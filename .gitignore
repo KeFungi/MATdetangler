@@ -1,0 +1,61 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+
+# SPAdes assemblies are huge — never commit except the one runnable example
+**/spades*/
+**/_spades*/
+**/k[0-9][0-9]*/
+**/contigs.fasta
+**/assembly_graph_after_simplification.gfa
+**/contigs.paths
+# ...but DO commit the shipped Tu127439 example
+!examples/Tu127439_spades/
+!examples/Tu127439_spades/**
+
+# Per-sample run outputs
+**/blast_*.tsv
+**/genome_cov_spades_*.txt
+**/anchor_*.fasta
+**/anchor_*.ann.tsv
+**/bubble_alleles*.fasta
+**/bubble_alleles*.ann.tsv
+**/bubble_topology.tsv
+**/cand_combined.fasta
+**/cand_combined.ann.tsv
+**/picker_candidates.fasta
+**/picker_candidates.ann.tsv
+**/primary_alleles*.fasta
+**/picks*.tsv
+**/identity*.tsv
+**/consensus_qc.tsv
+**/coverage.tsv
+**/consensus_alleles.fasta
+**/reads.sorted.bam
+**/reads.sorted.bam.*
+**/bubble.{txt,gfa,dot,tsv,png}
+**/seg_labels_k*.tsv
+**/queries/
+**/logs/
+**/input_process/
+
+# Aggregate summary + cluster outputs
+summary.tsv
+clusters/
+**/cores*.fasta
+**/cores*.tsv
+**/allele_classification.tsv
+**/allele_distance_matrix.tsv
+
+# Scratch directories
+_*/
+*_out/
+
+# Editor / OS
+.DS_Store
+*.bak
+*.swp
+*.swo

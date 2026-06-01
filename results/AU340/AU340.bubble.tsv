@@ -1,0 +1,7 @@
+node_a	node_b	arm	label_a	label_b
+4465787	42066	arm1	flankL	Suilu4_MATA_HD2+Suilu4_MATA_HD1
+42066	4709409	arm1	Suilu4_MATA_HD2+Suilu4_MATA_HD1	
+4709409	49826	arm1		flankR
+4465787	39632	arm2	flankL	Suilu4_MATA_HD2+Suilu4_MATA_HD1
+39632	4709409	arm2	Suilu4_MATA_HD2+Suilu4_MATA_HD1	
+4709409	49826	arm2		flankR

@@ -1,0 +1,287 @@
+#!/bin/bash
+# MATdetangler-spades — step 0: build per-k SPAdes assemblies in the exact layout
+# MATdetangler expects.
+#
+#   <outdir>/<sample>/k<K>/
+#       contigs.fasta
+#       assembly_graph_after_simplification.gfa
+#
+# That layout (one SPAdes run per k) is the only one that preserves the GFA at
+# every k — SPAdes' own multi-k mode (-k 21,33,55 in one call) strips intermediate
+# GFAs and leaves only the final k. MATdetangler's targeted-search benefits from
+# the full sweep, so we run one SPAdes job per (sample, k) pair.
+#
+# Two subcommands:
+#
+#   MATdetangler-spades run    --sample S --reads-r1 R1 --reads-r2 R2 --outdir D [opts]
+#   MATdetangler-spades batch  --samplesheet TSV --outdir D [opts]
+#
+# `batch` submits a SLURM job array, one task per (sample, k) pair. `run` is the
+# single-sample case; with --local it runs inline, otherwise it submits one
+# sbatch job per k.
+#
+# Samplesheet (batch): 3-column TSV with NO header — sample, r1, r2.
+#
+# Output is "skip-safe": a (sample, k) that already has contigs.fasta +
+# assembly_graph_after_simplification.gfa is skipped, so re-submitting on failure
+# only redoes the missing pieces.
+set -uo pipefail
+
+show_help() {
+cat <<EOF
+MATdetangler-spades — step 0: per-k SPAdes assemblies for MATdetangler
+
+USAGE
+  MATdetangler-spades       --sample S --reads-r1 R1 --reads-r2 R2 --outdir D [opts]   # single sample
+  MATdetangler-spades batch --samplesheet TSV --outdir D [opts]                        # multi-sample
+  MATdetangler-spades -h | --help
+
+COMMON OPTIONS
+  --outdir DIR                 parent dir. Layout written: DIR/<sample>/k<K>/
+  --ks LIST                    comma-separated k values (default: 33,45,53)
+  --threads N                  CPUs per SPAdes job   (default: 8)
+  --mem N                      memory in GB per job  (default: 24)
+  --time HH:MM:SS              wallclock per job     (default: 2:30:00)
+  --account ACCT               SLURM --account
+  --partition PART             SLURM --partition     (default: standard)
+  --bayes-hammer               run BayesHammer error correction. Default is OFF
+                               (--only-assembler), assuming reads were already
+                               adapter- and quality-trimmed.
+  --local                      run inline (no sbatch). For 'batch', this serializes
+                               every (sample, k) pair. Use for laptops / small jobs.
+  --module-init SCRIPT         optional file to 'source' before invoking spades.py
+                               (e.g. an HPC module-load helper).
+  --extra "..."                extra args appended to spades.py verbatim
+  -h, --help                   this help
+
+EXAMPLES
+  # Single sample, defaults (no BayesHammer, k = 33/45/53), submit as SLURM
+  MATdetangler-spades --sample CSUF-1723 \\
+    --reads-r1 R1.fq.gz --reads-r2 R2.fq.gz \\
+    --outdir spades_per_sample/
+
+  # Batch from samplesheet, with custom k list and account
+  MATdetangler-spades batch --samplesheet samples.tsv \\
+    --outdir spades_per_sample/ --ks 21,33,55 \\
+    --account tyjames1 --threads 8 --mem 24 --time 3:00:00
+
+  # Laptop / no SLURM: run everything serially
+  MATdetangler-spades batch --samplesheet samples.tsv \\
+    --outdir spades_per_sample/ --local
+
+SAMPLESHEET (3-col TSV, no header)
+  sample-id<TAB>R1.fastq.gz<TAB>R2.fastq.gz
+
+NOTES
+  * SPAdes' single-k mode (-k 33 in one invocation) keeps the per-k GFA.
+    Multi-k mode (-k 33,45,53) does NOT — that's why we run one job per k.
+  * A (sample, k) with both contigs.fasta and assembly_graph_after_simplification.gfa
+    already present is skipped, so re-running is safe.
+EOF
+}
+
+# ---------- defaults ----------
+SUBCMD=""; SAMPLE=""; R1=""; R2=""; OUTDIR=""; SAMPLESHEET=""
+KS="33,45,53"; THREADS=8; MEM=24; TIME="2:30:00"
+ACCOUNT=""; PARTITION="standard"
+ONLY_ASSEMBLER="--only-assembler"
+LOCAL=0
+MODULE_INIT=""
+EXTRA=""
+
+[ $# -lt 1 ] && { show_help; exit 1; }
+# Subcommand is now optional. `run` is the default — single-sample mode is
+# whatever the rest of the args describe. `batch` must still be spelled out.
+case "${1:-}" in
+  -h|--help) show_help; exit 0;;
+  batch)     SUBCMD="batch"; shift;;
+  run)       SUBCMD="run";   shift;;   # back-compat
+  *)         SUBCMD="run";;             # default: single-sample
+esac
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --sample)        SAMPLE="$2";        shift 2;;
+    --reads-r1)      R1="$2";            shift 2;;
+    --reads-r2)      R2="$2";            shift 2;;
+    --outdir)        OUTDIR="$2";        shift 2;;
+    --samplesheet)   SAMPLESHEET="$2";   shift 2;;
+    --ks)            KS="$2";            shift 2;;
+    --threads)       THREADS="$2";       shift 2;;
+    --mem)           MEM="${2%G}";       shift 2;;   # strip a trailing G if given
+    --time)          TIME="$2";          shift 2;;
+    --account)       ACCOUNT="$2";       shift 2;;
+    --partition)     PARTITION="$2";     shift 2;;
+    --bayes-hammer)  ONLY_ASSEMBLER="";  shift 1;;
+    --local)         LOCAL=1;            shift 1;;
+    --module-init)   MODULE_INIT="$2";   shift 2;;
+    --extra)         EXTRA="$2";         shift 2;;
+    -h|--help)       show_help;          exit 0;;
+    *) echo "unknown arg: $1"; echo; show_help; exit 1;;
+  esac
+done
+
+# ---------- validate ----------
+[ -z "$OUTDIR" ] && { echo "--outdir required" >&2; exit 1; }
+mkdir -p "$OUTDIR"
+
+K_LIST=$(echo "$KS" | tr ',' ' ')
+for k in $K_LIST; do
+  case "$k" in
+    ''|*[!0-9]*) echo "bad k value: '$k' (must be an integer)" >&2; exit 1;;
+  esac
+done
+
+if [ "$SUBCMD" = "run" ]; then
+  [ -z "$SAMPLE" ] && { echo "--sample required" >&2; exit 1; }
+  [ -s "$R1" ]    || { echo "--reads-r1 missing or empty: $R1" >&2; exit 1; }
+  [ -s "$R2" ]    || { echo "--reads-r2 missing or empty: $R2" >&2; exit 1; }
+fi
+if [ "$SUBCMD" = "batch" ]; then
+  [ -z "$SAMPLESHEET" ] && { echo "--samplesheet required" >&2; exit 1; }
+  [ -s "$SAMPLESHEET" ] || { echo "samplesheet not found: $SAMPLESHEET" >&2; exit 1; }
+fi
+
+# ---------- helpers ----------
+
+spades_one_done() {
+  # $1=spades_dir for one (sample, k). returns 0 if both required outputs present.
+  local d="$1"
+  [ -s "$d/contigs.fasta" ] && [ -s "$d/assembly_graph_after_simplification.gfa" ]
+}
+
+run_one() {
+  # Run SPAdes for a single (sample, k). Writes into $OUTDIR/<sample>/k<K>/.
+  # Skips if already complete. Echoes a status line.
+  local sample="$1" k="$2" r1="$3" r2="$4"
+  local d="$OUTDIR/$sample/k$k"
+  if spades_one_done "$d"; then
+    echo "[skip] $sample k=$k already complete ($d)"
+    return 0
+  fi
+  if [ ! -s "$r1" ] || [ ! -s "$r2" ]; then
+    echo "[skip] $sample k=$k reads missing ($r1 / $r2)"
+    return 0
+  fi
+  mkdir -p "$d"
+  echo "[run ] $sample k=$k -> $d"
+  # shellcheck disable=SC2086
+  spades.py -1 "$r1" -2 "$r2" -k "$k" -t "$THREADS" -m "$MEM" $ONLY_ASSEMBLER \
+    -o "$d" --tmp-dir "$d/_tmp" $EXTRA
+}
+
+# ---------- SLURM array helpers ----------
+
+build_tasks_file() {
+  # writes to $1: a 4-column TSV `sample TAB k TAB r1 TAB r2`, one row per (sample,k)
+  # pair that is NOT yet complete. Echoes the number of tasks to stdout.
+  local taskfile="$1"
+  : > "$taskfile"
+  local n=0
+  if [ "$SUBCMD" = "run" ]; then
+    for k in $K_LIST; do
+      if spades_one_done "$OUTDIR/$SAMPLE/k$k"; then
+        echo "[skip] $SAMPLE k=$k already complete" >&2
+        continue
+      fi
+      printf "%s\t%s\t%s\t%s\n" "$SAMPLE" "$k" "$R1" "$R2" >> "$taskfile"
+      n=$((n + 1))
+    done
+  else
+    # batch: read 3-col TSV
+    while IFS=$'\t' read -r samp r1 r2 || [ -n "$samp" ]; do
+      [ -z "$samp" ] && continue
+      case "$samp" in \#*) continue;; esac     # skip comment lines
+      for k in $K_LIST; do
+        if spades_one_done "$OUTDIR/$samp/k$k"; then
+          echo "[skip] $samp k=$k already complete" >&2
+          continue
+        fi
+        if [ ! -s "$r1" ] || [ ! -s "$r2" ]; then
+          echo "[skip] $samp k=$k reads missing" >&2
+          continue
+        fi
+        printf "%s\t%s\t%s\t%s\n" "$samp" "$k" "$r1" "$r2" >> "$taskfile"
+        n=$((n + 1))
+      done
+    done < "$SAMPLESHEET"
+  fi
+  echo "$n"
+}
+
+submit_array() {
+  # $1 = task file ($outdir/_array_tasks.tsv), $2 = N
+  local taskfile="$1" n="$2"
+  local logdir="$OUTDIR/_spades_logs"; mkdir -p "$logdir"
+  local sb="$OUTDIR/_array.sbatch"
+  cat > "$sb" <<EOF
+#!/bin/bash
+#SBATCH --job-name=hdspades
+#SBATCH --cpus-per-task=$THREADS
+#SBATCH --mem=${MEM}G
+#SBATCH --time=$TIME
+#SBATCH --output=$logdir/%a.log
+#SBATCH --error=$logdir/%a.log
+${ACCOUNT:+#SBATCH --account=$ACCOUNT}
+#SBATCH --partition=$PARTITION
+
+set -uo pipefail
+${MODULE_INIT:+source "$MODULE_INIT"}
+
+# task lookup
+TASK="\$(awk -v i=\$SLURM_ARRAY_TASK_ID 'NR == i + 1' "$taskfile")"
+SAMP=\$(echo "\$TASK" | cut -f1)
+K=\$(   echo "\$TASK" | cut -f2)
+R1=\$(  echo "\$TASK" | cut -f3)
+R2=\$(  echo "\$TASK" | cut -f4)
+OUT="$OUTDIR/\$SAMP/k\$K"
+
+echo "[\$(date)] task=\$SLURM_ARRAY_TASK_ID sample=\$SAMP k=\$K out=\$OUT"
+
+if [ -s "\$OUT/contigs.fasta" ] && [ -s "\$OUT/assembly_graph_after_simplification.gfa" ]; then
+  echo "  SKIP: already complete"; exit 0
+fi
+if [ ! -s "\$R1" ] || [ ! -s "\$R2" ]; then
+  echo "  SKIP: reads missing (\$R1 / \$R2)"; exit 0
+fi
+mkdir -p "\$OUT"
+
+spades.py -1 "\$R1" -2 "\$R2" -k "\$K" -t $THREADS -m $MEM $ONLY_ASSEMBLER \\
+  -o "\$OUT" --tmp-dir "\$OUT/_tmp" $EXTRA
+RC=\$?
+echo "[\$(date)] done task=\$SLURM_ARRAY_TASK_ID rc=\$RC"
+exit \$RC
+EOF
+  local last=$((n - 1))
+  echo "submitting array: $n tasks (0..$last) -> $sb"
+  sbatch --array=0-$last "$sb"
+}
+
+# ---------- dispatch ----------
+
+TASKFILE="$OUTDIR/_array_tasks.tsv"
+N=$(build_tasks_file "$TASKFILE")
+N=$(printf '%s\n' "$N" | tail -1)        # last line is the count
+
+if [ "$N" -eq 0 ]; then
+  echo "[step 0] nothing to do — every (sample, k) is already complete"
+  rm -f "$TASKFILE"
+  exit 0
+fi
+echo "[step 0] planned $N task(s) to run; see $TASKFILE"
+
+if [ "$LOCAL" -eq 1 ]; then
+  ${MODULE_INIT:+source "$MODULE_INIT"}
+  rc_any=0
+  while IFS=$'\t' read -r samp k r1 r2; do
+    run_one "$samp" "$k" "$r1" "$r2" || rc_any=$?
+  done < "$TASKFILE"
+  rm -f "$TASKFILE"
+  exit $rc_any
+else
+  if ! command -v sbatch >/dev/null 2>&1; then
+    echo "sbatch not on PATH. Use --local to run inline, or install SLURM." >&2
+    exit 1
+  fi
+  submit_array "$TASKFILE" "$N"
+fi

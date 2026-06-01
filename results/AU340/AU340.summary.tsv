@@ -1,0 +1,2 @@
+sample	used_k	bubble_type	genome_coverage	allele1_complete	allele2_complete	allele1_coverage	allele2_coverage	allele1_vs_allele2_id_pct	allele1_vs_allele2_aln_frac	cons_allele1_complete	cons_allele2_complete	cons_allele1_vs_allele2_id_pct	cons_allele1_vs_allele2_aln_frac	allele1_path	allele2_path
+AU340	k53	NA	0.0	TRUE	TRUE	0.0	0.0	83.0	0.99	-	-	-	-	4465787 (flankL) <-> 42066 (Suilu4_MATA_HD2+Suilu4_MATA_HD1) <-> 4709409 <-> 49826 (flankR)	4465787 (flankL) <-> 39632 (Suilu4_MATA_HD2+Suilu4_MATA_HD1) <-> 4709409 <-> 49826 (flankR)
