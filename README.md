@@ -253,6 +253,8 @@ and falls back to a top-level final-k GFA + contigs if no per-k subdir is found.
 
 ## Outputs (per sample, in `results/<sample>/`)
 
+![bubble schema](results/AU340/bubble.png)
+
 | file | what |
 |---|---|
 | **`primary_alleles.fasta`** | **The picked pair (canonical output)** — straight from the GFA / contig walk. 0 to `--expected-count` records. |
