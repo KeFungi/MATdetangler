@@ -306,6 +306,7 @@ def find_alleles(
         expected_var_tags: set[str] | None = None,
         locus_padding: int = 1500,
         contig_seeds: set[str] | None = None,
+        queries_dir: str | None = None,
 ) -> dict:
     """Run the full orchestrator. Returns a dict with the final classification
     and any emitted allele/chimera sequences:
@@ -397,6 +398,7 @@ def find_alleles(
             locus_padding=locus_padding,
             expected_var_tags=expected_var_tags,
             genome_cov=genome_cov, lo_mult=lo_mult, hi_mult=hi_mult,
+            queries_dir=queries_dir,
         )
         out["k"] = k
         out["genome_cov"] = genome_cov
@@ -552,6 +554,73 @@ def _dedup_named(named_seqs: list[tuple[str, str]],
     return kept
 
 
+def _dedup_named_ranked(named_seqs: list[tuple[str, str]],
+                         divergence_threshold: float,
+                         key_fn) -> list[tuple[str, str]]:
+    """Same as _dedup_named, but the walk order is determined by `key_fn`
+    (smaller value = higher priority) instead of length-desc. This lets us
+    rank by completeness FIRST so the more-complete representative of each
+    equivalence class survives, not just the longest one. The divergence
+    check itself (5% edit-distance, RC-aware) is unchanged."""
+    nonempty = [(n, s) for n, s in named_seqs if s]
+    nonempty.sort(key=lambda ns: key_fn(ns[0], ns[1]))
+    kept: list[tuple[str, str]] = []
+    for n, s in nonempty:
+        if any(not is_divergent(s, ks, threshold=divergence_threshold)
+               for _, ks in kept):
+            continue
+        kept.append((n, s))
+    return kept
+
+
+def _blastn_flank_presence(named_seqs: list[tuple[str, str]],
+                            queries_dir: str | None
+                            ) -> dict[str, tuple[bool, bool]]:
+    """Run a single blastn pass with queries/flankL.fasta + flankR.fasta
+    against the candidate sequences (one DB built per call). Returns
+    {name: (has_flankL, has_flankR)} where each bool is True iff at least
+    one hit at pid >= 85% and aln length >= 100 bp survives.
+
+    Returns {name: (False, False)} for all candidates when queries_dir is
+    missing, the flank FASTAs are absent, or BLAST exits non-zero — so
+    completeness ranking degrades gracefully (every candidate looks
+    "incomplete at flanks" and the next tiers do the ranking)."""
+    import subprocess, tempfile, os
+    presence = {n: (False, False) for n, _ in named_seqs}
+    if not queries_dir or not named_seqs: return presence
+    flankL_q = os.path.join(queries_dir, "flankL.fasta")
+    flankR_q = os.path.join(queries_dir, "flankR.fasta")
+    if not (os.path.exists(flankL_q) and os.path.exists(flankR_q)):
+        return presence
+    with tempfile.TemporaryDirectory() as td:
+        sfa = os.path.join(td, "cands.fa")
+        with open(sfa, "w") as fh:
+            for n, s in named_seqs:
+                fh.write(f">{n}\n{s}\n")
+        db = os.path.join(td, "candb")
+        r = subprocess.run(
+            ["makeblastdb", "-in", sfa, "-dbtype", "nucl", "-out", db],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        if r.returncode != 0: return presence
+        for q_path, idx in [(flankL_q, 0), (flankR_q, 1)]:
+            r = subprocess.run(
+                ["blastn", "-query", q_path, "-db", db, "-outfmt", "6",
+                 "-evalue", "1e-10", "-dust", "no"],
+                capture_output=True, text=True)
+            if r.returncode != 0: continue
+            for ln in r.stdout.splitlines():
+                f = ln.split("\t")
+                if len(f) < 12: continue
+                sname = f[1]
+                try:
+                    pid = float(f[2]); aln = int(f[3])
+                except ValueError: continue
+                if pid >= 85.0 and aln >= 100 and sname in presence:
+                    cur = list(presence[sname]); cur[idx] = True
+                    presence[sname] = tuple(cur)
+    return presence
+
+
 def _path_mean_cov(path: list[str], provenance: dict,
                     depths: dict[str, float]) -> float:
     """Length-weighted mean DP:f: depth across a path's nodes."""
@@ -577,6 +646,7 @@ def _emit_result(res: dict, gfa_seqs: dict[str, str],
                   genome_cov: float | None = None,
                   lo_mult: float = 0.25,
                   hi_mult: float = 2.0,
+                  queries_dir: str | None = None,
                   force: bool = False) -> dict:
     """Pipe every var-bearing candidate through trim → dedup → emit.
 
@@ -722,13 +792,37 @@ def _emit_result(res: dict, gfa_seqs: dict[str, str],
             local_raw, local_found = _tblastn_trim_each(
                 local_raw, var_proteins_ref, locus_padding)
 
-        # Dedup within this pool only (no cross-network collapse)
-        local_dedup = _dedup_named(local_raw, divergence_threshold)
-        nd = len(local_dedup)
-
         depths_d = depths or {}
         _cov  = lambda rn: _path_mean_cov(local_path.get(rn, []), prov, depths_d)
         _bnds = lambda rn: _innermost_flank_bounds(local_path.get(rn, []))
+
+        # Completeness ranking for dedup: fresh blastn over the trimmed
+        # candidate set against queries/flankL.fasta + queries/flankR.fasta,
+        # combined with the tblastn var-tag info from _tblastn_trim_each.
+        # Per candidate, compute:
+        #   complete_var   = expected_var_tags ⊆ found_var_tags(this candidate)
+        #   complete_locus = complete_var AND has_flankL AND has_flankR
+        # Then re-sort candidates by (complete_locus DESC, complete_var DESC,
+        # length DESC, diploid_cov_distance ASC) before walking the divergence
+        # check — the more-complete representative survives each equivalence
+        # class, instead of the longest one.
+        flank_presence = _blastn_flank_presence(local_raw, queries_dir) if local_raw else {}
+
+        def _rank_key(name: str, seq: str) -> tuple:
+            fv = local_found.get(name, set())
+            cv = bool(expected_var_tags) and (expected_var_tags <= fv)
+            hL, hR = flank_presence.get(name, (False, False))
+            cl = cv and hL and hR
+            bp = len(seq)
+            cov = _cov(name)
+            diploid_dist = abs(cov / genome_cov - 0.5) if genome_cov else 1.0
+            # sort ascending: smaller is better → negate for DESC tiers
+            return (not cl, not cv, -bp, diploid_dist)
+
+        # Dedup within this pool only (no cross-network collapse), now with
+        # completeness-first ranking. is_divergent threshold unchanged.
+        local_dedup = _dedup_named_ranked(local_raw, divergence_threshold, _rank_key)
+        nd = len(local_dedup)
 
         # seg_processor.directional_split now emits clean position-indexed
         # sub-node IDs ("{parent}#1", "{parent}#2", "{parent}#N"). The

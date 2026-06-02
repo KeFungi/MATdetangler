@@ -135,6 +135,7 @@ def main(argv: list[str] | None = None) -> int:
             expected_var_tags=expected_tags or None,
             locus_padding=args.locus_padding,
             divergence_threshold=args.divergence_threshold,
+            queries_dir=args.queries_dir,
         )
     except Exception as e:
         with open(result_tsv, "w") as fh:
