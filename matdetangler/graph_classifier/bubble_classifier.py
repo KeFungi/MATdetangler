@@ -82,14 +82,30 @@ def classify(nodes: set[str], edges: set[frozenset],
     if not var_nodes:
         return {"class": "no_var", **info}
 
-    # R1. SEPARATE — var nodes in disjoint full-graph components
+    # R1. SEPARATE — var nodes in disjoint full-graph components.
+    # When there are multiple disjoint networks, expand and classify each
+    # network independently (recursive call on the network's induced
+    # subgraph), then return the per-network sub-results. Downstream
+    # `_emit_result` runs the trim → dedup → emit chain PER NETWORK and
+    # tags each network's alleles with its network index, so an N-network
+    # `separate` sample produces N independent allele sets.
     full_comps = connected_components(set(nodes), adj)
     var_full = [c for c in full_comps if c & var_nodes]
     if len(var_full) > 1:
+        sub_results = []
+        for comp in var_full:
+            comp_nodes = set(comp)
+            comp_edges = {e for e in edges if all(x in comp_nodes for x in tuple(e))}
+            comp_labels  = {n: label_per_node.get(n, "") for n in comp_nodes}
+            comp_var_per = {n: var_per_node.get(n, set()) for n in comp_nodes if var_per_node.get(n)}
+            sub = classify(comp_nodes, comp_edges, comp_labels, comp_var_per)
+            sub_results.append(sub)
         return {"class": "separate", **info,
                 "n_var_components": len(var_full),
                 "var_components": [list(c) for c in var_full],
-                "explain": f"var genes in {len(var_full)} disjoint subgraphs"}
+                "sub_results": sub_results,
+                "explain": f"var genes in {len(var_full)} disjoint subgraphs; "
+                           f"each network classified independently"}
 
     # P2. BUBBLE via BFS from var through unlabeled
     bubble = bubble_bfs(adj, var_nodes, unlabeled)

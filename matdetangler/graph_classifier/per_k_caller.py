@@ -223,16 +223,21 @@ def restrict_subgraph(nodes: set[str], edges: set[frozenset],
 # -----------------------------------------------------------------------------
 
 def _identity(a: str, b: str) -> float:
-    """Pairwise nucleotide identity via edlib infix (HW) edit distance.
-    Query is the shorter seq, target the longer — end gaps in the target are
-    free, so terminal length differences don't penalize identity. Returns
-    1.0 for identical (or one fully contained in the other), lower for
+    """Pairwise nucleotide identity via edlib infix (HW) edit distance,
+    strand-agnostic. Query = shorter seq, target = longer (end gaps free).
+    We try the target both forward AND reverse-complemented and take the
+    closer alignment — graph walks through the same bubble can be emitted
+    in either orientation depending on which anchor BFS started from, so
+    two alleles that are reverse complements of each other must collapse
+    in dedup. Returns 1.0 for identical (or fully contained), lower for
     divergent. Handles indels and end-fragmentation properly."""
     import edlib
     if not a or not b: return 0.0
     q, t = (a, b) if len(a) <= len(b) else (b, a)
-    r = edlib.align(q, t, task="distance", mode="HW")
-    return 1.0 - r["editDistance"] / max(len(q), 1)
+    r_fwd = edlib.align(q, t, task="distance", mode="HW")
+    r_rc  = edlib.align(q, reverse_complement(t), task="distance", mode="HW")
+    best_ed = min(r_fwd["editDistance"], r_rc["editDistance"])
+    return 1.0 - best_ed / max(len(q), 1)
 
 
 def is_divergent(seq_a: str, seq_b: str, threshold: float = 0.05) -> bool:
@@ -391,6 +396,7 @@ def find_alleles(
             var_proteins_ref=var_proteins_ref,
             locus_padding=locus_padding,
             expected_var_tags=expected_var_tags,
+            genome_cov=genome_cov, lo_mult=lo_mult, hi_mult=hi_mult,
         )
         out["k"] = k
         out["genome_cov"] = genome_cov
@@ -568,6 +574,9 @@ def _emit_result(res: dict, gfa_seqs: dict[str, str],
                   var_proteins_ref: str | None = None,
                   locus_padding: int = 1500,
                   expected_var_tags: set[str] | None = None,
+                  genome_cov: float | None = None,
+                  lo_mult: float = 0.25,
+                  hi_mult: float = 2.0,
                   force: bool = False) -> dict:
     """Pipe every var-bearing candidate through trim → dedup → emit.
 
@@ -636,68 +645,166 @@ def _emit_result(res: dict, gfa_seqs: dict[str, str],
         """Node-level trim: unordered component → only var nodes."""
         return [n for n in c if n in var_nodes]
 
-    # 1. Build candidate sequences. Apply node-level path-trim first (graph
-    #    structural), then sequence-level tblastn-trim below (content-based).
-    raw: list[tuple[str, str]] = []
-    path_by_name: dict[str, list[str]] = {}
-    for i, p in enumerate(res.get("closed_arms", [])):
-        trimmed_p = _trim_path_to_var(list(p))
-        nm = f"cl{i}"
-        raw.append((nm, _seq_full(trimmed_p)))
-        path_by_name[nm] = trimmed_p
-    for i, p in enumerate(res.get("dangling_arms", [])):
-        trimmed_p = _trim_path_to_var(list(p))
-        nm = f"da{i}"
-        raw.append((nm, _seq_full(trimmed_p)))
-        path_by_name[nm] = trimmed_p
-    for i, c in enumerate(res.get("var_components") or []):
-        trimmed_c = _trim_component_to_var(list(c))
-        nm = f"vc{i}"
-        raw.append((nm, _arm_sequence_for(trimmed_c, prov, gfa_seqs)))
-        path_by_name[nm] = trimmed_c
+    var_per_node = res.get("_var_per_node", {})
 
-    n_raw = len(raw)
+    # The component cov-band check is GATED by the same `cov_filter` state
+    # the BFS iteration used (res["_cov_filter"]). When the BFS ran with
+    # cov-filter on, we apply it to var_components too; when the BFS ran
+    # with cov-filter off (the lenient fallback), we don't.
+    cov_filter_active = bool(res.get("_cov_filter", False))
 
-    # 2. Locus trim via tblastn(var proteins → candidate). Drops no-hit candidates.
-    found_tags: dict[str, set[str]] = {}
-    if var_proteins_ref:
-        raw, found_tags = _tblastn_trim_each(raw, var_proteins_ref, locus_padding)
+    def _component_passes_filter(comp_nodes: list[str]) -> bool:
+        """Filter for raw `var_components` emission (rarely used now that
+        we recurse classify per network).
+        (a) ≥ 2 DISTINCT var tags — always applies (the orphan-fragment guard).
+        (b) mean depth in cov-filter band — applied only when the BFS this
+            iteration also ran with the cov filter on (consistent state)."""
+        tags: set[str] = set()
+        for n in comp_nodes:
+            t = var_per_node.get(n)
+            if t: tags |= set(t)
+        if len(tags) < 2:
+            return False
+        if cov_filter_active and genome_cov and depths:
+            lo, hi = lo_mult * genome_cov, hi_mult * genome_cov
+            total_bp = 0; weighted = 0.0
+            for n in comp_nodes:
+                if n not in prov: continue
+                seg, s, e, _ = prov[n]
+                L = e - s
+                d = depths.get(seg)
+                if d is None or L <= 0: continue
+                total_bp += L; weighted += L * d
+            mean_dp = (weighted / total_bp) if total_bp else 0.0
+            if mean_dp and not (lo <= mean_dp <= hi):
+                return False
+        return True
 
-    # 3. Dedup the trimmed sequences (k-mer Jaccard at threshold).
-    deduped_named = _dedup_named(raw, divergence_threshold)
-    n = len(deduped_named)
+    # ---- Per-network pool builder -------------------------------------------
+    #
+    # For a `separate` verdict the classifier recurses into each disjoint
+    # network and returns its sub-results in res["sub_results"]. We then run
+    # the full trim → dedup → emit pipeline INDEPENDENTLY per network and
+    # tag each network's emitted alleles with an "n{i}_" prefix, so the
+    # output for an N-network separate sample is the concatenation of N
+    # per-network allele sets. Dedup does NOT cross networks (alleles from
+    # disjoint graph regions stay as distinct records even if their
+    # sequences happen to be similar — they represent different loci).
+    #
+    # For non-separate verdicts there's a single "pool" with prefix = "".
 
-    # 4. Emit by post-dedup count. Compute length-weighted mean depth per allele
-    #    AND record the innermost-flank boundary nodes per allele (metadata
-    #    only — emitted sequence stays var-trimmed; the boundary tells the
-    #    consumer where the immediate flank context would extend to).
-    depths = depths or {}
-    cov_for = lambda raw_name: _path_mean_cov(path_by_name.get(raw_name, []), prov, depths)
-    bounds_for = lambda raw_name: _innermost_flank_bounds(path_by_name.get(raw_name, []))
+    def _process_pool(closed_arms, dangling_arms, var_components, prefix):
+        """Build raw candidates → locus-trim → dedup → emit names.
+        Returns dict with keys: alleles, allele_cov, allele_segments,
+        extend_bounds, n_raw, n_dedup, found_tags_surviving."""
+        local_raw: list[tuple[str, str]] = []
+        local_path: dict[str, list[str]] = {}
+        for j, p in enumerate(closed_arms):
+            tp = _trim_path_to_var(list(p))
+            nm = f"{prefix}cl{j}"
+            local_raw.append((nm, _seq_full(tp))); local_path[nm] = tp
+        for j, p in enumerate(dangling_arms):
+            tp = _trim_path_to_var(list(p))
+            nm = f"{prefix}da{j}"
+            local_raw.append((nm, _seq_full(tp))); local_path[nm] = tp
+        for j, c in enumerate(var_components or []):
+            tc = _trim_component_to_var(list(c))
+            if not _component_passes_filter(tc): continue
+            nm = f"{prefix}vc{j}"
+            local_raw.append((nm, _arm_sequence_for(tc, prov, gfa_seqs)))
+            local_path[nm] = tc
 
-    if n <= 1:
-        if deduped_named:
-            rn, rs = deduped_named[0]
-            alleles = [("allele1", rs)]
-            allele_cov = [cov_for(rn)]
-            extend_bounds = [bounds_for(rn)]
+        n_raw_pool = len(local_raw)
+
+        # Locus trim — drops no-HD candidates
+        local_found: dict[str, set[str]] = {}
+        if var_proteins_ref:
+            local_raw, local_found = _tblastn_trim_each(
+                local_raw, var_proteins_ref, locus_padding)
+
+        # Dedup within this pool only (no cross-network collapse)
+        local_dedup = _dedup_named(local_raw, divergence_threshold)
+        nd = len(local_dedup)
+
+        depths_d = depths or {}
+        _cov  = lambda rn: _path_mean_cov(local_path.get(rn, []), prov, depths_d)
+        _bnds = lambda rn: _innermost_flank_bounds(local_path.get(rn, []))
+
+        # seg_processor.directional_split now emits clean position-indexed
+        # sub-node IDs ("{parent}#1", "{parent}#2", "{parent}#N"). The
+        # provenance dict carries the coords for sequence materialization;
+        # the IDs themselves stay coord-free for clean display in bubble.*.
+        def _segs(rn):
+            out, seen = [], set()
+            for sub in local_path.get(rn, ()):
+                if sub not in prov: continue
+                if sub in seen: continue
+                seen.add(sub); out.append(sub)
+            return out
+
+        # Per-pool label scheme: n=1→allele1, n=2→allele1/2, n>=3→chimeraN
+        if nd <= 1:
+            if local_dedup:
+                rn, rs = local_dedup[0]
+                alleles_p     = [(f"{prefix}allele1", rs)]
+                cov_p         = [_cov(rn)]
+                bounds_p      = [_bnds(rn)]
+                segs_p        = [_segs(rn)]
+            else:
+                alleles_p = []; cov_p = []; bounds_p = []; segs_p = []
+        elif nd == 2:
+            alleles_p = [(f"{prefix}allele1", local_dedup[0][1]),
+                          (f"{prefix}allele2", local_dedup[1][1])]
+            cov_p     = [_cov(local_dedup[0][0]), _cov(local_dedup[1][0])]
+            bounds_p  = [_bnds(local_dedup[0][0]), _bnds(local_dedup[1][0])]
+            segs_p    = [_segs(local_dedup[0][0]), _segs(local_dedup[1][0])]
         else:
-            alleles = []
-            allele_cov = []
-            extend_bounds = []
-    elif n == 2:
-        alleles = [("allele1", deduped_named[0][1]), ("allele2", deduped_named[1][1])]
-        allele_cov = [cov_for(deduped_named[0][0]), cov_for(deduped_named[1][0])]
-        extend_bounds = [bounds_for(deduped_named[0][0]), bounds_for(deduped_named[1][0])]
-    else:
-        alleles = [(f"chimera{i+1}", s) for i, (_, s) in enumerate(deduped_named)]
-        allele_cov = [cov_for(rn) for rn, _ in deduped_named]
-        extend_bounds = [bounds_for(rn) for rn, _ in deduped_named]
+            alleles_p = [(f"{prefix}chimera{k+1}", s)
+                         for k, (_, s) in enumerate(local_dedup)]
+            cov_p    = [_cov(rn) for rn, _ in local_dedup]
+            bounds_p = [_bnds(rn) for rn, _ in local_dedup]
+            segs_p   = [_segs(rn) for rn, _ in local_dedup]
 
-    # Aggregate var tags hit by the surviving (post-dedup) candidates.
+        surviving = set()
+        for rn, _ in local_dedup:
+            surviving |= local_found.get(rn, set())
+
+        return {
+            "alleles": alleles_p, "allele_cov": cov_p,
+            "extend_bounds": bounds_p, "allele_segments": segs_p,
+            "n_raw": n_raw_pool, "n_dedup": nd,
+            "found_tags_surviving": surviving,
+        }
+
+    # Build pools — one per network for `separate`, one global pool otherwise.
+    sub_results = res.get("sub_results")
+    if sub_results:
+        pools = []
+        for i, sub in enumerate(sub_results):
+            pools.append(_process_pool(
+                sub.get("closed_arms", []) or [],
+                sub.get("dangling_arms", []) or [],
+                sub.get("var_components", []) or [],
+                prefix=f"n{i+1}_",
+            ))
+    else:
+        pools = [_process_pool(
+            res.get("closed_arms", []) or [],
+            res.get("dangling_arms", []) or [],
+            res.get("var_components", []) or [],
+            prefix="",
+        )]
+
+    alleles         = [a for p in pools for a in p["alleles"]]
+    allele_cov      = [c for p in pools for c in p["allele_cov"]]
+    extend_bounds   = [b for p in pools for b in p["extend_bounds"]]
+    allele_segments = [s for p in pools for s in p["allele_segments"]]
+    n_raw           = sum(p["n_raw"]   for p in pools)
+    n               = sum(p["n_dedup"] for p in pools)
     surviving_tags: set[str] = set()
-    for name, _ in deduped_named:
-        surviving_tags |= found_tags.get(name, set())
+    for p in pools: surviving_tags |= p["found_tags_surviving"]
+
+    depths = depths or {}
 
     if expected_var_tags is not None:
         complete_var = expected_var_tags <= surviving_tags
@@ -706,8 +813,57 @@ def _emit_result(res: dict, gfa_seqs: dict[str, str],
         complete_var = None
         locus_coverage = None
 
+    # Decide the final verdict from the actual network sourcing of emissions:
+    #   * alleles span ≥ 2 distinct networks    → "separate"  (HARD OVERRIDE,
+    #                                              wins over any sub-verdict like
+    #                                              open_bubble / closed_bubble /
+    #                                              single — the sample really is
+    #                                              split across disconnected
+    #                                              graph regions)
+    #   * alleles all from ONE network          → promote that network's
+    #                                              sub-verdict (so a separate
+    #                                              sample where only one network
+    #                                              had real alleles is reported
+    #                                              as the network's own shape:
+    #                                              closed_bubble / open_bubble /
+    #                                              complexed / single)
+    #   * no networks (no sub_results, normal)  → use the classifier's top-level
+    #                                              verdict as-is
+    final_verdict = cls
+    if sub_results:
+        emit_nets = set()
+        for name, _ in alleles:
+            if name.startswith("n") and "_" in name:
+                emit_nets.add(name.split("_", 1)[0])
+        if len(emit_nets) >= 2:
+            final_verdict = "separate"
+        elif len(emit_nets) == 1:
+            net_idx = int(next(iter(emit_nets))[1:]) - 1
+            if 0 <= net_idx < len(sub_results):
+                final_verdict = sub_results[net_idx].get("class", cls)
+        # else: no network emitted anything — keep classifier's "separate"
+
+    # Materialize each unique sub-node ID referenced by any emitted allele.
+    # The IDs themselves are coord-free ("{parent}#N"); coords live in `prov`.
+    # Returned as a small {sub_id: sub_sequence} dict so run_per_k can
+    # write a per-k FASTA that graph_paths reads when assembling
+    # bubble.txt / bubble.gfa / bubble.png.
+    sub_seqs: dict[str, str] = {}
+    referenced_ids: set[str] = set()
+    for seg_list in allele_segments:
+        referenced_ids.update(seg_list)
+    for sid in referenced_ids:
+        if sid not in prov: continue
+        parent, s, e, strand = prov[sid]
+        if parent not in gfa_seqs: continue
+        sub = gfa_seqs[parent][s:e]
+        if not sub: continue
+        if strand == "-": sub = reverse_complement(sub)
+        sub_seqs[sid] = sub
+
     return {
-        "verdict": cls,                                                # always the classifier origin
+        "verdict": final_verdict,
+        "topology": cls,                                                # raw classifier top-level (always "separate" when sub_results present)
         "complete_var": complete_var,
         "complete_locus": complete_var,                                # same notion: did we recover all var tags
         "locus_coverage": locus_coverage,
@@ -721,6 +877,8 @@ def _emit_result(res: dict, gfa_seqs: dict[str, str],
         "alleles": alleles,
         "allele_cov": allele_cov,                                       # length-weighted DP:f: mean per allele
         "extend_bounds": extend_bounds,                                 # per allele (innermost_flankL, innermost_flankR)
+        "allele_segments": allele_segments,                             # per allele: list of GFA seg IDs walked (path order, deduped)
+        "subnode_seqs": sub_seqs,                                       # {sub_id: materialized sub-region sequence} for split parents
         "info": {k: v for k, v in res.items() if not k.startswith("_")
                  and k not in ("closed_arms", "dangling_arms", "var_components")},
     }

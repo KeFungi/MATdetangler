@@ -226,7 +226,12 @@ def main(argv: list[str] | None = None) -> int:
             allele_lens  = (win.get("allele_lens",   "") or "").split(",")
             cov_str      = (win.get("allele_cov",    "") or "").split(",")
             ext_pairs    = (win.get("extend_bounds", "") or "").split(";")
-            segs_field   = win.get("segments", "-")
+            # Per-allele GFA segments. Format from run_per_k.py: alleles are
+            # ;-separated, segments within each allele are ,-separated.
+            # "-" placeholder if an allele has no recorded segments.
+            allele_segs_field = win.get("allele_segments", "") or ""
+            per_allele_segs = allele_segs_field.split(";") if allele_segs_field else []
+            sample_union_segs = win.get("segments", "-")  # fallback only
             origin = ("path" if win.get("bubble_type") in ("closed_bubble",
                                                             "open_bubble", "single")
                             else "graph")  # complexed / separate → "graph"
@@ -239,17 +244,21 @@ def main(argv: list[str] | None = None) -> int:
                 cov_v = (cov_str[i] if i < len(cov_str) else "") or "0"
                 ext = (ext_pairs[i] if i < len(ext_pairs) else "-:-")
                 L_ok, R_ok = "-" not in ext.split(":")[0], "-" not in ext.split(":")[-1]
-                # n_variable_genes "found/expected" — sample-level approximation:
-                # complete_var=True → "K/K" where K is len(found_var_tags) (≈expected).
-                # Else → estimate found from comma-joined list.
-                # (Approximation: every emitted allele inherits the sample-level count.)
-                # Without per-allele recheck, just use sample-level found_var_tags count.
+                # Per-allele segments — if absent (older result.tsv format), fall
+                # back to the sample-level union; downstream consumers expecting
+                # picks.tsv col 8 to be populated will still work, just with a
+                # less precise (union) walk.
+                if i < len(per_allele_segs) and per_allele_segs[i] and per_allele_segs[i] != "-":
+                    segs_v = per_allele_segs[i]
+                else:
+                    segs_v = sample_union_segs
+                # n_variable_genes "found/expected" — sample-level approximation
                 nv_found = len((win.get("found_var_tags", "") or "").split(",")) if win.get("found_var_tags") and win.get("found_var_tags") != "-" else 0
                 n_variable = f"{nv_found}/{nv_found}" if win.get("complete_var") else f"?/{nv_found}"
                 has_both_flanks = "True" if (L_ok and R_ok) else "False"
                 ptsv.write("\t".join([
                     sample, name, origin, win["_k"], type_lbl, str(ln),
-                    "-", segs_field, cov_v, n_variable, has_both_flanks, "False",
+                    "-", segs_v, cov_v, n_variable, has_both_flanks, "False",
                 ]) + "\n")
                 n_picked += 1
 

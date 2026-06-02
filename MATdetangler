@@ -395,8 +395,6 @@ fi
 #       is no need to keep paying tblastn cost on the remaining ks.
 # Per-k outputs (cand_*_<k>.fasta) are accumulated into cand_*.fasta as we go.
 [ "$CONTINUE" -eq 1 ] && echo "  --continue: reusing per-k outputs where present; cumulative pools rebuilt from per-k files"
-: > "$SDIR/anchor_contig.fasta"
-: > "$SDIR/anchor_segments.fasta"
 : > "$SDIR/bubble_alleles.fasta"
 : > "$SDIR/bubble_alleles.ann.tsv"
 DONE_K=""
@@ -438,45 +436,11 @@ print(f'{v:.4f}')
     echo "$K_GENOMECOV" > "$K_COV_FILE"
   fi
 
-  # --- 2.1: anchor search on contigs (this k only) ---
-  "$PY" -m matdetangler.anchor_search --sample "$SAMPLE" --source contigs --spades-dir "$SPADES_DIR" \
-    --queries-dir "$QDIR" --ks "$K_ONE" --outdir "$SDIR" \
-    --min-len "$MIN_AL" --blastn-pid "$BLASTN_PID" --blastn-minlen "$BLASTN_MINLEN" \
-    --tblastn-pid "$TBLASTN_PID" --tblastn-aa "$TBLASTN_AA" \
-    --tblastx-pid "$TBLASTX_PID" --tblastx-aa "$TBLASTX_AA" \
-    --flank-pid "$FLANK_PID" --flank-minlen "$FLANK_MINLEN" \
-    --threads "$THREADS" \
-    $( [ "$DEBUG" -eq 1 ] && echo --include-flanks ) --blast-out-dir "$SDIR" \
-    2>&1 | tee "$LDIR/02_1_anchor_search_contigs_${K_ONE}.log"
-  mv -f "$SDIR/anchor_contig.fasta"   "$SDIR/anchor_contig_${K_ONE}.fasta"
-  mv -f "$SDIR/anchor_contig.ann.tsv" "$SDIR/anchor_contig_${K_ONE}.ann.tsv" 2>/dev/null || true
-  # Count HD-bearing anchors specifically (col 5 of ann.tsv = hd_genes, non-"-").
-  # With --include-flanks (debug), anchor_contig.fasta may include flank-only records
-  # that step 3 won't use as seeds, so total record count is misleading.
-  N_HD_ANCHORS_21=$(awk -F'\t' 'NF>=5 && $5!="-" && $5!=""' "$SDIR/anchor_contig_${K_ONE}.ann.tsv" 2>/dev/null | wc -l)
-
-  # --- 2.2 trigger 1 (per k): 2.1 found ZERO HD-bearing anchors this k ---
-  TRIED_22=0; ANCHOR_SEG_ARG=""
-  if [ "$N_HD_ANCHORS_21" -le 0 ]; then
-    echo "  [$K_ONE] step 2.1 found 0 HD-bearing anchors -> step 2.2 GFA-segment search"
-    "$PY" -m matdetangler.anchor_search --sample "$SAMPLE" --source segments --spades-dir "$SPADES_DIR" \
-      --queries-dir "$QDIR" --ks "$K_ONE" --outdir "$SDIR" \
-      --min-len 200 --blastn-pid "$BLASTN_PID" --blastn-minlen "$BLASTN_MINLEN" \
-      --tblastn-pid "$TBLASTN_PID" --tblastn-aa "$TBLASTN_AA" \
-      --tblastx-pid "$TBLASTX_PID" --tblastx-aa "$TBLASTX_AA" \
-      --flank-pid "$FLANK_PID" --flank-minlen "$FLANK_MINLEN" \
-      --threads "$THREADS" \
-      $( [ "$DEBUG" -eq 1 ] && echo --include-flanks ) --blast-out-dir "$SDIR" \
-      2>&1 | tee "$LDIR/02_2_anchor_search_segments_${K_ONE}.log"
-    mv -f "$SDIR/anchor_segments.fasta"   "$SDIR/anchor_segments_${K_ONE}.fasta"
-    mv -f "$SDIR/anchor_segments.ann.tsv" "$SDIR/anchor_segments_${K_ONE}.ann.tsv" 2>/dev/null || true
-    TRIED_22=1
-    ANCHOR_SEG_ARG="--anchors-segments $SDIR/anchor_segments_${K_ONE}.fasta"
-  fi
-
-  # --- 3: per-K allele caller (NEW — replaces graph_path_search + pick_alleles) ---
-  # Uses matdetangler.run_per_k: GFA-segment BLAST → labeler → bubble classifier
-  # → trim → dedup → emit. Writes $SDIR/$K_ONE/result.tsv + alleles.fasta.
+  # --- 3: per-K allele caller (replaces graph_path_search + pick_alleles) ---
+  # The legacy step-2 anchor_search (contigs + segment-fallback) was a
+  # diagnostic-only BLAST pass — its outputs were never consumed by the
+  # caller. Removed: run_per_k.py does its own GFA-segment BLAST from
+  # scratch and uses labels to seed the BFS.
   echo "  [$K_ONE] step 3 run_per_k (new caller)"
   GFA_HERE="$SPADES_DIR/$K_ONE/assembly_graph_after_simplification.gfa"
   GS_RC=0
@@ -492,11 +456,6 @@ print(f'{v:.4f}')
     cp -f "$SDIR/$K_ONE/alleles.fasta" "$SDIR/bubble_alleles_${K_ONE}.fasta"
   fi
 
-  # 2.2 retry trigger removed — new caller doesn't depend on segment anchors;
-  # it BLASTs directly against GFA segments. The anchor_search step 2.1 still
-  # runs and its outputs (anchor_contig_*.fasta) remain available for diagnostics
-  # but are NOT consumed by run_per_k.
-
   if [ "$GS_RC" -eq 0 ]; then
     echo "[$SAMPLE] $K_ONE caller produced result.tsv (verdict pending cross-K pick)"
     [ -z "$DONE_K" ] && DONE_K="$K_ONE"
@@ -508,17 +467,11 @@ if [ -z "$DONE_K" ]; then
   echo "[$SAMPLE] no k produced a per-k result; downstream may fail"
 fi
 
-# Rebuild cumulative pools from every per-k file that exists with content.
-: > "$SDIR/anchor_contig.fasta"
-: > "$SDIR/anchor_contig.ann.tsv"
-: > "$SDIR/anchor_segments.fasta"
+# Rebuild cumulative bubble_alleles pool from every per-k file that exists.
 : > "$SDIR/bubble_alleles.fasta"
 : > "$SDIR/bubble_alleles.ann.tsv"
 for K_ONE in ${KS//,/ }; do
-  [ -s "$SDIR/anchor_contig_${K_ONE}.fasta"     ] && cat "$SDIR/anchor_contig_${K_ONE}.fasta"     >> "$SDIR/anchor_contig.fasta"
-  [ -s "$SDIR/anchor_contig_${K_ONE}.ann.tsv"   ] && cat "$SDIR/anchor_contig_${K_ONE}.ann.tsv"   >> "$SDIR/anchor_contig.ann.tsv"
-  [ -s "$SDIR/anchor_segments_${K_ONE}.fasta"   ] && cat "$SDIR/anchor_segments_${K_ONE}.fasta"   >> "$SDIR/anchor_segments.fasta"
-  [ -s "$SDIR/bubble_alleles_${K_ONE}.fasta"    ] && cat "$SDIR/bubble_alleles_${K_ONE}.fasta"    >> "$SDIR/bubble_alleles.fasta"
+  [ -s "$SDIR/bubble_alleles_${K_ONE}.fasta" ] && cat "$SDIR/bubble_alleles_${K_ONE}.fasta" >> "$SDIR/bubble_alleles.fasta"
 done
 echo "[$SAMPLE] cumulative bubble_alleles.fasta rebuilt from per-k files: $(grep -c '^>' "$SDIR/bubble_alleles.fasta") records"
 

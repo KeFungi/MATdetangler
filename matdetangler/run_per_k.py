@@ -143,6 +143,20 @@ def main(argv: list[str] | None = None) -> int:
 
     write_fasta(res["alleles"], fasta, sample=f"{args.sample}_{args.k}")
 
+    # Sub-node side FASTA — one record per unique split-segment sub-node ID
+    # ({parent}#N), with the materialized sub-region sequence (strand-flipped
+    # if the post-P1 strand was "-"). graph_paths reads this to draw the
+    # bubble outputs with clean coord-free IDs; bare parent IDs (un-split
+    # segments) are NOT included since they're already in the GFA.
+    sub_seqs = res.get("subnode_seqs") or {}
+    if sub_seqs:
+        sub_fa = os.path.join(out_k, "subnode_seqs.fasta")
+        with open(sub_fa, "w") as fh:
+            for sid, ss in sorted(sub_seqs.items()):
+                fh.write(f">{sid}\n")
+                for i in range(0, len(ss), 80):
+                    fh.write(ss[i:i + 80] + "\n")
+
     allele_names = ",".join(res.get("component_list", [])) or "-"
     allele_lens  = ",".join(str(len(s)) for _, s in res["alleles"]) or "-"
     seg_list     = ",".join(res.get("segments", [])) or "-"
@@ -150,12 +164,17 @@ def main(argv: list[str] | None = None) -> int:
     allele_cov   = ",".join(f"{c:.1f}" for c in res.get("allele_cov", [])) or "-"
     extend_bounds = ";".join(f"{L or '-'}:{R or '-'}"
                               for (L, R) in res.get("extend_bounds", [])) or "-"
+    # Per-allele GFA segments: list-of-lists. Encoded as `;` between alleles,
+    # `,` within. `-` placeholder for empty (matches single-list convention).
+    allele_segments = ";".join(",".join(segs) if segs else "-"
+                                for segs in res.get("allele_segments", [])) or "-"
 
     header = ["sample", "k", "bubble_type", "components", "complete_var",
               "complete_locus", "locus_coverage", "basepair", "genome_cov",
               "allele_cov", "n_cand", "n_dedup", "divergent", "n_hops_used",
               "phase", "cov_filter_used", "allele_lens", "segments",
-              "segments_labeled", "found_var_tags", "extend_bounds"]
+              "segments_labeled", "found_var_tags", "extend_bounds",
+              "allele_segments"]
     row = [
         args.sample, str(res.get("k") or "?"),
         str(res.get("bubble_type", res.get("verdict"))),
@@ -172,6 +191,7 @@ def main(argv: list[str] | None = None) -> int:
         allele_lens, seg_list, seg_lab_list,
         ",".join(res.get("found_var_tags", [])) or "-",
         extend_bounds,
+        allele_segments,
     ]
     with open(result_tsv, "w") as fh:
         fh.write("\t".join(header) + "\n")

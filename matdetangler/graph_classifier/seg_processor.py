@@ -87,38 +87,129 @@ def directional_split(
             side_to_sub[(seg, "R")] = seg
             provenance[seg] = (seg, 0, slen, "+")
             continue
-        if len(hits) == 1:
-            h = hits[0]
+
+        # Distinct-label rule (matches user spec):
+        #   n_label == 1 → 1 piece  (no split; segment as whole, labeled with the tag)
+        #   n_label == 2 → up to 3 pieces (left-label, middle, right-label).
+        #                  Middle is omitted when the two label spans touch.
+        #   n_label >= 3 → up to 3 pieces (leftmost-tag at L end, rightmost-tag
+        #                  at R end, all other label spans absorbed into the
+        #                  middle, which is left unlabeled).
+        # Multiple hits of the same tag collapse to that tag's outer span
+        # (min start, max end). Strand for a collapsed span is taken from the
+        # tag's longest single hit.
+        tag_first: list[str] = []
+        tag_span: dict[str, list] = {}   # tag -> [min_start, max_end, strand, longest_aln, kind]
+        for h in hits:
+            if h.tag not in tag_span:
+                tag_first.append(h.tag)
+                tag_span[h.tag] = [h.start, h.end, h.strand, h.end - h.start, h.kind]
+            else:
+                s = tag_span[h.tag]
+                s[0] = min(s[0], h.start); s[1] = max(s[1], h.end)
+                aln = h.end - h.start
+                if aln > s[3]: s[2] = h.strand; s[3] = aln
+
+        n_label = len(tag_span)
+
+        if n_label == 1:
+            tag = tag_first[0]; sp = tag_span[tag]
             new_nodes.add(seg)
-            new_labels[seg] = h.tag
-            if h.kind == "var":
-                new_vars.setdefault(seg, set()).update(h.tag.split("+"))
+            new_labels[seg] = tag
+            if sp[4] == "var":
+                new_vars.setdefault(seg, set()).update(tag.split("+"))
             seg_subs[seg] = [seg]
             side_to_sub[(seg, "L")] = seg
             side_to_sub[(seg, "R")] = seg
-            # For a single-hit segment, the sub-region IS the whole segment
-            # (the hit just labels it; nothing was actually split).
-            provenance[seg] = (seg, 0, slen, h.strand)
+            provenance[seg] = (seg, 0, slen, sp[2])
             continue
-        # Multi-hit: split into chain of pure sub-segments.
-        # Each sub-segment's coordinate range is the hit's (start, end) plus a
-        # half-gap on each side reaching to the midpoint between hits, so that
-        # the union of sub-segments partitions the whole segment with no gaps.
-        boundaries = [0]
-        for i in range(len(hits) - 1):
-            boundaries.append((hits[i].end + hits[i + 1].start) // 2)
-        boundaries.append(slen)
+
+        # n_label >= 2 — order tags by their span's start coordinate; the
+        # leftmost-start tag holds the L-end piece, the rightmost-end tag
+        # holds the R-end piece. Any other tags (n_label > 2) get absorbed
+        # into an unlabeled middle.
+        tags_by_left = sorted(tag_span.items(), key=lambda kv: kv[1][0])
+        L_tag, L_sp = tags_by_left[0]
+        R_tag, R_sp = max(tag_span.items(), key=lambda kv: kv[1][1])
+        if L_tag == R_tag:
+            # Two distinct tags shouldn't collapse to the same span endpoint —
+            # but if a single tag's span dominates both ends (e.g. one wide hit
+            # encompasses another tag entirely), fall back to first/last by start.
+            R_tag, R_sp = tags_by_left[-1]
+
+        # Cut points: midpoint between L-end and the next-leftmost label's
+        # start (gives a clean L-piece boundary) and between the last
+        # non-R label's end and R-end's start.
+        # Simplest concrete recipe:
+        #   left_cut  = (L_sp.end + R_sp.start) // 2  when only 2 tags
+        #               and they touch (L_sp.end >= R_sp.start) → 0-bp middle.
+        #   For >=3 tags, left_cut goes between L_sp.end and the next
+        #   non-L label start; right_cut between previous non-R label end
+        #   and R_sp.start.
+        if n_label == 2:
+            left_cut  = max(L_sp[1], (L_sp[1] + R_sp[0]) // 2)
+            right_cut = min(R_sp[0], (L_sp[1] + R_sp[0]) // 2)
+        else:
+            other_starts = [sp[0] for tag, sp in tag_span.items() if tag not in (L_tag, R_tag)]
+            other_ends   = [sp[1] for tag, sp in tag_span.items() if tag not in (L_tag, R_tag)]
+            left_cut  = (L_sp[1] + min(other_starts)) // 2 if other_starts else L_sp[1]
+            right_cut = (max(other_ends) + R_sp[0]) // 2 if other_ends else R_sp[0]
+        left_cut  = max(L_sp[1], min(left_cut, R_sp[0]))
+        right_cut = max(L_sp[1], min(right_cut, R_sp[0]))
+        if right_cut < left_cut: right_cut = left_cut  # touching spans → empty middle
+
+        # Sub-node IDs: clean position-indexed form "{seg}#{N}" (1-based).
+        # No coordinates encoded in the name — coords live in provenance only.
+        # Order: #1 = L-piece, #2 = middle (if present), trailing # = R-piece.
         subs: list[str] = []
-        for i, h in enumerate(hits):
-            sub_id = f"{seg}__sub{i}_{h.tag}"
-            new_nodes.add(sub_id)
-            new_labels[sub_id] = h.tag
-            if h.kind == "var":
-                new_vars.setdefault(sub_id, set()).update(h.tag.split("+"))
-            subs.append(sub_id)
-            if i > 0:
-                new_edges.add(frozenset((subs[i - 1], sub_id)))
-            provenance[sub_id] = (seg, boundaries[i], boundaries[i + 1], h.strand)
+        # L piece — always emitted
+        L_id = f"{seg}#1"
+        new_nodes.add(L_id); new_labels[L_id] = L_tag
+        if L_sp[4] == "var":
+            new_vars.setdefault(L_id, set()).update(L_tag.split("+"))
+        provenance[L_id] = (seg, 0, left_cut, L_sp[2])
+        subs.append(L_id)
+
+        # Middle piece — only if non-empty
+        if right_cut > left_cut:
+            M_id = f"{seg}#2"
+            new_nodes.add(M_id)
+            # Middle keeps any var labels whose span lies between left_cut
+            # and right_cut — losing them would erase real HD content that
+            # sits between flank-labeled ends (e.g. a single GFA segment
+            # spanning flankL + HD1 + HD2 + flankR would otherwise emit a
+            # var-less node and the classifier would report no_var).
+            # Flank labels in the middle ARE dropped (the canonical layout
+            # puts flanks at the ends of the locus, not in its middle).
+            middle_var_tags: set[str] = set()
+            middle_label_toks: list[str] = []
+            middle_strand = "+"
+            best_aln = 0
+            for tag, sp in tag_span.items():
+                if tag in (L_tag, R_tag): continue
+                # treat a label as "in middle" if its span overlaps [left_cut, right_cut)
+                if sp[1] <= left_cut or sp[0] >= right_cut: continue
+                if sp[4] == "var":
+                    middle_var_tags.update(tag.split("+"))
+                    if sp[3] > best_aln: best_aln = sp[3]; middle_strand = sp[2]
+                middle_label_toks.append(tag)
+            if middle_label_toks:
+                new_labels[M_id] = "+".join(middle_label_toks)
+            if middle_var_tags:
+                new_vars[M_id] = middle_var_tags
+            provenance[M_id] = (seg, left_cut, right_cut, middle_strand)
+            subs.append(M_id)
+            new_edges.add(frozenset((subs[-2], M_id)))
+
+        # R piece
+        R_id = f"{seg}#{len(subs) + 1}"
+        new_nodes.add(R_id); new_labels[R_id] = R_tag
+        if R_sp[4] == "var":
+            new_vars.setdefault(R_id, set()).update(R_tag.split("+"))
+        provenance[R_id] = (seg, right_cut, slen, R_sp[2])
+        new_edges.add(frozenset((subs[-1], R_id)))
+        subs.append(R_id)
+
         seg_subs[seg] = subs
         side_to_sub[(seg, "L")] = subs[0]
         side_to_sub[(seg, "R")] = subs[-1]

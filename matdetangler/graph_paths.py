@@ -30,6 +30,35 @@ def _gfa_segments(gfa: str) -> dict[str, str]:
             f = ln.split("\t"); d[f[1]] = f[2]
     return d
 
+
+# Sub-node ID convention emitted by per_k_caller._segs when P1 split a GFA
+# segment into multiple sub-nodes: "<parent>#<N>" (1-based index, no coords).
+# Lets bubble.txt / bubble.gfa / bubble.png distinguish HD1-bearing vs
+# HD2-bearing sub-regions of the same parent segment instead of collapsing
+# them to a single ambiguous node label. Bare IDs (no "#") are un-split
+# parents. The actual materialized sub-sequence for each sub-node ID is
+# stored by run_per_k in <sample_dir>/<k>/subnode_seqs.fasta, which the
+# resolver reads to populate the seqs dict when needed.
+def _parent_of(sid: str) -> str:
+    return sid.split("#", 1)[0] if "#" in sid else sid
+
+def _load_subnode_seqs(k_dir: str) -> dict[str, str]:
+    """Read <k_dir>/subnode_seqs.fasta if present. Returns {} otherwise."""
+    p = os.path.join(k_dir, "subnode_seqs.fasta")
+    if not os.path.exists(p): return {}
+    out: dict[str, str] = {}
+    cur = None; buf: list[str] = []
+    with open(p) as fh:
+        for ln in fh:
+            ln = ln.rstrip()
+            if ln.startswith(">"):
+                if cur is not None: out[cur] = "".join(buf)
+                cur = ln[1:].split()[0]; buf = []
+            else:
+                buf.append(ln)
+        if cur is not None: out[cur] = "".join(buf)
+    return out
+
 def _gfa_adj(gfa: str) -> dict[str, set[str]]:
     a = collections.defaultdict(set)
     for ln in open(gfa):
@@ -251,17 +280,43 @@ def emit_ascii(arm1: list[str], arm2: list[str] | None, labels: dict[str, str], 
         o.write("allele1: " + _astr(arm1, labels) + "\n")
         o.write("allele2: " + _astr(arm2 or [], labels) + "\n")
 
-def emit_sub_gfa(arm1: list[str], arm2: list[str] | None, gfa: str, out_path: str) -> None:
-    """Extract S-lines for the bubble nodes + L-lines among them."""
+def emit_sub_gfa(arm1: list[str], arm2: list[str] | None, gfa: str, out_path: str,
+                 sub_seqs: dict[str, str] | None = None) -> None:
+    """Extract S-lines for the bubble nodes + L-lines among them.
+
+    If `sub_seqs` is given, S-lines are written directly from it (one per
+    sub-node ID, supports decorated `parent#start-end±` IDs). L-lines are
+    synthesized from arm adjacency since the source GFA only has parent-level
+    edges. Otherwise we fall back to copying S-lines verbatim from the GFA
+    (legacy bare-ID case) and copying parent-to-parent L-lines.
+    """
     keep = set(arm1) | (set(arm2) if arm2 else set())
-    with open(gfa) as fh, open(out_path, "w") as o:
-        for ln in fh:
-            if ln[0] == "S":
-                f = ln.split("\t")
-                if f[1] in keep: o.write(ln)
-            elif ln[0] == "L":
-                f = ln.split("\t")
-                if f[1] in keep and f[3] in keep: o.write(ln)
+    with open(out_path, "w") as o:
+        if sub_seqs:
+            # S-lines: write each retained node with its sub-region sequence
+            for nm in keep:
+                seq = sub_seqs.get(nm, "")
+                if not seq: continue
+                o.write(f"S\t{nm}\t{seq}\n")
+            # L-lines: synthesized from arm-walk adjacency. Each arm
+            # contributes (n_i, n_{i+1}) pairs; strand is unknown post-trim
+            # so we mark + by convention. Duplicates collapsed.
+            seen_links: set[tuple[str, str]] = set()
+            for arm in (arm1, arm2 or []):
+                for a, b in zip(arm[:-1], arm[1:]):
+                    if (a, b) in seen_links or (b, a) in seen_links: continue
+                    seen_links.add((a, b))
+                    o.write(f"L\t{a}\t+\t{b}\t+\t0M\n")
+            return
+        # Fallback: copy from source GFA (bare-ID only)
+        with open(gfa) as fh:
+            for ln in fh:
+                if ln[0] == "S":
+                    f = ln.split("\t")
+                    if f[1] in keep: o.write(ln)
+                elif ln[0] == "L":
+                    f = ln.split("\t")
+                    if f[1] in keep and f[3] in keep: o.write(ln)
 
 def emit_dot_tsv(arm1: list[str], arm2: list[str] | None, labels: dict[str, str],
                  out_dot: str, out_tsv: str) -> None:
@@ -284,103 +339,118 @@ def emit_dot_tsv(arm1: list[str], arm2: list[str] | None, labels: dict[str, str]
         if arm2: add_edges(arm2, "arm2")
         o.write("}\n")
 
-def emit_png_paired(arm1: list[str], arm2: list[str] | None, labels: dict[str, str],
+def emit_png_paired(arms: list[list[str]], arm_names: list[str], labels: dict[str, str],
                     out_path: str, title: str | None = None) -> None:
-    """Two horizontal walks (arm1 top, arm2 bottom), each retaining its own node IDs.
-    Flank-bearing nodes (labels containing 'flank') across arms are linked by a thin
-    dashed gray line — a visual homology hint without forcing the two arms onto a single
-    backbone. If the two walks happen to converge (the picker chose two distinct alleles
-    but the GFA path-finder traced them to the same nodes), they'll just be drawn as two
-    identical-looking rows; that's the honest representation."""
+    """Render N walks as N stacked horizontal rows (top to bottom). Each row
+    keeps its own node IDs. For N=1 the single row is centered (singleton
+    mode). For N=2 the original blue/orange paired layout is preserved.
+    For N>=3 a cycling palette is used and cross-row homology lines are
+    drawn between every PAIR of consecutive rows that share a node ID.
+    A title (if given) sits above the figure — bash wrapper uses this to
+    surface the bubble verdict + allele count.
+
+    Backward compatibility shim: legacy callers passed (arm1, arm2, labels, out, title).
+    The wrapper at module bottom translates that to the new signature.
+    """
     try:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
     except ImportError:
         print("  [png] matplotlib not available; skipping bubble.png", file=sys.stderr); return
-    if not arm1 and not arm2: return
-    # Allow singleton mode: one arm (the picked single allele) rendered centered.
-    if not arm2: arm2 = []
-    if not arm1: arm1, arm2 = arm2, []
-    n1, n2 = len(arm1), len(arm2)
-    singleton = (n2 == 0)
-    fig_h = 3.0 if singleton else 4.5
-    fig, ax = plt.subplots(figsize=(max(9, 2 + 1.8 * max(n1, n2)), fig_h))
+    arms = [a for a in arms if a]
+    if not arms: return
+    # Cap visible rows at 4 — above that the plot stops being a useful
+    # picture (overlapping boxes, illegible labels). Extras are dropped from
+    # the PNG only; bubble.txt / picks.tsv still carry the full set.
+    truncated = max(0, len(arms) - 4)
+    arm_names = list(arm_names) + [""] * max(0, len(arms) - len(arm_names))
+    if truncated:
+        arms = arms[:4]; arm_names = arm_names[:4]
+    N = len(arms)
+    max_n = max(len(a) for a in arms)
+    # 1 inch per row + header padding, no compression at higher N
+    fig_h = 2.0 + 1.0 * N
+    fig_w = max(9, 2 + 1.8 * max_n)
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    # Row layout: 1.0 data-unit spacing per row, centered around y=0.
+    # Top row = (N-1)/2, bottom row = -(N-1)/2. Plenty of headroom so the
+    # outermost rows don't clip on annotations.
+    ys = [(N - 1) / 2.0 - i for i in range(N)]
     def positions(path, y):
         n = len(path)
         if n < 2: return [(0.5, y)]
         return [(i / (n - 1), y) for i in range(n)]
-    pos1 = positions(arm1, 0.0 if singleton else +0.45)
-    pos2 = positions(arm2, -0.45) if not singleton else []
+    row_pos = [positions(arm, ys[i]) for i, arm in enumerate(arms)]
+    palette = ["#3b6db8", "#d97a3a", "#5e9c64", "#a463b5", "#c7503f",
+               "#1f8a8a", "#8a6f2e", "#5b5f96"]
+    row_colors = [palette[i % len(palette)] for i in range(N)]
+
     def face_for(lab):
-        # Variable-gene (HD) takes precedence over flank; pure-number / empty
-        # labels are white. A node tagged "HD1+flankL" is colored as HD-bearing
-        # because the HD content is what diverges between alleles.
         tokens = [t for t in lab.split("+") if t]
         has_flank = any(t.startswith("flank") for t in tokens)
         has_var   = any(not t.startswith("flank") for t in tokens)
-        return ("#fff3b0" if has_var      # variable gene → yellow
-                else "#cfe8ff" if has_flank  # flank only   → blue
-                else "#ffffff")              # pure number  → white
-    # Cross-arm homology lines:
-    #   1. For EVERY GFA segment ID that appears in both arms (any label),
-    #      draw a dashed line linking the two occurrences. Same ID = same
-    #      segment in the GFA = definite homology.
-    #   2. As a flank-end fallback: if NO flank-only node (label is flankL or
-    #      flankR with NO variable-gene tag) is shared between the arms for
-    #      that flank type, draw ONE extra line connecting the outermost
-    #      flank-only node of each arm. Outermost: leftmost flankL (arm
-    #      entry), rightmost flankR (arm exit).
-    # The pure-pairwise variant (linking every flank-bearing node to every
-    # other in the opposite arm) turned bubbles with many flank-tagged
-    # segments into a hairball; this rule preserves homology evidence
-    # without spurious cross-links.
+        return ("#fff3b0" if has_var
+                else "#cfe8ff" if has_flank
+                else "#ffffff")
+
     def _is_flank_only(lab: str, want: str) -> bool:
         toks = [t for t in lab.split("+") if t]
         return bool(toks) and all(t.startswith("flank") for t in toks) and want in toks
-    if not singleton:
-        ids1: dict[str, int] = {}
-        for i, n in enumerate(arm1): ids1.setdefault(n, i)
-        ids2: dict[str, int] = {}
-        for j, n in enumerate(arm2): ids2.setdefault(n, j)
-        shared_ids = set(ids1) & set(ids2)
-        for node in shared_ids:
-            i, j = ids1[node], ids2[node]
-            ax.plot([pos1[i][0], pos2[j][0]], [pos1[i][1], pos2[j][1]],
-                    color="#9aa0a6", lw=0.9, ls="--", zorder=0)
-        # outermost flank-only fallback for whichever flank has no shared-ID anchor
+
+    # Cross-row homology lines — drawn between EVERY consecutive pair of
+    # rows. Same logic as the old 2-arm version, just applied repeatedly.
+    if N >= 2:
         OUTER = {"flankL": "first", "flankR": "last"}
-        for want in ("flankL", "flankR"):
-            idx1 = [i for i, n in enumerate(arm1) if _is_flank_only(labels.get(n, ""), want)]
-            idx2 = [j for j, n in enumerate(arm2) if _is_flank_only(labels.get(n, ""), want)]
-            if not idx1 or not idx2: continue
-            if any(arm1[i] in shared_ids for i in idx1): continue
-            if any(arm2[j] in shared_ids for j in idx2): continue
-            pick = (lambda xs: xs[0]) if OUTER[want] == "first" else (lambda xs: xs[-1])
-            i = pick(idx1); j = pick(idx2)
-            ax.plot([pos1[i][0], pos2[j][0]], [pos1[i][1], pos2[j][1]],
-                    color="#9aa0a6", lw=0.9, ls="--", zorder=0)
-    # arm 1 (blue) — backbone + boxes
-    for (xa, ya), (xb, yb) in zip(pos1[:-1], pos1[1:]):
-        ax.plot([xa, xb], [ya, yb], color="#3b6db8", lw=1.8, zorder=1)
-    for (x, y), n in zip(pos1, arm1):
-        la = labels.get(n, "")
-        ax.annotate(f"{n}\n{la}" if la else n, (x, y), ha="center", va="center", fontsize=8,
-                    bbox=dict(boxstyle="round,pad=0.30", fc=face_for(la), ec="0.4"), zorder=2)
-    # arm 2 (orange) — skipped in singleton mode
-    if not singleton:
-        for (xa, ya), (xb, yb) in zip(pos2[:-1], pos2[1:]):
-            ax.plot([xa, xb], [ya, yb], color="#d97a3a", lw=1.8, zorder=1)
-        for (x, y), n in zip(pos2, arm2):
+        for k in range(N - 1):
+            a, b = arms[k], arms[k + 1]
+            pa, pb = row_pos[k], row_pos[k + 1]
+            ids_a: dict[str, int] = {}
+            for i, n in enumerate(a): ids_a.setdefault(n, i)
+            ids_b: dict[str, int] = {}
+            for j, n in enumerate(b): ids_b.setdefault(n, j)
+            shared = set(ids_a) & set(ids_b)
+            for node in shared:
+                i, j = ids_a[node], ids_b[node]
+                ax.plot([pa[i][0], pb[j][0]], [pa[i][1], pb[j][1]],
+                        color="#9aa0a6", lw=0.9, ls="--", zorder=0)
+            for want in ("flankL", "flankR"):
+                ia = [i for i, n in enumerate(a) if _is_flank_only(labels.get(n, ""), want)]
+                ib = [j for j, n in enumerate(b) if _is_flank_only(labels.get(n, ""), want)]
+                if not ia or not ib: continue
+                if any(a[i] in shared for i in ia): continue
+                if any(b[j] in shared for j in ib): continue
+                pick = (lambda xs: xs[0]) if OUTER[want] == "first" else (lambda xs: xs[-1])
+                i = pick(ia); j = pick(ib)
+                ax.plot([pa[i][0], pb[j][0]], [pa[i][1], pb[j][1]],
+                        color="#9aa0a6", lw=0.9, ls="--", zorder=0)
+
+    # Draw each row: backbone + boxes + row label
+    for i, (arm, name, color, pos) in enumerate(zip(arms, arm_names, row_colors, row_pos)):
+        for (xa, ya), (xb, yb) in zip(pos[:-1], pos[1:]):
+            ax.plot([xa, xb], [ya, yb], color=color, lw=1.8, zorder=1)
+        for (x, y), n in zip(pos, arm):
             la = labels.get(n, "")
             ax.annotate(f"{n}\n{la}" if la else n, (x, y), ha="center", va="center", fontsize=8,
                         bbox=dict(boxstyle="round,pad=0.30", fc=face_for(la), ec="0.4"), zorder=2)
-    ax.set_xlim(-0.05, 1.05)
-    if singleton: ax.set_ylim(-0.5, 0.5)
-    else: ax.set_ylim(-0.9, 0.9)
+        # Row label (e.g. "chimera3") above its segment row, NOT on the
+        # same y as the segment boxes — keeps the label out of the box
+        # area when arms are dense and avoids overlap with cross-row
+        # homology lines. Centered along the row so it's visible regardless
+        # of how many boxes are on this row.
+        ax.text(-0.05, ys[i] + 0.32, name, ha="left", va="bottom", fontsize=9,
+                color=color, weight="bold")
+
+    ax.set_xlim(-0.08, 1.05)
+    pad_top, pad_bot = 0.9, 0.6   # extra headroom for the per-row labels
+    ax.set_ylim(min(ys) - pad_bot, max(ys) + pad_top)
     ax.set_xticks([]); ax.set_yticks([])
     for sp in ("top", "right", "bottom", "left"): ax.spines[sp].set_visible(False)
-    if title: ax.set_title(title, fontsize=10)
+    full_title = title or ""
+    if truncated:
+        # Footnote-style suffix when extras were dropped
+        full_title = (full_title + f"   [showing 4 of {N + truncated}]").strip()
+    if full_title: ax.set_title(full_title, fontsize=11, weight="bold")
     plt.tight_layout()
     plt.savefig(out_path, dpi=150)
     plt.close(fig)
@@ -406,7 +476,9 @@ def _trace_allele_in_gfa(seq: str, gfa: str, queries_dir: str,
 def run(sample: str, gfa: str, primary_alleles_fa: str, queries_dir: str, outdir: str,
         known_degHD: str | None = None, repeats: str | None = None,
         per_allele_gfas: dict[str, str] | None = None,
-        recorded_paths: dict[str, list[str]] | None = None) -> dict:
+        recorded_paths: dict[str, list[str]] | None = None,
+        subnode_seqs_per_gfa: dict[str, dict[str, str]] | None = None,
+        bubble_type: str | None = None) -> dict:
     """Trace each picked allele's walk through a GFA and emit ASCII/DOT/PNG views.
 
     `per_allele_gfas`: optional mapping allele_name -> GFA path. When given (and the allele's
@@ -417,12 +489,21 @@ def run(sample: str, gfa: str, primary_alleles_fa: str, queries_dir: str, outdir
     `recorded_paths`: optional mapping allele_name -> list of segment IDs (the path written by
     `segment_alleles.py` into `picks.tsv:segments`). When given, used verbatim — no
     re-derivation needed. Strands (`+`/`-`) in segment IDs are stripped before lookup.
+
+    `subnode_seqs_per_gfa`: optional mapping GFA path -> {sub_id: sub_sequence}. Provides
+    materialized sub-region sequences for "{parent}#N" decorated IDs. When given, these
+    sub-IDs are added to the per-GFA seqs dict so labels reflect per-sub-region content.
+
+    `bubble_type`: optional verdict label (closed_bubble, open_bubble, complexed, ...) for
+    the PNG title. When given together with N alleles, the figure title shows
+    "{sample}: {bubble_type} (N alleles)".
     """
     os.makedirs(outdir, exist_ok=True)
     alleles = read_fasta(primary_alleles_fa)
     if not alleles:
         print(f"[graph_paths] {sample}: no picked alleles; nothing to draw")
         return {}
+    sub_seqs_per_gfa = subnode_seqs_per_gfa or {}
     # Two-stage optimization for the labeling cost:
     # (1) PER-GFA CACHE: multiple alleles from the same k share the same GFA;
     #     parse it once and reuse.
@@ -432,6 +513,13 @@ def run(sample: str, gfa: str, primary_alleles_fa: str, queries_dir: str, outdir
     #     O(|union of paths|=~tens of segs). When any allele lacks a recorded
     #     path, we fall back to labeling the full GFA (alignment-based trace
     #     needs to know labels for every candidate segment).
+    # Per GFA: collect the set of recorded sub-node IDs needed. Decorated
+    # sub-node IDs ("{parent}#N") have their materialized sequence in the
+    # per-k subnode_seqs.fasta; bare IDs come from the GFA directly. We
+    # augment the seqs dict so label_nodes() sees the actual sub-region
+    # content (so an HD1-only sub-node labels as "HD1" rather than the
+    # parent's joint "HD1+HD2"), and so downstream lookups for these IDs
+    # succeed.
     needed_segs_per_gfa: dict[str, set[str] | None] = {}
     for nm in alleles:
         g = (per_allele_gfas or {}).get(nm) or gfa
@@ -445,13 +533,26 @@ def run(sample: str, gfa: str, primary_alleles_fa: str, queries_dir: str, outdir
     gfa_cache: dict[str, tuple[dict[str, str], dict[str, str]]] = {}
     def _seqs_labels_for(g: str):
         if g in gfa_cache: return gfa_cache[g]
-        ss = _gfa_segments(g)
+        parent_seqs = _gfa_segments(g)
+        # Sub-node seqs live next to the GFA's per-k output dir, NOT next
+        # to the GFA file itself. Per-allele resolver passes (per_allele_gfas)
+        # the SPAdes graph path, but the materialized sub-node FASTA was
+        # written by run_per_k to <results>/<sample>/<k>/subnode_seqs.fasta.
+        # We can't infer that from the spades path alone, so the resolver
+        # below attaches it via a side dict (sub_seqs_per_gfa).
+        sub_seqs = sub_seqs_per_gfa.get(g, {})
         needed = needed_segs_per_gfa.get(g)
         if needed is None:
+            ss = dict(parent_seqs); ss.update(sub_seqs)
             ll = label_nodes(ss, queries_dir, known_degHD, repeats)
         else:
-            subset = {sid: ss[sid] for sid in needed if sid in ss}
-            ll = label_nodes(subset, queries_dir, known_degHD, repeats)
+            ss = {}
+            for sid in needed:
+                if "#" in sid:
+                    if sid in sub_seqs: ss[sid] = sub_seqs[sid]
+                elif sid in parent_seqs:
+                    ss[sid] = parent_seqs[sid]
+            ll = label_nodes(ss, queries_dir, known_degHD, repeats)
         gfa_cache[g] = (ss, ll)
         return ss, ll
     # per-allele trace
@@ -483,6 +584,26 @@ def run(sample: str, gfa: str, primary_alleles_fa: str, queries_dir: str, outdir
             if tagn not in merged_labels: merged_labels[tagn] = labels.get(n, "")
             if tagn not in merged_seqs:   merged_seqs[tagn]   = seqs.get(n, "")
         arm_paths.append(tagged_path)
+    # Orient each row so its var-tag fingerprint matches the first row's
+    # (the leftmost var-bearing node on every row carries the same gene tag
+    # — matching the File-S1-style canonical convention). A row whose
+    # var-tag order is the EXACT REVERSE of row 0's gets walked backwards.
+    # Rows with disjoint or ambiguous fingerprints are left alone.
+    def _vartag_seq(arm: list[str]) -> list[str]:
+        out: list[str] = []
+        for n in arm:
+            lab = merged_labels.get(n, "")
+            toks = [t for t in lab.split("+") if t and not t.startswith("flank")]
+            if toks and (not out or out[-1] != toks[0]):
+                out.append(toks[0])
+        return out
+    if arm_paths:
+        canon = _vartag_seq(arm_paths[0])
+        if canon:
+            for i in range(1, len(arm_paths)):
+                vs = _vartag_seq(arm_paths[i])
+                if vs and vs == list(reversed(canon)):
+                    arm_paths[i] = list(reversed(arm_paths[i]))
     arm1 = arm_paths[0] if arm_paths else []
     arm2 = arm_paths[1] if len(arm_paths) > 1 else None
     emit_ascii(arm1, arm2, merged_labels, os.path.join(outdir, "bubble.txt"))
@@ -491,30 +612,54 @@ def run(sample: str, gfa: str, primary_alleles_fa: str, queries_dir: str, outdir
     used_gfas = list(dict.fromkeys(a[4] for a in arm_data))
     def _tag_for(g):
         return "" if same_gfa else "K" + os.path.basename(os.path.dirname(g)).lstrip("kK") + ":"
+    # If any allele's path contains decorated sub-node IDs (anything with
+    # "#" — emitted by per_k_caller when P1 split a parent into multiple
+    # sub-nodes), the source GFA can't supply those S-lines verbatim; emit
+    # them from the merged sub-seqs dict instead, and synthesize L-lines
+    # from arm-walk adjacency (parent-to-parent L-lines from the GFA no
+    # longer have the right node names anyway).
+    any_subnode = any("#" in n for a in arm_paths for n in a)
     with open(os.path.join(outdir, "bubble.gfa"), "w") as o:
-        for g in used_gfas:
-            tag = _tag_for(g)
-            tagged_ids_for_this_g = {n for a in arm_paths for n in a if (not tag) or n.startswith(tag)}
-            raw_ids = {n[len(tag):] if tag else n for n in tagged_ids_for_this_g}
-            for ln in open(g):
-                if ln[0] == "S":
-                    f = ln.split("\t")
-                    if f[1] in raw_ids:
-                        o.write("\t".join([f[0], f"{tag}{f[1]}"] + f[2:]))
-                elif ln[0] == "L":
-                    f = ln.split("\t")
-                    if f[1] in raw_ids and f[3] in raw_ids:
-                        f[1] = f"{tag}{f[1]}"; f[3] = f"{tag}{f[3]}"
-                        o.write("\t".join(f))
+        if any_subnode:
+            for n in dict.fromkeys(n for a in arm_paths for n in a):
+                seq = merged_seqs.get(n, "")
+                if seq: o.write(f"S\t{n}\t{seq}\n")
+            seen_links: set[tuple[str, str]] = set()
+            for arm in arm_paths:
+                for a, b in zip(arm[:-1], arm[1:]):
+                    if (a, b) in seen_links or (b, a) in seen_links: continue
+                    seen_links.add((a, b))
+                    o.write(f"L\t{a}\t+\t{b}\t+\t0M\n")
+        else:
+            for g in used_gfas:
+                tag = _tag_for(g)
+                tagged_ids_for_this_g = {n for a in arm_paths for n in a if (not tag) or n.startswith(tag)}
+                raw_ids = {n[len(tag):] if tag else n for n in tagged_ids_for_this_g}
+                for ln in open(g):
+                    if ln[0] == "S":
+                        f = ln.split("\t")
+                        if f[1] in raw_ids:
+                            o.write("\t".join([f[0], f"{tag}{f[1]}"] + f[2:]))
+                    elif ln[0] == "L":
+                        f = ln.split("\t")
+                        if f[1] in raw_ids and f[3] in raw_ids:
+                            f[1] = f"{tag}{f[1]}"; f[3] = f"{tag}{f[3]}"
+                            o.write("\t".join(f))
     emit_dot_tsv(arm1, arm2, merged_labels,
                   os.path.join(outdir, "bubble.dot"),
                   os.path.join(outdir, "bubble.tsv"))
-    if same_gfa:
-        _png_title = f"{sample}: locus walks (allele1=blue, allele2=orange)"
+    # PNG title: "{sample}: {bubble_type} (N alleles)" on top — surfaces
+    # the classifier verdict + the allele count right in the figure.
+    n_drawn = len(arm_paths)
+    allele_names_list = list(alleles.keys())
+    if bubble_type:
+        _png_title = f"{sample}: {bubble_type} ({n_drawn} allele{'s' if n_drawn != 1 else ''})"
+    elif same_gfa:
+        _png_title = f"{sample}: {n_drawn} allele walk{'s' if n_drawn != 1 else ''}"
     else:
         ks_label = ' vs '.join('K' + os.path.basename(os.path.dirname(g)).lstrip('kK') for g in used_gfas)
         _png_title = f"{sample}: per-allele walks ({ks_label})"
-    emit_png_paired(arm1, arm2, merged_labels,
+    emit_png_paired(arm_paths, allele_names_list, merged_labels,
                     os.path.join(outdir, "bubble.png"), title=_png_title)
     arm1_str = _astr(arm1, merged_labels)
     arm2_str = _astr(arm2 or [], merged_labels)
@@ -556,6 +701,77 @@ def _paths_from_cand_ann(cand_ann_tsv: str, spades_dir: str, primary_alleles_fa:
     return out_gfas, out_paths
 
 
+def _picks_summary_bubble_type(picks_tsv: str) -> str | None:
+    """Read bubble_type from the sibling picks_summary.tsv (single row).
+    Returns None when the file is absent or unreadable."""
+    if not picks_tsv: return None
+    summary = picks_tsv.replace("picks.tsv", "picks_summary.tsv")
+    if not os.path.exists(summary): return None
+    with open(summary) as fh:
+        hdr = next(fh, "").rstrip("\n").split("\t")
+        if "bubble_type" not in hdr: return None
+        i = hdr.index("bubble_type")
+        row = next(fh, "").rstrip("\n").split("\t")
+        if len(row) <= i: return None
+        v = row[i].strip()
+        return v if v and v not in ("-", "NA", "NO_RESULT") else None
+
+
+def _subnode_seqs_per_gfa(per_allele_gfas: dict[str, str]) -> dict[str, dict[str, str]]:
+    """For each unique GFA path in per_allele_gfas, load <gfa_dir>/subnode_seqs.fasta
+    if present. Returns {gfa_path: {sub_id: sub_seq}}. The directory holding
+    the GFA is also where run_per_k writes the subnode FASTA, so we look there."""
+    out: dict[str, dict[str, str]] = {}
+    seen_gfas = set(per_allele_gfas.values())
+    # Each GFA path is .../spades/<sample>/<k>/assembly_graph_after_simplification.gfa
+    # but subnode_seqs.fasta is in the RESULTS sample/k dir, not next to the GFA.
+    # The caller is expected to populate this via _subnode_seqs_per_gfa_from_picks
+    # — this default helper just covers the (rare) case where the FASTA sits
+    # next to the GFA itself.
+    for g in seen_gfas:
+        k_dir = os.path.dirname(g)
+        seqs = _load_subnode_seqs(k_dir)
+        if seqs: out[g] = seqs
+    return out
+
+
+def _subnode_seqs_per_gfa_from_picks(picks_tsv: str, per_allele_gfas: dict[str, str]
+                                      ) -> dict[str, dict[str, str]]:
+    """Resolve subnode_seqs.fasta from the RESULTS dir: each allele's source
+    k is in picks.tsv, and run_per_k wrote subnode_seqs.fasta to
+    <picks_dir>/<k>/subnode_seqs.fasta. We aggregate across alleles, keyed
+    by the per-allele GFA path so the resolver can look up directly."""
+    if not picks_tsv or not os.path.exists(picks_tsv): return {}
+    results_sample_dir = os.path.dirname(picks_tsv)
+    # parse picks.tsv: allele -> k
+    allele_to_k: dict[str, str] = {}
+    with open(picks_tsv) as fh:
+        hdr = next(fh, "").rstrip("\n").split("\t")
+        try:
+            i_a = hdr.index("allele"); i_k = hdr.index("k")
+        except ValueError:
+            return {}
+        for ln in fh:
+            f = ln.rstrip("\n").split("\t")
+            if len(f) > max(i_a, i_k):
+                allele_to_k[f[i_a]] = f[i_k]
+    # for each GFA in per_allele_gfas, derive the k and load that k's
+    # subnode_seqs.fasta from the results dir
+    out: dict[str, dict[str, str]] = {}
+    for nm, g in per_allele_gfas.items():
+        # nm in primary fasta is like "<SAMPLE>_k53_allele1"; the picks
+        # entries use short names. We need to find an entry that matches.
+        k = None
+        for short, kk in allele_to_k.items():
+            if nm.endswith("_" + short) or nm == short or nm.endswith(short):
+                k = kk; break
+        if not k: continue
+        k_dir = os.path.join(results_sample_dir, k)
+        seqs = _load_subnode_seqs(k_dir)
+        if seqs: out[g] = seqs
+    return out
+
+
 def _per_allele_gfas_and_paths(picks_tsv: str, spades_dir: str, primary_alleles_fa: str
                                 ) -> tuple[dict[str, str], dict[str, list[str]]]:
     """Read picks.tsv and resolve each allele's (a) source-k GFA and (b) recorded segment path.
@@ -581,8 +797,13 @@ def _per_allele_gfas_and_paths(picks_tsv: str, spades_dir: str, primary_alleles_
             if len(f) <= max(i_allele, i_k): continue
             short_to_k[f[i_allele]] = f[i_k]
             if i_segs >= 0 and len(f) > i_segs and f[i_segs] not in ("", "-"):
-                # strand-stripped segment IDs (e.g. "975421+" -> "975421")
-                short_to_segs[f[i_allele]] = [s.rstrip("+-") for s in f[i_segs].split(",")]
+                # Strip trailing strand marks ONLY on bare parent IDs
+                # (e.g. "975421+" -> "975421"). Decorated sub-node IDs of
+                # the form "parent#start-end[+|-]" keep their full form —
+                # the trailing strand is part of the sub-region encoding.
+                def _strip_bare(s: str) -> str:
+                    return s.rstrip("+-") if "#" not in s else s
+                short_to_segs[f[i_allele]] = [_strip_bare(s) for s in f[i_segs].split(",")]
     fasta_names = []
     for ln in open(primary_alleles_fa):
         if ln.startswith(">"): fasta_names.append(ln[1:].split()[0])
@@ -620,12 +841,17 @@ def _cli(argv=None):
     a = p.parse_args(argv)
     if a.picks_tsv and a.spades_dir and os.path.exists(a.picks_tsv):
         pag, rec = _per_allele_gfas_and_paths(a.picks_tsv, a.spades_dir, a.primary_alleles)
+        sub_per_gfa = _subnode_seqs_per_gfa_from_picks(a.picks_tsv, pag)
+        btype = _picks_summary_bubble_type(a.picks_tsv)
     elif a.cand_ann and a.spades_dir:
         pag, rec = _paths_from_cand_ann(a.cand_ann, a.spades_dir, a.primary_alleles)
+        sub_per_gfa = _subnode_seqs_per_gfa(pag)
+        btype = None
     else:
-        pag, rec = ({}, {})
+        pag, rec, sub_per_gfa, btype = ({}, {}, {}, None)
     run(a.sample, a.gfa, a.primary_alleles, a.queries_dir, a.outdir,
-        a.known_degHD, a.repeats, per_allele_gfas=pag, recorded_paths=rec)
+        a.known_degHD, a.repeats, per_allele_gfas=pag, recorded_paths=rec,
+        subnode_seqs_per_gfa=sub_per_gfa, bubble_type=btype)
 
 if __name__ == "__main__":
     _cli()
