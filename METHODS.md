@@ -198,7 +198,7 @@ for each K in --ks:
                        var_proteins_ref=HDs.fasta,
                        expected_var_tags={HD1, HD2, ...},
                        locus_padding=1500,
-                       divergence_threshold=0.05)
+                       divergence_threshold=0.01)
 
     write_fasta(res.alleles, <outdir>/<K>/alleles.fasta)
     write_result_tsv(res,    <outdir>/<K>/result.tsv)
@@ -400,7 +400,7 @@ the rest is a single counting step.
 
 ### 3.7 `find_alleles` BFS loop
 
-`find_alleles(seg_label_hits_tsv, gfa_path, genome_cov, init_nhop=3, max_nhop=10, var_proteins_ref=…, expected_var_tags=…, locus_padding=4000, lo_mult=0.2, hi_mult=2.0, divergence_threshold=0.05, queries_dir=…, out_candidate_fa=…, seeds_mode="both", cov_filter=True, max_paths=50, max_path_length=15, min_allele_bp=3000)`
+`find_alleles(seg_label_hits_tsv, gfa_path, genome_cov, init_nhop=3, max_nhop=10, var_proteins_ref=…, expected_var_tags=…, locus_padding=4000, lo_mult=0.2, hi_mult=2.0, divergence_threshold=0.01, queries_dir=…, out_candidate_fa=…, seeds_mode="both", cov_filter=True, max_paths=50, max_path_length=15, min_allele_bp=3000)`
 
 The orchestrator runs the BFS at increasing hop counts, collects per-network
 candidates from every iteration, optionally short-circuits when a fully
@@ -580,7 +580,7 @@ build sequences via provenance (orig_seg, start, end, strand)
     │      ed_fwd = edlib.align(q, t,         mode=HW, task=distance)
     │      ed_rc  = edlib.align(q, RC(t),     mode=HW, task=distance)
     │      identity = 1 − min(ed_fwd, ed_rc) / |q|
-    │    threshold default = 5% (collapse if identity ≥ 95%)
+    │    threshold default = 1% (collapse if identity ≥ 99%)
     ▼
 emit: allele1 / allele1+allele2 / chimera1..N (by post-dedup count)
     │

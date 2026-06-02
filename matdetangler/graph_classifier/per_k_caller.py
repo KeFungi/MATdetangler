@@ -302,7 +302,7 @@ def find_alleles(
         genome_cov: float | None = None,
         init_nhop: int = 3,
         max_nhop: int = 10,
-        divergence_threshold: float = 0.05,
+        divergence_threshold: float = 0.01,
         lo_mult: float = 0.2,
         hi_mult: float = 2.0,
         k: int | str | None = None,
@@ -531,7 +531,7 @@ def _bubble_priority(verdict: str, n_dedup: int) -> int:
 
 
 def build_longest_alleles_fasta(candidate_fa: str, out_fa: str,
-                                  divergence_threshold: float = 0.05) -> int:
+                                  divergence_threshold: float = 0.01) -> int:
     """Read every emission from `candidate_fa` (= candidate_allele.fasta),
     run length-first RC-aware dedup at `divergence_threshold` (5% default),
     and write the surviving sequences — the LONGEST representative of each
@@ -805,7 +805,7 @@ def _arm_sequence_for_skip(arm_path: list[str], provenance: dict,
 
 
 def _dedup_sequences(seqs: list[str],
-                      divergence_threshold: float = 0.05) -> list[str]:
+                      divergence_threshold: float = 0.01) -> list[str]:
     """Collapse non-divergent sequences. Walk in length-desc order so the
     longest representative of each equivalence class is kept."""
     nonempty = [s for s in seqs if s]
@@ -874,7 +874,7 @@ def _tblastn_trim_each(
 
 
 def _dedup_named(named_seqs: list[tuple[str, str]],
-                  divergence_threshold: float = 0.05
+                  divergence_threshold: float = 0.01
                   ) -> list[tuple[str, str]]:
     """Length-desc walk, drop seqs whose k-mer Jaccard distance < threshold from
     any already-kept seq. Like _dedup_sequences but preserves the (name, seq) pairing."""
@@ -986,7 +986,7 @@ def _path_mean_cov(path: list[str], provenance: dict,
 
 def _emit_result(res: dict, gfa_seqs: dict[str, str],
                   depths: dict[str, float] | None = None,
-                  divergence_threshold: float = 0.05,
+                  divergence_threshold: float = 0.01,
                   var_proteins_ref: str | None = None,
                   locus_padding: int = 1500,
                   expected_var_tags: set[str] | None = None,

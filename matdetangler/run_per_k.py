@@ -82,7 +82,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--lo-mult",   type=float, default=0.2)
     ap.add_argument("--hi-mult",   type=float, default=2.0)
     ap.add_argument("--locus-padding", type=int, default=4000)
-    ap.add_argument("--divergence-threshold", type=float, default=0.05)
+    ap.add_argument("--divergence-threshold", type=float, default=0.01)
     ap.add_argument("--seeds", choices=("var","flank","both"), default="both",
                     help="BFS seed source (var-labeled, flank-labeled, or both). Default: both.")
     ap.add_argument("--cov-filter", choices=("on","off"), default="on",
