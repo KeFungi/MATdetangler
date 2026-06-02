@@ -1,6 +1,111 @@
 # MATdetangler — TODO
 
 ## Open
+
+### Per-iteration timeout in `_try_one_pass` to bound classifier explosion
+
+Heavy-combinatorial bubbles can hang `classify()` (specifically
+`_enum_paths` DFS) for hours when nhop expands the bubble subgraph to
+800+ nodes with many fork points. Example: BPL1195 at k=53 stuck on
+nhop=10 cov-off for 20+ minutes burning 99.7% CPU — `max_paths=200`
+caps OUTPUT count but DFS keeps exploring fork combinations until it
+stumbles into 200 L→R paths.
+
+Fix: wrap each `_try_one_pass` `classify()` call with a per-iteration
+deadline (e.g., 60 s). On timeout, treat as `complexed` / abandon, log,
+proceed to next nhop. Implementation options:
+  - Signal-based: `signal.alarm()` + SIGALRM handler (works on Linux,
+    not thread-safe).
+  - DFS budget: pass a `node_visits_budget` counter into `_enum_paths`
+    that decrements on each `dfs()` call; abort when ≤ 0. Cleaner than
+    signal-based, no thread-safety issues, and bounds work deterministically.
+
+Also: bound `_enum_dangling` the same way (it has the same DFS shape).
+
+Quick mitigation while this is open: reduce `max_nhop` to 8 (or even 7)
+for the production array, since the explosion almost always happens at
+nhop ≥ 9 where the BFS subgraph balloons. Costs us nothing for clean
+samples (they accept at nhop=3-4) and prevents the hangs.
+
+### Depth-weighted path decomposition for `n > 2` candidates
+
+When `per_k_caller`'s post-dedup count exceeds 2, fall back to depth-based
+ploidy estimation instead of emitting many chimeras.
+
+Use the GFA `DP:f:` field on each segment to estimate ploidy:
+  ploidy = round(sum_{u in L_anchors} DP(u) / genome_cov)
+
+Then keep only `ploidy` candidate paths — the ones with the strongest
+depth support (sum of `DP(u)` along the path, normalized by length).
+Originally rejected when AG5-shape called for "respect the topological
+complexity," but the AG17 var-trim run showed the assembly graph
+genuinely multi-paths the SAME biological allele (~5 kb cores, all
+distinct in k-mer composition due to k=53 graph artifacts). Depth is
+the principled way to collapse these to true allele count.
+
+### Change label/text gene order
+
+Make the gene order in allele labels / text output configurable.
+Currently `seg_label_hits.tsv` emits multi-tag regions as
+`"+".join(sorted(tags))` (alphabetical, e.g. `HD1+HD2`). Decide on a
+convention — alphabetical, locus-order, or user-supplied — and apply
+consistently across the labeler TSV, FASTA headers, and any downstream
+text-based labels.
+
+### Uvar-leaf fallback anchors when no flank is reachable
+
+Currently the bubble classifier requires at least one flank-adjacent
+node to act as an L-anchor or R-anchor. If the BFS-expanded
+neighborhood contains var content but no flank context (e.g., long
+unlabeled chain bounded by Uvars, or a sub-bubble exposed before the
+flanks come into range), `L_anchors` and `R_anchors` are both empty,
+the classifier returns 0 arms, and the verdict falls through to
+`complexed, "no var-bearing arm"` with empty emission.
+
+Fallback rule (~5 LOC in `bubble_classifier.classify`, right after the
+existing R2 anchor computation):
+
+```python
+# Fallback: promote bubble-leaf Uvars to anchors when no flank reachable
+if not L_anchors and not R_anchors:
+    bubble_deg = {n: sum(1 for m in adj.get(n, ()) if m in bubble)
+                   for n in bubble}
+    leaves = {n for n in bubble & unlabeled if bubble_deg.get(n, 0) <= 1}
+    L_anchors = R_anchors = leaves
+    info["anchor_fallback"] = "uvar_leaves"
+```
+
+Path enumeration (`_enum_paths(adj, s, R_anchors, bubble)`) already
+handles `L_anchors == R_anchors` correctly because of its
+`curr != start` guard — closed paths between any two leaves are found,
+duplicates are canonicalized by `_canonical`.
+
+Add a synthetic test case `case_uvar_bounded_bubble`:
+`Uvar — var — var — Uvar` with a parallel `Uvar — var — var — Uvar`
+and no flank nodes; expect `closed_bubble` with 2 arms.
+
+### BFS-from-both-sides fallback for the bubble classifier
+
+The Appendix-B classifier currently does P2 Bubble BFS by starting from
+all var nodes and walking through unlabeled connectors. If this fails
+to produce a usable bubble (zero var-bearing arms found between
+anchors), as a fallback, **also try BFS from the flanks** — start from
+pure-flank nodes and walk inward through unlabeled connectors until
+hitting a var node. The two BFS frontiers can meet somewhere in the
+middle; the bubble is then "everything in between."
+
+This helps cases where:
+  - Var nodes are very small / sparse and the unlabeled connector chain
+    dominates the bubble territory; var-only BFS terminates immediately
+    while the chain belongs to the bubble.
+  - Composite flanks contain the only var signal but the BFS from var
+    can't reach a flank because the composite IS the flank boundary
+    (and the var on it doesn't have unlabeled outward).
+
+Implementation: run flank-side BFS only when var-side BFS yields zero
+arms. Mark the merged set as the bubble; otherwise keep the current
+single-side BFS result.
+
 ### graph classifier
 develop robust graph classifier assumed flanks and var genes are determined; can be further generalized determine var genes and flank on the flight if var and/or flank is not known later;
 make an isolated graph classifier to test algorithm

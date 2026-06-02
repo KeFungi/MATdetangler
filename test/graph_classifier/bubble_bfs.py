@@ -36,7 +36,9 @@ def build_adj(nodes: set[str], edges: set[frozenset]) -> dict[str, set[str]]:
     """Build undirected adjacency from a set of node IDs and frozenset edges."""
     adj: dict[str, set[str]] = defaultdict(set)
     for e in edges:
-        a, b = tuple(e)
+        t = tuple(e)
+        if len(t) == 1: continue                       # self-loop in GFA
+        a, b = t
         adj[a].add(b); adj[b].add(a)
     return dict(adj)
 

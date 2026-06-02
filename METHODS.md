@@ -1201,42 +1201,233 @@ single counting step.
 
 ### B.8. Implementation
 
-Four modules under `test/graph_classifier/`:
+Six modules under `test/graph_classifier/`. All operate on a **single GFA at
+a single k**; cross-k integration (Suilu k33/k45/k53; Pcub k55/k77) is a
+separate selection step downstream that picks the best per-k call.
 
 | module | role | key function |
 |---|---|---|
-| `seg_processor.py` | P1 directional split | `directional_split(seg_labels, seg_length, edges, edge_endpoints)` |
-| `bubble_bfs.py`    | P2 Bubble BFS from var through unlabeled | `bubble_bfs(adj, var_nodes, unlabeled)` |
+| `labeler.py`        | Aggregator: BLAST cache TSVs + GFA → `seg_label_hits.tsv` (unpacked, one row per tag) | `emit_seg_label_hits(gfa_path, blast_tsvs, out_tsv)` |
+| `seg_processor.py`  | P1 directional split; emits provenance `{sub_id: (orig_seg, start, end, strand)}` | `directional_split(seg_labels, seg_length, edges, edge_endpoints)` |
+| `bubble_bfs.py`     | P2 Bubble BFS from var through unlabeled | `bubble_bfs(adj, var_nodes, unlabeled)` |
 | `bubble_classifier.py` | R1–R4 verdict over the post-P1 graph | `classify(nodes, edges, label_per_node, var_per_node)` |
-| `labeler.py`       | Aggregator: BLAST cache TSVs + GFA → `seg_label_hits.tsv` | `emit_seg_label_hits(gfa_path, blast_tsvs, out_tsv)` |
+| `arm_sequences.py`  | Reconstruct allele DNA per arm; skip joint/fork nodes (shared between arms) | `reconstruct_arms(arms, provenance, gfa_seqs, skip_joints=True)` |
+| `per_k_caller.py`   | End-to-end driver for a single k: var-seeded BFS loop + dedup-based emission | `find_alleles(seg_label_hits_tsv, gfa_path, genome_cov, …)` |
 
 Test suite: `test/graph_classifier/directional_test.py` covers the
-classifier with 8 hand-built synthetic cases that exercise composites,
-long unlabeled spacers, Y-fork bubbles, dangling arms, multi-arm
-complexity, and disjoint var subgraphs. All 8 pass.
+classifier with 8 hand-built synthetic cases — composites, long unlabeled
+spacers, Y-fork bubbles, dangling arms, multi-arm complexity, disjoint
+var subgraphs, and the AG10 / AG17 / AJB36 / SA93 / AG5 shapes. All 8
+pass. AG17 real-data run emits 2 divergent alleles (5217 bp + 5045 bp,
+verdict `closed_bubble`) end-to-end through `per_k_caller.find_alleles`.
 
-Pseudocode for the end-to-end pipeline:
+#### Labeler: TSV format (unpacked)
 
-```python
-from test.graph_classifier import seg_processor, bubble_classifier
+`seg_label_hits.tsv` schema — one row per `(seg_id, sub-region, tag)`:
 
-# Input: per-segment label hits (from labeler) and edges (from GFA)
-nodes, edges, label_per_node, var_per_node = seg_processor.directional_split(
-    seg_labels, seg_length, edges, edge_endpoints,
-)
-result = bubble_classifier.classify(
-    nodes, edges, label_per_node, var_per_node,
-)
-# result["class"] is the verdict
+```
+seg_id   seg_length   tag      kind    start   end    strand
+NODE_3   12450        flankL   flank   0       4310   +
+NODE_7   8200         HD1      var     0       1020   +
+NODE_7   8200         HD2      var     1450    2300   +
+NODE_9   3100         flankR   flank   200     1800   +
 ```
 
-### B.9. Upstream plumbing required
+The unpacked format means a single segment with two var hits has two
+rows; the segment processor sorts by `start` and partitions the segment
+at midpoints. Multi-tag co-located hits (e.g. an HD1/HD2 fusion segment)
+are joined with `+` and emitted in **one** row whose `kind` is `var`.
 
-P1 needs per-end label coordinates on each GFA segment. The pipeline
-already produces these in BLAST output (start/end of hit on segment); the
-picker / `graph_paths.py` annotation step would need to emit them to the
-classifier-facing data (`bubble.tsv` or equivalent). Minimal plumbing
-change, no algorithmic work.
+The labeler runs three merge stages before emission:
+
+- **Stage A — intra-tag merge**: overlapping/adjacent hits with the same
+  tag on the same segment collapse to their union.
+- **Stage B — sweepline same-kind merge**: among hits of the same `kind`
+  (flank vs var), contiguous regions are emitted as single intervals; a
+  region covered by multiple tags gets a `+`-joined label.
+- **Stage C — var-priority clip**: flank regions are clipped against var
+  regions (var wins). A segment carrying both `HD1` and `flankR` keeps
+  the HD1 span pure-var and only the residual non-overlap as flank.
+
+#### Orchestrator: per-k driver
+
+`find_alleles(seg_label_hits_tsv, gfa_path, genome_cov, init_nhop=3, max_nhop=10, var_proteins_ref=…, expected_var_tags=…, locus_padding=1500, lo_mult=0.25, hi_mult=2.0, divergence_threshold=0.05)`
+loops over BFS hop counts and coverage filters, accepts the first
+configuration that yields two divergent closed-bubble arms, and
+otherwise emits whatever the loop ends on.
+
+BFS loop:
+
+```python
+for phase in (var_seeded, var+flank_seeded):
+    for nhop in init_nhop..max_nhop:
+        for use_cov in (True, False):                          # cov-on first
+            res = _try_one_pass(seeds, nhop, use_cov)          # BFS + classify
+            log(phase, nhop, use_cov, |nhood|, n_arms, class)
+            if use_cov and nhop == max_nhop:
+                fallback_cov_on := res                         # remember
+            last_res := res
+            if _accept(res):                                   # closed_bubble + 2 arms divergent
+                return _finalize(res)
+
+# Exhausted — fallback chain:
+emit_from = fallback_cov_on if it has candidates else last_res
+return _finalize(emit_from)
+```
+
+Each `_try_one_pass` BFS-expands seeds by `nhop` hops, optionally
+applies a depth filter `[lo_mult × genome_cov, hi_mult × genome_cov]`
+(default `[0.25, 2.0]`), restricts edges, runs P1 directional split,
+runs the classifier, and stashes `_provenance` + `_var_per_node` on
+the result. Self-loop GFA edges (where source == target) are skipped
+when building adjacency.
+
+#### Emission rule (trim → dedup → emit)
+
+The caller collects every var-bearing candidate the classifier
+produced — pooling `closed_arms + dangling_arms + var_components` —
+and runs them through a uniform pipeline. The verdict always
+preserves the classifier's origin; only the emitted record naming
+reflects the post-dedup count.
+
+Pipeline inside `_emit_result`:
+
+```
+candidate paths from classifier
+    │
+    ▼
+[node-level path-trim]              ← always (uses var_per_node, no BLAST)
+    │  ordered paths     → subpath [first_var, last_var]
+    │  var_components    → only var-labeled nodes
+    ▼
+build sequences via provenance (orig_seg, start, end, strand)
+    │
+    ▼
+[tblastn locus-trim]                ← when var_proteins_ref provided
+    │  one tblastn pass: var_proteins → all candidates as multi-fasta
+    │  per candidate: trim to [min(sstart)−padding, max(send)+padding]
+    │  drop candidates with no HD hits
+    │  collect found_var_tags per surviving candidate
+    ▼
+[edlib HW edit-distance dedup]      ← always
+    │  sort by length desc
+    │  for each candidate s: drop if identity(s, k) > 1 − threshold
+    │  with some already-kept k (default threshold = 5%)
+    │  HW mode = shorter as query within longer as target → terminal
+    │  length differences don't penalize identity
+    ▼
+emit: allele1 / allele1+allele2 / chimera1..N (by post-dedup count)
+    │
+    ▼
+[per-allele depth + completeness]   ← derived from surviving candidates
+    allele_cov = length-weighted DP:f: mean per allele path
+    surviving_tags = union of found_var_tags across survivors
+    complete_var / complete_locus / locus_coverage
+```
+
+| post-dedup `n` | emitted records           | verdict (= origin) |
+|----------------|---------------------------|--------------------|
+| 1              | `allele1`                 | `<origin>`         |
+| 2              | `allele1`, `allele2`      | `<origin>`         |
+| ≥ 3            | `chimera1`, `chimera2`, … | `<origin>`         |
+
+A `closed_bubble` whose two arms turn out to be identical (dedup→1)
+is reported as `verdict=closed_bubble` with one `allele1`, NOT
+downgraded to `single`. `n_after_dedup` tells the consumer how many
+distinct sequences came out.
+
+**Dedup similarity choice.** Originally k-mer Jaccard (k=21, threshold
+0.05) — replaced because Jaccard is dominated by the *union* of
+k-mers and gets fooled by long conserved flanks (two alleles with
+small variant region embedded in long flank look ≥95% similar and
+incorrectly collapse). Current implementation uses edlib edit-distance
+identity: `1 − editDistance / max(len(a), len(b))` under HW (infix)
+mode. The locus-trim step upstream further reduces flank dilution by
+stripping non-HD-bearing content before dedup compares.
+
+**Why two layers of trim.** Node-level path-trim is cheap (no BLAST,
+uses graph-level `var_per_node` membership) and strips most of the
+conserved flank. The tblastn locus-trim then catches cases where the
+labeler missed a var hit or the node-trim left extra context; it is
+the content-based safety net.
+
+#### Arm-sequence reconstruction
+
+Each arm is a path of post-P1 node IDs. The seg-processor supplies
+`provenance[node] = (orig_seg, start, end, strand)` for each
+sub-segment. The reconstructor walks the path, slices the
+stored-strand DNA at `[start:end]` per node, applies reverse-complement
+where `strand == "-"`, and concatenates. `arm_sequences.py` exposes a
+joint-skipping variant (for diagnostics); `_emit_result` uses
+full-path reconstruction since its trim chain owns boundary logic.
+
+### B.9. Output: best alleles for a single k
+
+Each `find_alleles()` call produces the **best allele set for one GFA at
+one k**. The output dict:
+
+```python
+{
+    # Classification
+    "verdict":         "closed_bubble" | "open_bubble" | "single" |
+                       "separate" | "complexed",
+    "bubble_type":     alias for `verdict` (clarity in TSV columns),
+    "k":               the K label passed in (e.g. "k53"),
+
+    # Allele records (post-trim, post-dedup)
+    "alleles":         [("allele1", "ACGT..."), ("allele2", "ACGT..."), ...]
+                       OR
+                       [("chimera1", "ACGT..."), ("chimera2", "ACGT..."), ...],
+    "component_list":  list of emitted names (parallel to alleles),
+    "allele_cov":      list[float],  # length-weighted DP:f: mean per allele
+    "basepair":        sum of emitted allele lengths,
+
+    # Completeness (post-trim tblastn over surviving candidates)
+    "complete_var":    bool | None,   # all expected_var_tags hit?
+    "complete_locus":  bool | None,   # currently mirrors complete_var
+    "locus_coverage":  float | None,  # fraction of expected_var_tags found
+    "found_var_tags":  sorted list[str],
+
+    # Diagnostics
+    "n_candidates":    int,           # before dedup (post-trim)
+    "n_after_dedup":   int,           # final emitted count
+    "divergent":       bool,          # n_after_dedup >= 2
+    "n_hops_used":     int,           # BFS hop count at acceptance/exhaustion
+    "phase":           "main" | "flank_fallback",
+    "cov_filter_used": bool,          # was the depth filter on at this iteration
+
+    # Segment provenance
+    "segments":        sorted list[str],   # union of orig-seg IDs across alleles
+    "segments_labeled": list[(seg_id, "tag1+tag2+...")],
+    "genome_cov":      float,         # echoed from input
+
+    "info":            { ...classifier stats (n_arms, n_closed, anchors, etc.) },
+}
+```
+
+The driver in `test/_k53_new_pipeline/run_one.py` flattens this dict
+into a 20-column TSV row with header:
+
+```
+sample  k  bubble_type  components  complete_var  complete_locus  locus_coverage
+basepair  genome_cov  allele_cov  n_cand  n_dedup  divergent  n_hops_used  phase
+cov_filter_used  allele_lens  segments  segments_labeled  found_var_tags
+```
+
+To pick the **best K** across the per-k results, run `find_alleles()`
+once per k and apply a cross-k selection rule (preference order:
+closed_bubble > open_bubble > separate-2-component > single > complexed,
+ties broken by total allele length or coverage). That rule lives outside
+this module — `per_k_caller`'s contract is **one k in, one verdict +
+allele set out**.
+
+### B.10. Upstream plumbing required
+
+P1 needs per-end label coordinates on each GFA segment. The labeler
+(`labeler.py`) already produces these from BLAST output (start/end of
+hit on segment) and writes them to `seg_label_hits.tsv`. Minimal
+plumbing change in production: replace the picker's current
+classifier-facing input with this TSV.
 
 If per-end coordinates are absent, the fallback is to retain the
 composite node as-is and use a simpler anchor rule (composite carrying a

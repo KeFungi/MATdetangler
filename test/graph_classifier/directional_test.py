@@ -231,7 +231,7 @@ def run_all():
     n_pass = n_fail = 0
     for builder in ALL_CASES:
         c = builder()
-        nodes, edges, labels, var_per = directional_split(
+        nodes, edges, labels, var_per, _provenance = directional_split(
             c["seg_labels"], c["seg_length"], c["edges"], c["edge_endpoints"]
         )
         res = classify(nodes, edges, labels, var_per)

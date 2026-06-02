@@ -87,6 +87,8 @@ def classify(nodes: set[str], edges: set[frozenset],
     var_full = [c for c in full_comps if c & var_nodes]
     if len(var_full) > 1:
         return {"class": "separate", **info,
+                "n_var_components": len(var_full),
+                "var_components": [list(c) for c in var_full],
                 "explain": f"var genes in {len(var_full)} disjoint subgraphs"}
 
     # P2. BUBBLE via BFS from var through unlabeled
@@ -124,6 +126,8 @@ def classify(nodes: set[str], edges: set[frozenset],
     n_arms = n_closed + n_dangling
     info["n_closed"] = n_closed; info["n_dangling"] = n_dangling
     info["n_arms"] = n_arms
+    info["closed_arms"] = [list(p) for p in closed.values()]
+    info["dangling_arms"] = [list(p) for p in dangling.values()]
 
     # R4. VERDICT
     if n_arms == 0:

@@ -58,47 +58,67 @@ def directional_split(
         seg_length: dict[str, int],
         edges: set[frozenset],
         edge_endpoints: dict[frozenset, tuple[str, str]] | None = None,
-) -> tuple[set[str], set[frozenset], dict[str, str], dict[str, set[str]]]:
-    """Apply P1 to the input. Returns the post-split graph data."""
+) -> tuple[set[str], set[frozenset], dict[str, str], dict[str, set[str]],
+           dict[str, tuple[str, int, int, str]]]:
+    """Apply P1 to the input. Returns (nodes, edges, labels, var_per, provenance).
+
+    `provenance[sub_id] = (original_seg_id, start, end, strand)` — for each
+    post-P1 node, the original GFA segment ID and the sub-region of that
+    segment on its stored strand. Used for arm-sequence reconstruction.
+    """
     new_nodes: set[str] = set()
     new_edges: set[frozenset] = set()
     new_labels: dict[str, str] = {}
     new_vars: dict[str, set[str]] = {}
     side_to_sub: dict[tuple[str, str], str] = {}
     seg_subs: dict[str, list[str]] = {}
+    provenance: dict[str, tuple[str, int, int, str]] = {}
 
     # Every segment id referenced anywhere
     all_segs = set(seg_labels.keys()) | {n for e in edges for n in tuple(e)}
 
     for seg in all_segs:
         hits = sorted(seg_labels.get(seg, []), key=lambda h: h.start)
+        slen = seg_length.get(seg, 0)
         if not hits:
             new_nodes.add(seg)
             seg_subs[seg] = [seg]
             side_to_sub[(seg, "L")] = seg
             side_to_sub[(seg, "R")] = seg
+            provenance[seg] = (seg, 0, slen, "+")
             continue
         if len(hits) == 1:
             h = hits[0]
             new_nodes.add(seg)
             new_labels[seg] = h.tag
             if h.kind == "var":
-                new_vars.setdefault(seg, set()).add(h.tag)
+                new_vars.setdefault(seg, set()).update(h.tag.split("+"))
             seg_subs[seg] = [seg]
             side_to_sub[(seg, "L")] = seg
             side_to_sub[(seg, "R")] = seg
+            # For a single-hit segment, the sub-region IS the whole segment
+            # (the hit just labels it; nothing was actually split).
+            provenance[seg] = (seg, 0, slen, h.strand)
             continue
-        # Multi-hit: split into chain of pure sub-segments
+        # Multi-hit: split into chain of pure sub-segments.
+        # Each sub-segment's coordinate range is the hit's (start, end) plus a
+        # half-gap on each side reaching to the midpoint between hits, so that
+        # the union of sub-segments partitions the whole segment with no gaps.
+        boundaries = [0]
+        for i in range(len(hits) - 1):
+            boundaries.append((hits[i].end + hits[i + 1].start) // 2)
+        boundaries.append(slen)
         subs: list[str] = []
         for i, h in enumerate(hits):
             sub_id = f"{seg}__sub{i}_{h.tag}"
             new_nodes.add(sub_id)
             new_labels[sub_id] = h.tag
             if h.kind == "var":
-                new_vars.setdefault(sub_id, set()).add(h.tag)
+                new_vars.setdefault(sub_id, set()).update(h.tag.split("+"))
             subs.append(sub_id)
             if i > 0:
                 new_edges.add(frozenset((subs[i - 1], sub_id)))
+            provenance[sub_id] = (seg, boundaries[i], boundaries[i + 1], h.strand)
         seg_subs[seg] = subs
         side_to_sub[(seg, "L")] = subs[0]
         side_to_sub[(seg, "R")] = subs[-1]
@@ -107,7 +127,9 @@ def directional_split(
     # Edge endpoints are looked up by the canonical (sorted) tuple, so the
     # mapping is deterministic regardless of frozenset iteration order.
     for e in edges:
-        a, b = sorted(tuple(e))                       # canonical order
+        t = sorted(tuple(e))
+        if len(t) == 1: continue                      # self-loop in GFA — skip
+        a, b = t                                       # canonical order
         if edge_endpoints and (a, b) in edge_endpoints:
             sa, sb = edge_endpoints[(a, b)]
         elif edge_endpoints and e in edge_endpoints:
@@ -119,4 +141,4 @@ def directional_split(
         if new_a != new_b:
             new_edges.add(frozenset((new_a, new_b)))
 
-    return new_nodes, new_edges, new_labels, new_vars
+    return new_nodes, new_edges, new_labels, new_vars, provenance

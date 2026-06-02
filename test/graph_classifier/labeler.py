@@ -78,8 +78,8 @@ def _iter_blast_tsv(path: str):
 
 
 def _merge_overlapping_spans(spans: list[tuple[int, int, str]]) -> list[tuple[int, int, str]]:
-    """Merge overlapping or touching spans (sorted by start). Strand info is
-    kept as the majority/first strand of the merged group."""
+    """Stage A — merge same-tag overlapping or touching spans. Strand info is
+    kept as the first strand of the merged group."""
     if not spans: return []
     spans = sorted(spans)
     out = [spans[0]]
@@ -89,6 +89,72 @@ def _merge_overlapping_spans(spans: list[tuple[int, int, str]]) -> list[tuple[in
             out[-1] = (prev_s, max(prev_e, e), prev_strand)
         else:
             out.append((s, e, strand))
+    return out
+
+
+def _sweepline_merge_kind(spans_by_tag: dict[str, list[tuple[int, int, str]]]
+                            ) -> list[tuple[int, int, frozenset, str]]:
+    """Stage B — sweepline across multiple tags of the same kind. Returns
+    contiguous regions [(start, end, tag_set, strand)] where the active
+    tag-set is constant within each region. Adjacent regions with the same
+    tag-set are merged."""
+    events: list[tuple[int, int, str]] = []
+    strand_of: dict[str, str] = {}
+    for tag, spans in spans_by_tag.items():
+        for s, e, strand in spans:
+            if e <= s: continue
+            events.append((s, 0, tag))                    # enter (sort first at same pos)
+            events.append((e, 1, tag))                    # exit
+            strand_of.setdefault(tag, strand)
+    if not events: return []
+    # At same position: exits before enters so adjacent ranges don't merge.
+    events.sort(key=lambda x: (x[0], -x[1]))
+    raw: list[tuple[int, int, frozenset]] = []
+    active: set[str] = set()
+    prev_pos: int | None = None
+    for pos, evt, tag in events:
+        if active and prev_pos is not None and pos > prev_pos:
+            raw.append((prev_pos, pos, frozenset(active)))
+        if evt == 0: active.add(tag)
+        else: active.discard(tag)
+        prev_pos = pos
+    # Merge adjacent regions with same tag-set
+    out: list[tuple[int, int, frozenset, str]] = []
+    for s, e, tags in raw:
+        strand = next((strand_of[t] for t in tags if t in strand_of), "+")
+        if out:
+            ps, pe, ptags, pstrand = out[-1]
+            if pe == s and ptags == tags:
+                out[-1] = (ps, e, tags, pstrand)
+                continue
+        out.append((s, e, tags, strand))
+    return out
+
+
+def _clip_flank_against_var(flank_regions: list[tuple[int, int, frozenset, str]],
+                             var_regions: list[tuple[int, int, frozenset, str]]
+                             ) -> list[tuple[int, int, frozenset, str]]:
+    """Stage C — drop or clip flank regions that overlap var regions. Var
+    wins on every overlapping base; flank gets clipped to what's NOT
+    covered by var."""
+    var_intervals = sorted([(s, e) for s, e, _, _ in var_regions])
+    out = []
+    for fs, fe, tags, strand in flank_regions:
+        remaining = [(fs, fe)]
+        for vs, ve in var_intervals:
+            new_remaining = []
+            for s, e in remaining:
+                if ve <= s or vs >= e:                    # no overlap
+                    new_remaining.append((s, e))
+                    continue
+                if vs > s:                                # keep left portion
+                    new_remaining.append((s, vs))
+                if ve < e:                                # keep right portion
+                    new_remaining.append((ve, e))
+            remaining = new_remaining
+        for s, e in remaining:
+            if e > s:
+                out.append((s, e, tags, strand))
     return out
 
 
@@ -117,24 +183,57 @@ def emit_seg_label_hits(
             key = (hit.sseqid, hit.qseqid, kind)
             per_key.setdefault(key, []).append((start_0, end_0, strand))
 
-    rows = []
+    # Per segment: collect spans by kind, do Stage A (intra-tag merge), then
+    # Stage B (sweepline across tags of same kind), then Stage C (var wins
+    # over flank where they overlap on the same bases).
+    by_seg_kind: dict[tuple[str, str], dict[str, list[tuple[int, int, str]]]] = {}
     for (seg, tag, kind), spans in per_key.items():
-        for start, end, strand in _merge_overlapping_spans(spans):
-            rows.append((seg, seg_length.get(seg, end), tag, kind, start, end, strand))
-    rows.sort(key=lambda r: (r[0], r[4]))                # by seg then start
+        merged = _merge_overlapping_spans(spans)               # Stage A
+        by_seg_kind.setdefault((seg, kind), {})[tag] = merged
+
+    # All segs that have any hit
+    all_segs = {s for (s, _) in by_seg_kind}
+    rows = []
+    for seg in sorted(all_segs):
+        var_regions = _sweepline_merge_kind(by_seg_kind.get((seg, "var"), {}))
+        flank_regions = _sweepline_merge_kind(by_seg_kind.get((seg, "flank"), {}))
+        flank_regions = _clip_flank_against_var(flank_regions, var_regions)
+        slen = seg_length.get(seg, 0)
+        for s, e, tags, strand in var_regions:
+            rows.append((seg, slen or e, "+".join(sorted(tags)), "var", s, e, strand))
+        for s, e, tags, strand in flank_regions:
+            rows.append((seg, slen or e, "+".join(sorted(tags)), "flank", s, e, strand))
+
+    # Unpacked: one row per individual tag. A region carrying N tags emits N
+    # rows with the same (start, end) but different `tag` values. Downstream
+    # readers aggregate by (seg_id, start, end) to recover the tag-set.
+    unpacked = []
+    for seg, slen, tag_str, kind, s, e, strand in rows:
+        for t in sorted(tag_str.split("+")):
+            unpacked.append((seg, slen, t, kind, s, e, strand))
+    unpacked.sort(key=lambda r: (r[0], r[4], r[2]))      # seg, start, tag
+
     with open(out_tsv, "w") as fh:
         fh.write("seg_id\tseg_length\ttag\tkind\tstart\tend\tstrand\n")
-        for r in rows:
+        for r in unpacked:
             fh.write("\t".join(str(x) for x in r) + "\n")
-    return len(rows)
+    return len(unpacked)
 
 
 def read_seg_label_hits(path: str) -> dict[str, list]:
     """Inverse: read `seg_label_hits.tsv` and group hits by seg_id.
-    Returns {seg_id: list of Hit}. Imports Hit from seg_processor."""
+
+    The TSV uses long/unpacked format (one row per (tag, position)). Rows
+    sharing (seg_id, start, end) represent one positional REGION carrying
+    multiple tags. This reader aggregates such rows into ONE Hit object
+    per region, with `tag = "+".join(sorted(tags))` and kind = "var" if
+    any tag is var else "flank".
+
+    Returns {seg_id: list of Hit}."""
     from .seg_processor import Hit
-    out: dict[str, list[Hit]] = {}
-    if not os.path.isfile(path): return out
+    # (seg, start, end) -> {"tags": set, "kinds": set, "strand": str}
+    grouped: dict[tuple, dict] = {}
+    if not os.path.isfile(path): return {}
     with open(path) as fh:
         header = fh.readline().rstrip("\n").split("\t")
         idx = {h: i for i, h in enumerate(header)}
@@ -146,11 +245,20 @@ def read_seg_label_hits(path: str) -> dict[str, list]:
                 start = int(cells[idx["start"]]); end = int(cells[idx["end"]])
             except ValueError:
                 continue
-            out.setdefault(seg, []).append(
-                Hit(tag=cells[idx["tag"]], kind=cells[idx["kind"]],
-                    start=start, end=end,
-                    strand=cells[idx["strand"]] if "strand" in idx else "+")
-            )
+            key = (seg, start, end)
+            g = grouped.setdefault(key, {"tags": set(), "kinds": set(),
+                                          "strand": cells[idx["strand"]]
+                                          if "strand" in idx else "+"})
+            g["tags"].add(cells[idx["tag"]])
+            g["kinds"].add(cells[idx["kind"]])
+    out: dict[str, list[Hit]] = {}
+    for (seg, start, end), g in grouped.items():
+        # var wins if mixed (shouldn't happen post-Stage-C but be safe)
+        kind = "var" if "var" in g["kinds"] else next(iter(g["kinds"]))
+        out.setdefault(seg, []).append(
+            Hit(tag="+".join(sorted(g["tags"])), kind=kind,
+                start=start, end=end, strand=g["strand"])
+        )
     return out
 
 
