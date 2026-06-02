@@ -244,8 +244,10 @@ layouts.
 | **`primary_alleles.fasta`** | **The picked allele set** — from the chosen K. Headers `<sample>_<k>_<allele_name>`. Empty if every per-K result errored. |
 | `picks.tsv` | legacy 12-col schema, one row per emitted allele: `sample, allele, origin, k, type, len, from_contig, segments, cov, n_variable_genes, has_both_flanks, is_degHD`. Compatible with downstream `graph_paths` + `summary_table`. |
 | `picks_summary.tsv` | sample-level new schema, one row per sample: `sample, k_chosen, bubble_type, n_dedup, complete_var, complete_locus, locus_coverage, basepair, genome_cov, allele_cov, n_cand, extend_bounds, components, all_k_tried`. |
-| `<K>/result.tsv` | per-K caller output, 21 columns. See METHODS.md §B.12. |
-| `<K>/alleles.fasta` | per-K emitted allele/chimera records. |
+| `<K>/result.tsv` | per-K caller output, 22 columns. See METHODS.md §3.11. |
+| `<K>/alleles.fasta` | per-K picked allele/chimera records (post-dedup). |
+| `<K>/candidate_allele.fasta` | every emission across all 24 BFS iterations (forensic record). Headers `cand{id}_h{nhop}_p{phase}_c{cov}_n{net}_v{verdict}_{name}`. |
+| `<K>/subnode_seqs.fasta` | materialized sub-segment sequences for `{parent}#N` IDs (after P1 directional split). Consumed by `graph_paths` to draw bubble outputs with coord-free IDs. |
 | `<K>/seg_label_hits.tsv` | labeler output for this K. |
 | `<K>/{flankL,flankR}_blastn.tsv`, `<K>/HD_tblastn.tsv` | full outfmt-6 BLAST caches. |
 | `genome_cov_spades_k<K>.txt` | per-k genome coverage (median of contigs.fasta `cov_` ≥ 5 kb). Bp-equivalent units. |

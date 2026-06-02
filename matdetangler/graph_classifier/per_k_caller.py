@@ -296,7 +296,7 @@ def find_alleles(
         seg_label_hits_tsv: str,
         gfa_path: str,
         genome_cov: float | None = None,
-        init_nhop: int = 3,
+        init_nhop: int = 5,
         max_nhop: int = 10,
         divergence_threshold: float = 0.05,
         lo_mult: float = 0.25,
@@ -307,6 +307,7 @@ def find_alleles(
         locus_padding: int = 1500,
         contig_seeds: set[str] | None = None,
         queries_dir: str | None = None,
+        out_candidate_fa: str | None = None,
 ) -> dict:
     """Run the full orchestrator. Returns a dict with the final classification
     and any emitted allele/chimera sequences:
@@ -344,33 +345,41 @@ def find_alleles(
     flank_seeds = {s for s, hits in seg_labels.items()
                    if any(h.kind == "flank" for h in hits)} | contig_seeds
 
-    def _accept(res: dict) -> bool:
-        if res["class"] != "closed_bubble": return False
-        arms = res.get("closed_arms", [])
-        if len(arms) < 2: return False
-        seqs = [_arm_sequence_for(a, res["_provenance"], gfa_seqs) for a in arms[:2]]
-        if is_divergent(seqs[0], seqs[1], divergence_threshold):
-            res["_emit_arms"] = arms[:2]
-            res["_emit_seqs"] = seqs
-            res["divergent"] = True
-            return True
-        return False
-
     def _log(phase: str, nhop: int, use_cov: bool, res: dict) -> None:
         n_arms = res.get("n_arms", 0)
         n_var  = res.get("n_var", 0)
         nhood  = len(res.get("_nhood", ()))
-        print(f"  [{phase} nhop={nhop} cov={'on' if use_cov else 'off':>3}] "
+        print(f"  [nhop={nhop} {phase} cov={'on' if use_cov else 'off':>3}] "
               f"|nhood|={nhood:<6} var={n_var:<3} cls={res['class']:<14} arms={n_arms}",
               flush=True)
 
-    last_res = None
-    fallback_cov_on = None                     # cov-on @ max_nhop, for the no-acceptance path
+    # New design (item 1 in BFS proposal):
+    #   outer  = nhop                            (5..10)
+    #   middle = phase                           (main, flank_fallback)
+    #   inner  = use_cov                         (True, False)
+    # Each (nhop, phase, cov) iteration produces per-network candidates.
+    # Acceptance check (α): closed_bubble + 2 divergent arms + complete_locus.
+    # If ANY candidate accepts at ANY iteration, all remaining iterations
+    # are skipped — fast path for clean diploid samples.
+    #
+    # When loop exhausts without acceptance, pick best candidate by the
+    # 6-tier ranking (bubble_priority > complete_locus > complete_var >
+    # cov_on > basepair > diploid_dist), gather all SAME-iteration
+    # siblings, then run a cross-network dedup to produce final alleles.
+    # Sample verdict = "separate" iff ≥ 2 surviving networks; else the
+    # single surviving network's sub-verdict.
 
-    def _phase_loop(phase: str, seeds: set[str]) -> dict | None:
-        nonlocal last_res, fallback_cov_on
-        for nhop in range(init_nhop, max_nhop + 1):
-            for use_cov in (True, False):      # cov-on first → if no acceptance, we replay cov-on at max below
+    candidates: list[dict] = []   # one per (iter, network)
+    iter_metadata: dict[str, dict] = {}
+    short_circuit = False
+
+    for nhop in range(init_nhop, max_nhop + 1):
+        if short_circuit: break
+        for phase, seeds in [("main",            var_seeds),
+                              ("flank_fallback",  var_seeds | flank_seeds)]:
+            if short_circuit: break
+            for use_cov in (True, False):
+                iter_id = f"h{nhop}_{phase[0]}_c{'on' if use_cov else 'off'}"
                 res = _try_one_pass(
                     seeds, all_edges, endpoints, adj_und, nhop,
                     seg_labels, seg_length, depths, gfa_seqs,
@@ -378,72 +387,324 @@ def find_alleles(
                     apply_cov_filter=use_cov,
                     lo_mult=lo_mult, hi_mult=hi_mult,
                 )
-                res["_phase"]       = phase
-                res["_n_hops"]      = nhop
-                res["_cov_filter"]  = use_cov
+                res["_phase"]      = phase
+                res["_n_hops"]     = nhop
+                res["_cov_filter"] = use_cov
                 _log(phase, nhop, use_cov, res)
-                last_res = res
-                if use_cov and nhop == max_nhop:
-                    fallback_cov_on = res      # remember the cov-filtered @ max for emission fallback
-                if _accept(res):
-                    return res
-        return None
 
-    def _finalize(res: dict, divergence_threshold: float) -> dict:
-        # _emit_result now does the locus-trim + completeness check inline.
-        out = _emit_result(
-            res, gfa_seqs, depths=depths,
-            divergence_threshold=divergence_threshold,
-            var_proteins_ref=var_proteins_ref,
-            locus_padding=locus_padding,
-            expected_var_tags=expected_var_tags,
-            genome_cov=genome_cov, lo_mult=lo_mult, hi_mult=hi_mult,
-            queries_dir=queries_dir,
+                # Skip if classifier produced no var-bearing content
+                if res.get("n_var", 0) == 0 or res["class"] == "no_var":
+                    continue
+
+                # Run trim + dedup + pool-build (per-network) — return only the
+                # pool list without merging.
+                pools_out = _emit_result(
+                    res, gfa_seqs, depths=depths,
+                    divergence_threshold=divergence_threshold,
+                    var_proteins_ref=var_proteins_ref,
+                    locus_padding=locus_padding,
+                    expected_var_tags=expected_var_tags,
+                    genome_cov=genome_cov,
+                    lo_mult=lo_mult, hi_mult=hi_mult,
+                    queries_dir=queries_dir,
+                    return_pools=True,
+                )
+                pools = pools_out["pools"]
+                iter_metadata[iter_id] = {
+                    "res": res, "pools_out": pools_out,
+                    "phase": phase, "nhop": nhop, "cov": use_cov,
+                }
+
+                # Build a candidate per non-empty pool (per network)
+                for net_i, pool in enumerate(pools, start=1):
+                    if not pool["alleles"]: continue
+                    # When there's only one pool (non-separate case), the
+                    # network index is 0 by convention (no per-network split).
+                    net_in_iter = net_i if len(pools) > 1 else 0
+                    cand = {
+                        "iter_id":   iter_id,
+                        "net_in_iter": net_in_iter,
+                        "phase":     phase,
+                        "nhop":      nhop,
+                        "cov":       use_cov,
+                        "verdict":   pool.get("verdict") or res["class"],
+                        "alleles":   pool["alleles"],
+                        "allele_cov": pool["allele_cov"],
+                        "extend_bounds": pool["extend_bounds"],
+                        "allele_segments": pool["allele_segments"],
+                        "n_dedup":   pool["n_dedup"],
+                        "n_raw":     pool["n_raw"],
+                        "complete_var":   bool(pool.get("complete_var")),
+                        "complete_locus": bool(pool.get("complete_locus")),
+                        "basepair":  pool["basepair"],
+                        "diploid_dist": pool["diploid_dist"],
+                        "found_tags": pool["found_tags_surviving"],
+                    }
+                    candidates.append(cand)
+
+                    # New acceptance check (α): hard short-circuit on gold-
+                    # standard candidate. Pool-level "verdict" is the per-
+                    # network sub-class (never "separate").
+                    if (cand["verdict"] == "closed_bubble"
+                            and cand["n_dedup"] >= 2
+                            and cand["complete_locus"]):
+                        print(f"  [accept] {iter_id} net={net_in_iter}: "
+                              f"closed_bubble n={cand['n_dedup']} complete — short-circuiting",
+                              flush=True)
+                        short_circuit = True
+                        break
+
+    # Write candidate_allele.fasta if requested — every emitted sequence
+    # across every (iter, network), tagged with its provenance in the header.
+    if out_candidate_fa and candidates:
+        _write_candidate_fasta(candidates, out_candidate_fa)
+
+    if not candidates:
+        # No iteration produced any emissible content — return an empty result
+        # so the caller can write a "no result" row.
+        return _empty_find_alleles_result(k, genome_cov)
+
+    # Pick best candidate by the 6-tier ranking.
+    def _rank_key(c: dict) -> tuple:
+        return (
+            _bubble_priority(c["verdict"], c["n_dedup"]),    # 0
+            not c["complete_locus"],                          # 1
+            not c["complete_var"],                            # 2
+            not c["cov"],                                     # 3
+            -c["basepair"],                                   # 4
+            c["diploid_dist"],                                # 5
         )
-        out["k"] = k
-        out["genome_cov"] = genome_cov
-        out["bubble_type"] = out["verdict"]                            # alias for TSV clarity
-        # Segments + segment-label list, from the result's emitted candidates.
-        prov = res.get("_provenance", {})
-        emitted_subnodes: set[str] = set()
-        for p in res.get("closed_arms", []):    emitted_subnodes.update(p)
-        for p in res.get("dangling_arms", []):  emitted_subnodes.update(p)
-        for c in res.get("var_components") or []: emitted_subnodes.update(c)
-        emitted_segs: set[str] = {prov[n][0] for n in emitted_subnodes if n in prov}
-        labels_by_seg: dict[str, str] = {}
-        for s in emitted_segs:
-            tags = sorted({h.tag for h in seg_labels.get(s, [])})
-            if tags: labels_by_seg[s] = "+".join(tags)
-        out["component_list"]   = [n for n, _ in out["alleles"]]
-        out["segments"]         = sorted(emitted_segs)
-        out["segments_labeled"] = [(s, labels_by_seg.get(s, "")) for s in sorted(emitted_segs)]
-        out["basepair"]         = sum(len(s) for _, s in out["alleles"])
-        return out
 
-    accepted = _phase_loop("main", var_seeds)
-    if accepted is not None:
-        return _finalize(accepted, divergence_threshold)
+    best = min(candidates, key=_rank_key)
+    print(f"  [pick] best={best['iter_id']} net={best['net_in_iter']} "
+          f"verdict={best['verdict']} n={best['n_dedup']} "
+          f"complete_locus={best['complete_locus']}", flush=True)
 
-    accepted = _phase_loop("flank_fallback", var_seeds | flank_seeds)
-    if accepted is not None:
-        return _finalize(accepted, divergence_threshold)
+    # Gather every same-iteration sibling (different networks of the same
+    # iteration). Cross-iteration mixing is disallowed.
+    siblings = [c for c in candidates if c["iter_id"] == best["iter_id"]]
 
-    # Loop exhausted — fallback chain:
-    #   1) cov-on @ max_nhop (preferred — selective)
-    #   2) if cov-on yielded 0 candidates, fall back to cov-off @ max_nhop (last_res)
-    def _has_candidates(r: dict) -> bool:
-        return (bool(r.get("closed_arms")) or bool(r.get("dangling_arms"))
-                or bool(r.get("var_components")))
+    return _finalize_candidates(
+        siblings, iter_metadata[best["iter_id"]],
+        gfa_seqs=gfa_seqs, depths=depths,
+        divergence_threshold=divergence_threshold,
+        expected_var_tags=expected_var_tags,
+        genome_cov=genome_cov,
+        queries_dir=queries_dir,
+        seg_labels=seg_labels,
+        k=k,
+    )
 
-    emit_from = fallback_cov_on or last_res
-    if emit_from is fallback_cov_on and not _has_candidates(fallback_cov_on):
-        emit_from = last_res
-        print(f"  [exhausted] cov-on @ max_nhop emitted 0 candidates; falling back to cov-off",
-              flush=True)
-    print(f"  [exhausted] emitting from phase={emit_from.get('_phase')} "
-          f"nhop={emit_from.get('_n_hops')} cov={emit_from.get('_cov_filter')}",
-          flush=True)
-    return _finalize(emit_from, divergence_threshold)
+
+_BUBBLE_PRIORITY = {
+    # Order matches the cross-K picker (pick_k.py): smaller = better.
+    # Diploid signatures (closed/open with n=2) preferred over chimeras
+    # (complexed with n!=2) and singletons.
+    ("closed_bubble", "any"): 1,
+    ("open_bubble",   "any"): 2,
+    ("separate",      "div2"): 3,
+    ("single",        "any"): 4,
+    ("complexed",     "div2"): 5,
+    ("separate",      "other"): 6,
+    ("complexed",     "other"): 7,
+    ("no_var",        "any"): 8,
+}
+
+
+def _bubble_priority(verdict: str, n_dedup: int) -> int:
+    """Priority tier for cross-iteration ranking — smaller = better."""
+    if verdict in ("closed_bubble", "open_bubble", "single", "no_var"):
+        return _BUBBLE_PRIORITY[(verdict, "any")]
+    if verdict in ("separate", "complexed"):
+        cls = "div2" if n_dedup == 2 else "other"
+        return _BUBBLE_PRIORITY[(verdict, cls)]
+    return 99
+
+
+def _write_candidate_fasta(candidates: list[dict], out_path: str) -> None:
+    """Write every candidate's alleles to a single FASTA. Header carries
+    iter_id + network + verdict + cov filter state so the file can be
+    forensically diffed against the picker's choice."""
+    with open(out_path, "w") as fh:
+        for ci, c in enumerate(candidates, start=1):
+            cov_tag = "con" if c["cov"] else "coff"
+            for name, seq in c["alleles"]:
+                hdr = (f">cand{ci:04d}_{c['iter_id']}_n{c['net_in_iter']}"
+                       f"_{cov_tag}_{c['verdict']}_{name}")
+                fh.write(hdr + "\n")
+                for i in range(0, len(seq), 80):
+                    fh.write(seq[i:i + 80] + "\n")
+
+
+def _empty_find_alleles_result(k, genome_cov) -> dict:
+    """Returned when no iteration produced any emissible candidate at all."""
+    return {
+        "verdict": "no_var", "topology": "no_var",
+        "complete_var": False, "complete_locus": False,
+        "locus_coverage": 0.0, "found_var_tags": [],
+        "n_candidates": 0, "n_after_dedup": 0,
+        "divergent": False,
+        "n_hops_used": None, "phase": None, "cov_filter_used": None,
+        "alleles": [], "allele_cov": [],
+        "extend_bounds": [], "allele_segments": [],
+        "subnode_seqs": {},
+        "info": {},
+        "k": k, "genome_cov": genome_cov,
+        "bubble_type": "no_var",
+        "component_list": [], "segments": [], "segments_labeled": [],
+        "basepair": 0,
+    }
+
+
+def _finalize_candidates(siblings: list[dict], iter_meta: dict,
+                          gfa_seqs: dict[str, str],
+                          depths: dict[str, float] | None,
+                          divergence_threshold: float,
+                          expected_var_tags: set[str] | None,
+                          genome_cov: float | None,
+                          queries_dir: str | None,
+                          seg_labels: dict,
+                          k) -> dict:
+    """Take all same-iteration sibling candidates, run cross-network dedup
+    (RC-aware, completeness-first ranking), and build the final output dict
+    in the same shape that the legacy _emit_result+_finalize path produced.
+
+    Sample-level verdict:
+      * surviving sequences from >= 2 distinct networks → "separate"
+      * all from 1 network → that network's sub-verdict
+    """
+    # Flatten: each sibling contributes its (allele, cov, bound, segs)
+    # tuples — keep network-of-origin so we can detect cross-network survival.
+    items = []
+    for s in siblings:
+        for (name, seq), cov, bnd, segs in zip(
+                s["alleles"], s["allele_cov"], s["extend_bounds"], s["allele_segments"]):
+            items.append({
+                "name": name, "seq": seq,
+                "net": s["net_in_iter"], "cov": cov,
+                "bnd": bnd, "segs": segs,
+                "sib_complete_var":   s["complete_var"],
+                "sib_complete_locus": s["complete_locus"],
+                "diploid_dist": s["diploid_dist"],
+            })
+
+    # Sort by completeness-first key (same as the in-pool dedup), then walk.
+    # The cross-network dedup may collapse two networks' alleles into one if
+    # they're within 5% edit distance (RC-aware) — which would mean they're
+    # actually duplicate calls of the same allele in two different graph
+    # components.
+    def _sort_key(it):
+        return (not it["sib_complete_locus"],
+                not it["sib_complete_var"],
+                -len(it["seq"]),
+                it["diploid_dist"])
+    items.sort(key=_sort_key)
+
+    final = []
+    for it in items:
+        if any(not is_divergent(it["seq"], kept["seq"], threshold=divergence_threshold)
+               for kept in final):
+            continue
+        final.append(it)
+
+    surviving_nets = {it["net"] for it in final}
+    if len(surviving_nets) >= 2:
+        sample_verdict = "separate"
+    elif final:
+        # Find the sibling whose net matches the surviving net to get its verdict
+        net = next(iter(surviving_nets))
+        matching = next((s for s in siblings if s["net_in_iter"] == net), siblings[0])
+        sample_verdict = matching["verdict"]
+    else:
+        sample_verdict = siblings[0]["verdict"] if siblings else "no_var"
+
+    # Re-emit names: when sample_verdict == "separate" we keep network
+    # prefixes; otherwise we strip them (cleaner output) and re-number as
+    # allele1/allele2 (or chimera if n>=3).
+    final_alleles = []
+    final_cov = []; final_bnd = []; final_segs = []
+    n_final = len(final)
+    for i, it in enumerate(final, start=1):
+        if sample_verdict == "separate":
+            name = it["name"]                    # keep network-prefixed
+        else:
+            if n_final == 1: nm = "allele1"
+            elif n_final == 2: nm = f"allele{i}"
+            else: nm = f"chimera{i}"
+            name = nm
+        final_alleles.append((name, it["seq"]))
+        final_cov.append(it["cov"])
+        final_bnd.append(it["bnd"])
+        final_segs.append(it["segs"])
+
+    # Pull provenance + sub-seqs from the chosen iteration
+    res = iter_meta["res"]
+    prov = res.get("_provenance", {})
+
+    surviving_tags = set()
+    for s in siblings:
+        surviving_tags |= s["found_tags"]
+
+    if expected_var_tags is not None:
+        complete_var = expected_var_tags <= surviving_tags
+        locus_coverage = (len(expected_var_tags & surviving_tags)
+                          / max(1, len(expected_var_tags)))
+    else:
+        complete_var = None
+        locus_coverage = None
+
+    # Emitted sub-node IDs → materialized sub-seqs (for run_per_k's
+    # subnode_seqs.fasta side file)
+    sub_seqs: dict[str, str] = {}
+    referenced_ids: set[str] = set()
+    for seg_list in final_segs:
+        referenced_ids.update(seg_list)
+    for sid in referenced_ids:
+        if sid not in prov: continue
+        parent, sst, eend, strand = prov[sid]
+        if parent not in gfa_seqs: continue
+        sub = gfa_seqs[parent][sst:eend]
+        if not sub: continue
+        if strand == "-": sub = reverse_complement(sub)
+        sub_seqs[sid] = sub
+
+    # Segments + segment-label list, from the surviving candidates' walks
+    emitted_segs: set[str] = set()
+    for sl in final_segs:
+        for sid in sl:
+            if sid in prov: emitted_segs.add(prov[sid][0])
+    labels_by_seg: dict[str, str] = {}
+    for s in emitted_segs:
+        tags = sorted({h.tag for h in seg_labels.get(s, [])})
+        if tags: labels_by_seg[s] = "+".join(tags)
+
+    return {
+        "verdict": sample_verdict,
+        "topology": res.get("class", sample_verdict),
+        "complete_var": complete_var,
+        "complete_locus": complete_var,
+        "locus_coverage": locus_coverage,
+        "found_var_tags": sorted(surviving_tags),
+        "n_candidates": sum(s["n_raw"] for s in siblings),
+        "n_after_dedup": n_final,
+        "divergent": n_final >= 2,
+        "n_hops_used": iter_meta["nhop"],
+        "phase": iter_meta["phase"],
+        "cov_filter_used": iter_meta["cov"],
+        "alleles": final_alleles,
+        "allele_cov": final_cov,
+        "extend_bounds": final_bnd,
+        "allele_segments": final_segs,
+        "subnode_seqs": sub_seqs,
+        "info": {},
+        "k": k,
+        "genome_cov": genome_cov,
+        "bubble_type": sample_verdict,
+        "component_list": [n for n, _ in final_alleles],
+        "segments": sorted(emitted_segs),
+        "segments_labeled": [(s, labels_by_seg.get(s, "")) for s in sorted(emitted_segs)],
+        "basepair": sum(len(s) for _, s in final_alleles),
+    }
 
 
 def _arm_sequence_for(arm_path: list[str], provenance: dict,
@@ -647,6 +908,7 @@ def _emit_result(res: dict, gfa_seqs: dict[str, str],
                   lo_mult: float = 0.25,
                   hi_mult: float = 2.0,
                   queries_dir: str | None = None,
+                  return_pools: bool = False,
                   force: bool = False) -> dict:
     """Pipe every var-bearing candidate through trim → dedup → emit.
 
@@ -763,26 +1025,54 @@ def _emit_result(res: dict, gfa_seqs: dict[str, str],
     #
     # For non-separate verdicts there's a single "pool" with prefix = "".
 
-    def _process_pool(closed_arms, dangling_arms, var_components, prefix):
+    def _has_flank_in_or_near(path: list[str], side: str) -> bool:
+        """Check whether `path` carries a flank label of `side` ('flankL'
+        or 'flankR') — either ON one of the path's own nodes, or on one
+        of the immediate (post-P1) neighbors of the path's endpoints.
+
+        The latter case is the common one for closed_bubble: after var-
+        trim, the path's first/last nodes are var-bearing; the flank-
+        labeled bubble anchor sits OUTSIDE the path as a neighbor."""
+        for n in path:
+            if side in (label_per_node.get(n, "")).split("+"):
+                return True
+        if path:
+            for ep in (path[0], path[-1]):
+                for m in adj_pp.get(ep, set()):
+                    if side in (label_per_node.get(m, "")).split("+"):
+                        return True
+        return False
+
+    def _process_pool(closed_arms, dangling_arms, var_components, prefix,
+                       pool_verdict: str = None):
         """Build raw candidates → locus-trim → dedup → emit names.
         Returns dict with keys: alleles, allele_cov, allele_segments,
-        extend_bounds, n_raw, n_dedup, found_tags_surviving."""
+        extend_bounds, n_raw, n_dedup, found_tags_surviving,
+        verdict (per-pool sub-verdict), complete_var, complete_locus,
+        basepair, diploid_dist (for cross-iteration ranking)."""
         local_raw: list[tuple[str, str]] = []
         local_path: dict[str, list[str]] = {}
+        # Keep pre-trim paths (for graph-level flank-presence checks). After
+        # the var-trim, the path's nodes are all var-bearing — flank labels
+        # only show up on the original arm (and via post-P1 neighbors).
+        local_path_pre: dict[str, list[str]] = {}
         for j, p in enumerate(closed_arms):
             tp = _trim_path_to_var(list(p))
             nm = f"{prefix}cl{j}"
             local_raw.append((nm, _seq_full(tp))); local_path[nm] = tp
+            local_path_pre[nm] = list(p)
         for j, p in enumerate(dangling_arms):
             tp = _trim_path_to_var(list(p))
             nm = f"{prefix}da{j}"
             local_raw.append((nm, _seq_full(tp))); local_path[nm] = tp
+            local_path_pre[nm] = list(p)
         for j, c in enumerate(var_components or []):
             tc = _trim_component_to_var(list(c))
             if not _component_passes_filter(tc): continue
             nm = f"{prefix}vc{j}"
             local_raw.append((nm, _arm_sequence_for(tc, prov, gfa_seqs)))
             local_path[nm] = tc
+            local_path_pre[nm] = list(c)
 
         n_raw_pool = len(local_raw)
 
@@ -796,17 +1086,19 @@ def _emit_result(res: dict, gfa_seqs: dict[str, str],
         _cov  = lambda rn: _path_mean_cov(local_path.get(rn, []), prov, depths_d)
         _bnds = lambda rn: _innermost_flank_bounds(local_path.get(rn, []))
 
-        # Completeness ranking for dedup: fresh blastn over the trimmed
-        # candidate set against queries/flankL.fasta + queries/flankR.fasta,
-        # combined with the tblastn var-tag info from _tblastn_trim_each.
-        # Per candidate, compute:
+        # Completeness ranking for dedup. Per candidate, compute:
         #   complete_var   = expected_var_tags ⊆ found_var_tags(this candidate)
         #   complete_locus = complete_var AND has_flankL AND has_flankR
-        # Then re-sort candidates by (complete_locus DESC, complete_var DESC,
-        # length DESC, diploid_cov_distance ASC) before walking the divergence
-        # check — the more-complete representative survives each equivalence
-        # class, instead of the longest one.
-        flank_presence = _blastn_flank_presence(local_raw, queries_dir) if local_raw else {}
+        # Flank presence comes from the path's GRAPH-LEVEL labels (the
+        # pre-trim arm carries flank-labeled nodes as endpoints/anchors),
+        # NOT from a blastn over the locus-trimmed sequence — the trim
+        # window strips off the flanks by design, so blastn would always
+        # report False here.
+        flank_presence = {
+            rn: (_has_flank_in_or_near(local_path_pre.get(rn, []), "flankL"),
+                 _has_flank_in_or_near(local_path_pre.get(rn, []), "flankR"))
+            for rn, _ in local_raw
+        }
 
         def _rank_key(name: str, seq: str) -> tuple:
             fv = local_found.get(name, set())
@@ -863,14 +1155,48 @@ def _emit_result(res: dict, gfa_seqs: dict[str, str],
         for rn, _ in local_dedup:
             surviving |= local_found.get(rn, set())
 
+        # Pool-level metrics (used by find_alleles for cross-iteration ranking)
+        complete_var_p = (expected_var_tags is not None
+                           and bool(expected_var_tags)
+                           and expected_var_tags <= surviving)
+        # Flank presence — taken from the per-candidate blastn we already ran
+        # above. A pool is flank-complete iff at least one surviving allele has
+        # BOTH flanks (the canonical L→R locus walk). For pools with multiple
+        # alleles, "both flanks at the pool level" means each emitted allele
+        # individually has both flanks — needed for closed_bubble acceptance.
+        all_have_flanks = bool(alleles_p) and all(
+            flank_presence.get(rn, (False, False))[0]
+            and flank_presence.get(rn, (False, False))[1]
+            for rn, _ in local_dedup
+        )
+        complete_locus_p = complete_var_p and all_have_flanks
+        basepair_p = sum(len(s) for _, s in alleles_p)
+        # Diploid signature: closer to ½ × genome_cov is better. Use the
+        # mean of all emitted alleles' covs vs genome_cov.
+        if genome_cov and cov_p:
+            diploid_dist_p = abs((sum(cov_p) / len(cov_p)) / genome_cov - 0.5)
+        else:
+            diploid_dist_p = 1.0
+
         return {
             "alleles": alleles_p, "allele_cov": cov_p,
             "extend_bounds": bounds_p, "allele_segments": segs_p,
             "n_raw": n_raw_pool, "n_dedup": nd,
             "found_tags_surviving": surviving,
+            "verdict": pool_verdict,                  # per-pool sub-verdict
+            "complete_var": complete_var_p,
+            "complete_locus": complete_locus_p,
+            "basepair": basepair_p,
+            "diploid_dist": diploid_dist_p,
+            # raw (name, seq) of the dedup-surviving candidates — used to
+            # reconstruct flank-presence/coverage info during cross-network
+            # dedup at the orchestrator level.
+            "raw_dedup": list(local_dedup),
         }
 
     # Build pools — one per network for `separate`, one global pool otherwise.
+    # Each pool carries its sub-verdict (never "separate" at the pool level —
+    # that label only emerges at the cross-pool aggregation step).
     sub_results = res.get("sub_results")
     if sub_results:
         pools = []
@@ -880,6 +1206,7 @@ def _emit_result(res: dict, gfa_seqs: dict[str, str],
                 sub.get("dangling_arms", []) or [],
                 sub.get("var_components", []) or [],
                 prefix=f"n{i+1}_",
+                pool_verdict=sub.get("class"),
             ))
     else:
         pools = [_process_pool(
@@ -887,7 +1214,17 @@ def _emit_result(res: dict, gfa_seqs: dict[str, str],
             res.get("dangling_arms", []) or [],
             res.get("var_components", []) or [],
             prefix="",
+            pool_verdict=cls,
         )]
+
+    # Find-alleles wants to inspect per-pool candidates BEFORE merging — used
+    # for cross-iteration ranking. The `return_pools` shortcut returns the
+    # raw pool list (already trimmed/deduped) and lets the orchestrator
+    # build its own emission.
+    if return_pools:
+        return {"pools": pools, "topology": cls, "sub_results": sub_results,
+                "_provenance": prov, "_var_per_node": var_per_node,
+                "_label_per_node": label_per_node}
 
     alleles         = [a for p in pools for a in p["alleles"]]
     allele_cov      = [c for p in pools for c in p["allele_cov"]]

@@ -75,7 +75,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--outdir", required=True,
                      help="per-sample output root; writes outdir/<k>/...")
     ap.add_argument("--threads", type=int, default=4)
-    ap.add_argument("--init-nhop", type=int, default=3)
+    ap.add_argument("--init-nhop", type=int, default=5)
     ap.add_argument("--max-nhop",  type=int, default=10)
     ap.add_argument("--lo-mult",   type=float, default=0.25)
     ap.add_argument("--hi-mult",   type=float, default=2.0)
@@ -126,6 +126,7 @@ def main(argv: list[str] | None = None) -> int:
         traceback.print_exc(); return 1
 
     try:
+        candidate_fa = os.path.join(out_k, "candidate_allele.fasta")
         res = find_alleles(
             hits_tsv, args.gfa,
             genome_cov=genome_cov,
@@ -136,6 +137,7 @@ def main(argv: list[str] | None = None) -> int:
             locus_padding=args.locus_padding,
             divergence_threshold=args.divergence_threshold,
             queries_dir=args.queries_dir,
+            out_candidate_fa=candidate_fa,
         )
     except Exception as e:
         with open(result_tsv, "w") as fh:

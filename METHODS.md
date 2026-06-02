@@ -254,19 +254,55 @@ and **unlabeled connector** (neither). The input may also contain **composite**
 nodes (a single GFA segment with BOTH flank and var tags, e.g. `HD1+flankL`). The
 preprocessing removes composites and identifies the bubble:
 
-**P1. Directional split** — each multi-labeled segment becomes a chain of
-single-labeled sub-segments along the segment's direction:
+**P1. Directional split — `n_label`-based 3-piece-max rule**
+
+Each multi-labeled segment becomes a short chain of sub-segments, where the
+number of pieces is bounded by the count of **distinct labels** on the segment
+(NOT by the number of individual hits):
 
 ```
-input:  ─── HD1+flankL+flankR composite ───
-P1 out: ─── [flankL] ─── [HD1] ─── [flankR] ───
+n_label = 1   →  1 piece    (segment unchanged; just labeled)
+n_label = 2   →  up to 3 pieces  (L-piece + middle + R-piece, middle omitted
+                                  when the two label spans touch)
+n_label ≥ 3   →  exactly 3 pieces (L-piece + unified middle + R-piece)
+                 — the middle keeps any var labels whose spans fall between
+                 the two end-piece labels; flank labels in the middle are
+                 dropped (canonical layout = flanks at ends).
 ```
 
-The split uses the **per-end label coordinates** the labeler records (start/end
-on each segment, from BLAST `sstart`/`send`). After P1, every node is pure-flank,
-pure-var, or unlabeled connector; **no composites remain.** Each neighbor edge
-of the original segment attaches to the sub-segment whose label range covers its
-connection end (GFA L-line orientation gives this).
+`L_tag` = the label whose span starts leftmost on the segment;
+`R_tag` = the label whose span ends rightmost.
+
+Sub-node IDs are coordinate-free: `{parent_seg}#1`, `{parent_seg}#2`, …
+(1 = L-piece, 2 = middle if present, trailing # = R-piece). The provenance
+dict `{sub_id: (parent_seg, start, end, strand)}` carries the actual
+coordinates for sequence materialization downstream — IDs stay clean for
+display in `bubble.txt` / `bubble.gfa` / `bubble.png`.
+
+Example (the AG3-class composite with all four labels on one segment):
+
+```
+input:  ─── flankL + HD1 + HD2 + flankR composite (5906 bp) ───
+P1 out: ─── [flankL]#1 ─── [HD1+HD2]#2 ─── [flankR]#3 ───
+                              ↑
+                  middle KEEPS both var labels — losing them would
+                  erase real HD content sandwiched between the flanks
+                  and the classifier would report no_var on a clearly
+                  HD-bearing segment.
+```
+
+The earlier rule split at every hit boundary (one piece per BLAST HSP),
+which inflated graph size when multiple same-label hits sat on the same
+segment, and lost biologically-meaningful collapsing. The current rule
+emits a fixed-shape 3-piece skeleton that captures: "this segment has L
+labels on the left, R labels on the right, and these var tags in the
+middle" — which is what the classifier actually needs.
+
+After P1, every node is pure-flank, pure-var (possibly with multiple var
+tags after middle-consolidation), or unlabeled connector; **no composites
+remain.** Each neighbor edge of the original segment attaches to the
+sub-segment whose label range covers its connection end (GFA L-line
+orientation gives this).
 
 **P2. Bubble BFS** — starting from every pure-var node, BFS through unlabeled-only
 neighbors. The set of nodes reached forms the **bubble**; everything else is
@@ -370,50 +406,147 @@ the rest is a single counting step.
 
 ### 3.7 `find_alleles` BFS loop
 
-`find_alleles(seg_label_hits_tsv, gfa_path, genome_cov, init_nhop=3, max_nhop=10, var_proteins_ref=…, expected_var_tags=…, locus_padding=1500, lo_mult=0.25, hi_mult=2.0, divergence_threshold=0.05)`
-loops over BFS hop counts and coverage filters, accepts the first configuration
-that yields two divergent closed-bubble arms, and otherwise emits whatever the
-loop ends on.
+`find_alleles(seg_label_hits_tsv, gfa_path, genome_cov, init_nhop=5, max_nhop=10, var_proteins_ref=…, expected_var_tags=…, locus_padding=1500, lo_mult=0.25, hi_mult=2.0, divergence_threshold=0.05, queries_dir=…, out_candidate_fa=…)`
+
+The orchestrator runs a 24-iteration grid (nhop × phase × cov), collects a
+per-network candidate from every iteration, optionally short-circuits when a
+"gold-standard" candidate appears, then picks across the whole pool. Saves
+every emission to `candidate_allele.fasta` for forensic audit.
 
 ```python
-for phase in (var_seeded, var+flank_seeded):
-    for nhop in init_nhop..max_nhop:
-        for use_cov in (True, False):                          # cov-on first
-            res = _try_one_pass(seeds, nhop, use_cov)          # BFS + classify
-            log(phase, nhop, use_cov, |nhood|, n_arms, class)
-            if use_cov and nhop == max_nhop:
-                fallback_cov_on := res                         # remember
-            last_res := res
-            if _accept(res):                                   # closed_bubble + 2 arms divergent
-                return _finalize(res)
+candidates = []
+short_circuit = False
 
-# Exhausted — fallback chain:
-emit_from = fallback_cov_on if it has candidates else last_res
-return _finalize(emit_from)
+for nhop in 5..10:                                # outer: 6 nhops
+    for phase in (var_seeded, var+flank_seeded):  # middle: 2 phases
+        for use_cov in (True, False):             # inner: 2 cov states
+            res = _try_one_pass(seeds, nhop, use_cov)
+            log(nhop, phase, use_cov, |nhood|, n_var, class, n_arms)
+
+            if res.class == "no_var" or res.n_var == 0:
+                continue                          # skip empty iterations
+
+            # Per-network candidates: 1 per pool (1 pool if non-separate,
+            # N pools when classifier returns 'separate' with N sub_results)
+            pools = _emit_result(res, ..., return_pools=True)
+            for i, pool in enumerate(pools):
+                if not pool.alleles: continue
+                c = {
+                    iter_id, net_in_iter=(i+1 if N>1 else 0),
+                    verdict=pool.sub_verdict,     # NEVER 'separate' at pool level
+                    alleles, allele_cov, basepair,
+                    complete_var, complete_locus,
+                    diploid_dist,
+                    ...
+                }
+                candidates.append(c)
+
+                # Acceptance gate (α — hard short-circuit)
+                if (c.verdict == "closed_bubble"
+                        and c.n_dedup >= 2
+                        and c.complete_locus):
+                    short_circuit = True
+
+            if short_circuit: break
+        ...
+
+write_candidate_fasta(candidates, out_candidate_fa)
+
+# === Picker: rank all candidates, take the single best ============
+best = min(candidates, key=lambda c: (
+    bubble_priority(c.verdict),         # 0. K-picker order
+    not c.complete_locus,               # 1. complete locus DESC
+    not c.complete_var,                 # 2. complete var DESC
+    not c.cov,                          # 3. cov-on > cov-off
+    -c.basepair,                        # 4. longer DESC
+    c.diploid_dist,                     # 5. closer to ½ × D_k ASC
+))
+
+# === Cross-network sibling dedup (same iteration only) ============
+siblings = [c for c in candidates if c.iter_id == best.iter_id]
+# Combined sequences from all siblings, RC-aware dedup with same
+# completeness-first ordering. Disallows cross-iteration mixing.
+final = dedup_ranked_cross_network(siblings, divergence_threshold)
+
+# === Sample verdict ================================================
+surviving_nets = {c.net for c in final}
+sample_verdict = ("separate" if len(surviving_nets) >= 2
+                  else siblings[0].verdict)
 ```
 
-Each `_try_one_pass` BFS-expands seeds by `nhop` hops, optionally applies a depth
-filter `[lo_mult × D_k, hi_mult × D_k]` (default `[0.25, 2.0]`), restricts edges,
-runs P1 directional split (§3.3), runs the classifier (§3.4–3.6), and stashes
-`_provenance` + `_var_per_node` on the result. Self-loop GFA edges (where source ==
-target) are skipped when building adjacency.
+#### Key invariants
+
+- **All 24 iterations may run.** Phase 2 (flank-seeded) runs at every nhop —
+  not "only when phase 1 failed". Acceptance can short-circuit early but
+  doesn't have to.
+- **Acceptance (α) is a hard short-circuit**, not a fallback condition. It
+  fires the moment ANY candidate is a clean diploid: `closed_bubble`,
+  `n_dedup ≥ 2`, `complete_locus`. All remaining iterations are skipped.
+- **No candidate ever carries `verdict="separate"`.** When the classifier
+  returns `class="separate"` (var-bearing nodes form disjoint subgraphs),
+  each network's sub-classification (`closed_bubble`/`open_bubble`/`single`/
+  `complexed`) becomes its candidate's verdict. The `separate` label is
+  applied AT THE SAMPLE LEVEL only — after dedup, if ≥ 2 distinct networks
+  survived.
+- **Cross-iteration mixing is disallowed**: the picker chooses ONE
+  candidate, and only its same-`iter_id` siblings join it for the
+  cross-network dedup. You can't combine network 1 from iteration X with
+  network 2 from iteration Y.
+- **`candidate_allele.fasta`** captures every emitted sequence across the
+  loop, with headers tagging `(iter_id, network, cov, verdict)` — purely
+  for audit / debugging; not used by downstream tools.
+
+#### `_try_one_pass` (single iteration)
+
+Each `_try_one_pass` BFS-expands seeds by `nhop` hops, optionally applies a
+depth filter `[lo_mult × D_k, hi_mult × D_k]` (default `[0.25, 2.0]`),
+restricts edges, runs P1 directional split (§3.3), runs the classifier
+(§3.4–3.6), and stashes `_provenance` + `_var_per_node` on the result.
+Self-loop GFA edges (where source == target) are skipped when building
+adjacency.
+
+The classifier's `class="separate"` recursion (per-network sub-classification)
+also happens here — sub_results are attached to `res` and consumed by
+`_emit_result(return_pools=True)` to produce per-network pools.
+
+#### Completeness — graph-level flank check
+
+The new acceptance and ranking rely on `complete_locus = complete_var AND
+has_flankL AND has_flankR`. The flank-presence check is **graph-level**,
+NOT a blastn on the locus-trimmed sequence:
+
+```python
+has_flank(path, side) := any(side in label(n) for n in path)
+                        OR any(side in label(m) for ep in (path[0], path[-1])
+                                                  for m in adj_pp[ep])
+```
+
+The candidate's pre-trim path nodes carry flank labels directly when an arm
+endpoint IS a flank-labeled segment; otherwise the bubble's flank anchor sits
+just OUTSIDE the path as a post-P1 neighbor. A blastn on the trimmed
+sequence would always return False here because the trim window
+(`var_start − 1500` to `var_end + 1500`) strips flanks by design.
 
 ### 3.8 Emission rule (trim → dedup → emit)
 
-The caller collects every var-bearing candidate the classifier produced — pooling
-`closed_arms + dangling_arms + var_components` — and runs them through a uniform
-pipeline. The verdict always preserves the classifier's origin; only the emitted
-record naming reflects the post-dedup count.
+`_emit_result(return_pools=False)` produces ONE merged sample-level emission
+(legacy path, used when the orchestrator finalizes a single picked iteration).
+`_emit_result(return_pools=True)` returns the raw per-pool list (new path, used
+by `find_alleles` to collect candidates across iterations — §3.7).
 
-Pipeline inside `_emit_result`:
+Per pool (= per network when classifier is "separate", or single global pool
+otherwise), the pipeline is:
 
 ```
 candidate paths from classifier
-    │
+    │  closed_arms + dangling_arms + var_components
     ▼
 [node-level path-trim]              ← always (uses var_per_node, no BLAST)
-    │  ordered paths     → subpath [first_var, last_var]
-    │  var_components    → only var-labeled nodes
+    │  ordered paths    → subpath [first_var, last_var]
+    │  var_components   → only var-labeled nodes
+    │
+    │  (pre-trim path kept SEPARATELY — used downstream for
+    │   graph-level flank-presence check — §3.7 "Completeness")
     ▼
 build sequences via provenance (orig_seg, start, end, strand)
     │
@@ -424,12 +557,16 @@ build sequences via provenance (orig_seg, start, end, strand)
     │  drop candidates with no HD hits
     │  collect found_var_tags per surviving candidate
     ▼
-[edlib HW edit-distance dedup]      ← always
-    │  sort by length desc
-    │  for each candidate s: drop if identity(s, k) > 1 − threshold
-    │  with some already-kept k (default threshold = 5%)
-    │  HW mode = shorter as query within longer as target → terminal
-    │  length differences don't penalize identity
+[completeness-first dedup]
+    │  RANK candidates by:
+    │    (¬complete_locus, ¬complete_var, −basepair, diploid_dist)
+    │  WALK in rank order:
+    │    keep s iff is_divergent(s, k, threshold) for every already-kept k
+    │    where is_divergent uses RC-aware edlib HW edit-distance:
+    │      ed_fwd = edlib.align(q, t,         mode=HW, task=distance)
+    │      ed_rc  = edlib.align(q, RC(t),     mode=HW, task=distance)
+    │      identity = 1 − min(ed_fwd, ed_rc) / |q|
+    │    threshold default = 5% (collapse if identity ≥ 95%)
     ▼
 emit: allele1 / allele1+allele2 / chimera1..N (by post-dedup count)
     │
@@ -437,38 +574,78 @@ emit: allele1 / allele1+allele2 / chimera1..N (by post-dedup count)
 [per-allele depth + completeness + extend_bounds]
     allele_cov = length-weighted DP:f: mean per allele path
     surviving_tags = union of found_var_tags across survivors
-    complete_var / complete_locus / locus_coverage
+    complete_var = (expected_var_tags ⊆ surviving_tags)
+    complete_locus = complete_var AND has_flankL AND has_flankR
+                     (flank presence via graph-level path-node labels;
+                     see §3.7 "Completeness")
     extend_bounds = per allele, (innermost_flankL_node,
-                    innermost_flankR_node) — found by looking at
-                    each candidate path's endpoint EXTERIOR
-                    neighbors (flank nodes sit outside the bubble,
-                    adjacent to the boundary). Metadata only —
-                    emitted sequence stays var-trimmed; this gives
-                    the consumer the locus context markers without
-                    changing what's emitted.
+                    innermost_flankR_node)
 ```
 
-| post-dedup `n` | emitted records           | verdict (= origin) |
+#### Pool-level outputs the orchestrator consumes
+
+Each pool returns (used both by the legacy single-merge path and by the new
+per-iteration candidate collection):
+
+```python
+{
+  alleles, allele_cov, extend_bounds, allele_segments,
+  n_raw, n_dedup, found_tags_surviving,
+  verdict,                                  # per-pool sub-verdict (NOT "separate")
+  complete_var, complete_locus,
+  basepair, diploid_dist,                   # for cross-iteration ranking
+  raw_dedup,                                # surviving (name, seq) pre-merge
+}
+```
+
+| post-dedup `n` | emitted records           | naming inside pool |
 |----------------|---------------------------|--------------------|
-| 1              | `allele1`                 | `<origin>`         |
-| 2              | `allele1`, `allele2`      | `<origin>`         |
-| ≥ 3            | `chimera1`, `chimera2`, … | `<origin>`         |
+| 1              | `allele1`                 | (prefix + `allele1`) |
+| 2              | `allele1`, `allele2`      | (prefix + `allele{i}`) |
+| ≥ 3            | `chimera1`, `chimera2`, … | (prefix + `chimera{i}`) |
 
-A `closed_bubble` whose two arms turn out to be identical (dedup→1) is reported as
-`verdict=closed_bubble` with one `allele1`, NOT downgraded to `single`. `n_after_dedup`
-tells the consumer how many distinct sequences came out.
+(prefix is `""` for non-separate, `n{i}_` for separate's i-th network — so
+output is e.g. `n2_allele1`, `n2_allele2`, …)
 
-**Dedup similarity choice.** Originally k-mer Jaccard (k=21, threshold 0.05) —
-replaced because Jaccard is dominated by the *union* of k-mers and gets fooled by
-long conserved flanks (two alleles with small variant region embedded in long flank
-look ≥95% similar and incorrectly collapse). Current implementation uses edlib
-edit-distance identity: `1 − editDistance / max(len(a), len(b))` under HW (infix)
-mode. The locus-trim step upstream further reduces flank dilution by stripping
-non-HD-bearing content before dedup compares.
+A `closed_bubble` whose two arms collapse to one (dedup→1) is reported as
+`verdict=closed_bubble` with one `allele1`, NOT downgraded to `single`.
+`n_after_dedup` tells the consumer how many distinct sequences came out.
 
-**Why two layers of trim.** Node-level path-trim is cheap (no BLAST, uses graph-level
-`var_per_node` membership) and strips most of the conserved flank. The tblastn
-locus-trim then catches cases where the labeler missed a var hit or the node-trim
+#### Why completeness-first ranking, not length-first
+
+The old rule kept the LONGEST representative of each dedup equivalence class.
+Problem: in transitive clusters where A↔B and B↔C are within 5% but A↔C is
+above 5%, length-first kept A and C (both endpoints), giving 2 alleles.
+Completeness-first picks B (the central more-complete representative), whose
+5% radius now covers BOTH A and C → 1 allele.
+
+Empirical: switching from length-first to completeness-first reduced total
+allele count from 407 → 395 across the 148-sample whitelist, with the
+biggest reductions in the 5–7 kb and ≥ 7 kb buckets (long chimeras that
+were keeping their length-tied tail variants). The 4–5 kb diploid bucket
+was untouched.
+
+#### RC-aware divergence — why both strands
+
+`_identity()` aligns the shorter sequence (as query) against BOTH the target
+and `RC(target)`, taking the better edit-distance. This is needed because
+graph walks through the same bubble can be emitted in either orientation
+depending on which anchor BFS started from. Without RC-awareness, two arms
+that are reverse-complements of the same allele would survive dedup as
+distinct (forward HW edit-distance between them would be near-zero on the
+shared part, but the orientation flip looks like total dissimilarity to
+infix-anchored alignment if the target is shorter than the query).
+
+The current `_blastn_flank_presence()` helper still exists for fallback /
+diagnostic use but is NOT consulted during normal emission — the
+graph-level path check (§3.7) replaces it. Calling code that wants
+sequence-level confirmation can still invoke it.
+
+#### Why two layers of trim
+
+Node-level path-trim is cheap (no BLAST, uses graph-level `var_per_node`
+membership) and strips most of the conserved flank. The tblastn locus-trim
+then catches cases where the labeler missed a var hit or the node-trim
 left extra context; it is the content-based safety net.
 
 ### 3.9 Arm-sequence reconstruction
@@ -527,9 +704,12 @@ The output dict:
                        # no flank-labeled neighbor was found on that side.
     "basepair":        sum of emitted allele lengths,
 
-    # Completeness (post-trim tblastn over surviving candidates)
+    # Completeness (post-trim tblastn over surviving candidates,
+    #               graph-level flank-presence check — §3.7)
     "complete_var":    bool | None,   # all expected_var_tags hit?
-    "complete_locus":  bool | None,   # currently mirrors complete_var
+    "complete_locus":  bool | None,   # at sample level: aliases complete_var
+                                       # (per-candidate level: complete_var AND
+                                       #  has_flankL AND has_flankR)
     "locus_coverage":  float | None,  # fraction of expected_var_tags found
     "found_var_tags":  sorted list[str],
 
@@ -544,23 +724,42 @@ The output dict:
     # Segment provenance
     "segments":        sorted list[str],   # union of orig-seg IDs across alleles
     "segments_labeled": list[(seg_id, "tag1+tag2+...")],
+    "allele_segments": list[list[str]],    # PER allele, list of sub-node IDs
+                                            # ({parent}#N format — see §3.3)
+                                            # written to picks.tsv col 8
+    "subnode_seqs":    {sub_id: dna_seq},  # materialized sub-node sequences
+                                            # for IDs referenced by emitted
+                                            # alleles; run_per_k writes to
+                                            # <k>/subnode_seqs.fasta
     "genome_cov":      float,         # echoed from input
 
     "info":            { ...classifier stats (n_arms, n_closed, anchors, etc.) },
 }
 ```
 
-`run_per_k.py` flattens this dict into a 21-column `result.tsv`:
+`run_per_k.py` flattens this dict into a 22-column `result.tsv`:
 
 ```
 sample  k  bubble_type  components  complete_var  complete_locus  locus_coverage
 basepair  genome_cov  allele_cov  n_cand  n_dedup  divergent  n_hops_used  phase
 cov_filter_used  allele_lens  segments  segments_labeled  found_var_tags
-extend_bounds
+extend_bounds  allele_segments
 ```
 
 `extend_bounds` is encoded as `L:R;L:R;…` (one `L:R` pair per emitted allele,
 `;`-joined). `-` placeholder where no flank was reached on that side.
+`allele_segments` is `;`-joined per allele, `,`-joined within an allele.
+
+#### Side files written by `run_per_k.py` per (sample, k):
+
+| file | content |
+|---|---|
+| `alleles.fasta` | post-dedup picked alleles, FASTA |
+| `result.tsv` | the 22-column row above |
+| `seg_label_hits.tsv` | labeler output (§3.2) |
+| `subnode_seqs.fasta` | one record per unique `{parent}#N` sub-node ID, with the materialized sub-region DNA (RC'd if post-P1 strand was `-`). Consumed by `graph_paths.py` to draw `bubble.gfa` / `bubble.png` with coord-free IDs. |
+| `candidate_allele.fasta` | forensic record — every emitted sequence across all 24 BFS iterations. Headers carry `cand{id}_h{nhop}_p{phase}_c{cov}_n{net}_v{verdict}_{allele_name}`. Not consumed by downstream stages. |
+| `flankL_blastn.tsv`, `flankR_blastn.tsv`, `HD_tblastn.tsv` | raw BLAST inputs to the labeler |
 
 Cross-K integration (picking the best K across the per-k results) lives in
 `matdetangler.pick_k`, documented in §4. `per_k_caller`'s contract is **one k in,
