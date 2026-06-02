@@ -888,3 +888,181 @@ phase B is cheap (single-linkage cut on the saved matrix) and re-runnable at any
 | Consensus drift from pick after read mapping | `consensus_qc.py` re-check + consensus divergence pass |
 | Read-derived gap in HD body | core_meandepth at the HD-core positions |
 | Cross-k pair makes a confusing bubble | per-K pair finder + bubble PNG K-prefix when cross-k |
+
+---
+
+## Appendix A. Topology classifier (isolated test bench)
+
+The `_pair_topology_rank` and `classify_neighborhood_topology` functions used
+during pick selection / widen-loop break are coarse (set-membership over
+shared flank-bearing segs). A more rigorous walk-aware classifier was
+developed and stress-tested in isolation under `test/graph_classifier/`
+before integration. This appendix documents the test bench and the new
+classifier algorithm.
+
+### A.1. Goals
+
+- Determine the topology class of a GFA neighborhood under the assumption
+  that **var-gene nodes and flank nodes are already labeled** (the BFS +
+  blast labeling that precedes classification gives us this).
+- Be robust to the kinds of structural noise real SPAdes graphs produce
+  (linker subdivisions, flank fragmentation, gene-flank lumping, paralog
+  flanks dragged in by BFS, etc.).
+- Distinguish more cases than the current set-membership classifier:
+  closed_bubble, open_bubble, complexed, **single** (one clean arm —
+  haploid / collapsed dikaryon), and separate.
+
+### A.2. Synthetic test data — clean cases
+
+Nine ground-truth networks (`test/graph_classifier/network.py`), each a
+hand-built undirected GFA-like graph (nodes + edges + per-node labels +
+per-node var-gene tag set):
+
+| builder | expected | structure |
+|---|---|---|
+| `closed_bubble` | closed_bubble | flankL — HD1{a,b} — HD2{a,b} — flankR (two arms, both flanks shared) |
+| `open_bubble_case1` | open_bubble | one arm closes at flankR, the other dangles |
+| `open_bubble_case2` | open_bubble | both arms anchored at flankL only; no flankR |
+| `complex_case1` | complexed | 3 parallel arms (3 var-series share both flanks) |
+| `complex_case2` | complexed | 3 arms; one closed, two open from flankL |
+| `complex_case3` | complexed | 3rd arm joins from opposite side (asymmetric) |
+| `complex_case4` | complexed | dangling HD1c-HD2c branch + a second arm anchored only at flankR |
+| `complex_case5` | complexed | HD1a forks into both HD2a AND HD2b (degree-3 hub) |
+| `separate` | separate | two completely disjoint flank-HD-flank chains |
+
+Node ID convention: HD genes carry an allele letter suffix (`HD1a`, `HD2a`
+= allele a; `HD1b`, `HD2b` = allele b; `c` for the third arm in complex
+cases). The classifier ignores the suffix; the test generator uses it
+(see A.4 rules).
+
+### A.3. Perturbation suite — class-preserving (mostly) transformations
+
+Five categories of perturbation, each implemented as a pure function
+`(TestNetwork, rng) -> TestNetwork` in `noise.py` / `lumping.py`:
+
+| perturbation | what it does |
+|---|---|
+| `add_noise` | hangs 1–5 dangling chains (length 1–5) of unlabeled nodes off random existing nodes — pure outward noise |
+| `add_linkers` | subdivides existing edges with chains of unlabeled linker nodes (≤ MAX_LINKER_PADDING) |
+| `apply_reality` | collapses interior unlabeled degree-2 nodes + subdivides some edges |
+| `lump_var_flank` | merges one var node with an adjacent flank into a composite (label "HD1+flankL", vars={"HD1"}) |
+| `lump_var_var` | merges two adjacent var nodes into a composite ("HD1+HD2", vars={"HD1","HD2"}) |
+| `partial_lump_flank` | inserts a NEW composite node between a flank and an adjacent var (yields `flankL` + `flankL+HD1` coexisting) |
+| `fragment_var` | splits one var node into two adjacent same-tag pieces |
+| `fragment_flank` | same idea for flank nodes |
+| `extra_flank` | plants a paralog flank node in a DISCONNECTED subgraph (no path to the locus) |
+| `drop_var_copy` (degvar) | removes a var-gene tag from one randomly chosen copy — class may shift, expected="unknown" |
+
+`apply_reality_full` is a meta-perturbation that randomly mixes 2–5 of
+the above per pass.
+
+### A.4. Realism rules constraining the generator
+
+- **MAX_LINKER_PADDING = 3** — single coupled parameter shared by the
+  generator (cap on linker chain length) and the classifier (validity
+  horizon, see A.5). If bumped, both sides move together.
+- **Allele separability.** `lump_var_flank` refuses to merge a var node
+  if it is the LAST pure-var (no-flank-tag) node of its allele. This
+  prevents cascades that bury all of an allele's var content into a
+  flank composite, which would leave that allele invisible in the
+  var-only subgraph. `lump_var_var` is unconstrained — cross-allele
+  composites are allowed; the separability rule alone is enough to keep
+  the alleles distinguishable in the post-perturbation network.
+- **Disconnected extras.** `extra_flank` no longer attaches into the main
+  network — it plants a paralog flank in its own disconnected subgraph.
+  The classifier's validity rule (A.5) correctly ignores it without any
+  special-case handling.
+
+### A.5. Classifier algorithm (walk-aware)
+
+`test/graph_classifier/classifier.py::classify(nodes, edges, labels, var_per)`.
+
+```
+1. PRUNE noise tails.
+   Iteratively remove leaf nodes (degree ≤ 1) that carry neither a var
+   gene nor a flank tag. Strips dangling anonymous chains so they don't
+   inflate the degree of real nodes.
+
+2. SEPARATE check.
+   If the var-bearing nodes live in more than one connected component of
+   the (pruned) FULL graph -> return 'separate'.
+
+3. VAR-SERIES = connected components of (nodes − flank_nodes), keeping
+   only those that contain at least one var-gene node.
+   - flank_nodes = any node whose label has a "flankL" or "flankR" tag,
+     INCLUDING composites like "flankL+HD1" (the flank tag puts the node
+     on the boundary regardless of any gene tag).
+
+4. FLANK-REGION components — generalized anchor detection.
+   Build a "flank-traversal" subgraph by removing only INTERIOR var nodes
+   (var-tagged AND not flank-tagged). Connected components of this
+   subgraph define flank regions; intersect each with flankL_nodes /
+   flankR_nodes to get L-regions / R-regions.
+
+   Generalization vs naive "same-component-of-flankL-nodes":
+       a -- linker -- b   where a, b are both flankL → still ONE L-region
+                                                       (linker is non-var)
+       a -- HD1 -- b      where a, b are both flankL → TWO L-regions
+                                                       (var between them)
+
+5. ANCHOR VALIDITY (couples to MAX_LINKER_PADDING).
+   A flank region is a "valid anchor" iff some flank node in it can
+   reach a var node through a path of ≤ MAX_LINKER_PADDING unlabeled
+   intermediates. BFS counting non-flank, non-var hops.
+   - This excludes paralog flanks planted in their own subgraph, AND
+     flank labels attached via long noise chains (which couldn't have
+     been a real bubble joint in the GFA).
+
+6. PER-SERIES bookkeeping.
+   For each var-series s, compute:
+     L_anchors(s) = indices of VALID flankL regions touched by s
+                    (a series 'touches' a region if some node in s is
+                    IN the region OR adjacent to a node in the region)
+     R_anchors(s) = same for flankR
+     clean(s)     = (max_degree_in_s ≤ 2) AND
+                    (no valid-flank node is adjacent to an interior
+                     non-endpoint node of s)
+                    i.e. the series is a simple chain and any flank
+                    attachment sits at an endpoint.
+
+7. CLASSIFY.
+   n_series = |var_series|
+   if n_series == 1 and the lone series is clean   -> 'single'
+   if n_series == 1 and not clean                  -> 'complexed'
+   if n_series != 2                                -> 'complexed'
+   if any series not clean                         -> 'complexed'
+   let s1, s2 = the two series, with anchors above.
+   define same_single(A, B) := A == B and |A| == 1
+   if same_single(L1,L2) AND same_single(R1,R2)     -> 'closed_bubble'
+   if (same_single(L1,L2) AND R side is empty or
+       only one series touches a single R region)
+       (symmetric for R-anchored)                  -> 'open_bubble'
+   otherwise                                        -> 'complexed'
+```
+
+### A.6. Test outcomes
+
+`run_tests.py` runs four layers:
+
+| layer | description | trials |
+|---|---|---|
+| clean | each of 9 ground-truth networks | 9 |
+| individual perturbations | each clean × {noise, linker, reality, lump_var_flank, lump_var_var, partial_lump_flank, fragment_var, fragment_flank, extra_flank_L, extra_flank_R} | 9 × 10 = 90 |
+| metatest | each clean × 20 random `apply_reality_full` trials (2–5 perturbations stacked per pass) | 9 × 20 = 180 |
+| degvar | each clean × `drop_var_copy` — class may legitimately shift (log only, no assertion) | 9 |
+
+Outcome buckets:
+- **pass** — verdict matches the ground-truth class
+- **simplified** — verdict differs from ground truth in a way the
+  perturbation can legitimately produce (e.g. lump cascade reduces
+  `complexed` → `closed_bubble`, or absorbs an arm into a composite
+  reducing `open_bubble` → `single`)
+- **fail** — verdict differs and no legitimate simplification path
+
+With the rules from A.4 in place, the suite is **275 pass, 0 fail,
+4 simplified** under `PYTHONHASHSEED=0`. Run with:
+
+```
+PYTHONHASHSEED=0 python3 -m test.graph_classifier.run_tests       # all layers
+PYTHONHASHSEED=0 python3 -m test.graph_classifier.run_tests -v    # per-series detail
+```

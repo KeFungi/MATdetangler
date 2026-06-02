@@ -5,16 +5,13 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 
-# SPAdes assemblies are huge — never commit except the one runnable example
+# SPAdes assemblies are huge — never commit
 **/spades*/
 **/_spades*/
 **/k[0-9][0-9]*/
 **/contigs.fasta
 **/assembly_graph_after_simplification.gfa
 **/contigs.paths
-# ...but DO commit the shipped Tu127439 example
-!examples/Tu127439_spades/
-!examples/Tu127439_spades/**
 
 # Per-sample run outputs
 **/blast_*.tsv
