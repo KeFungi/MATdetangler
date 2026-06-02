@@ -474,69 +474,38 @@ print(f'{v:.4f}')
     ANCHOR_SEG_ARG="--anchors-segments $SDIR/anchor_segments_${K_ONE}.fasta"
   fi
 
-  # --- 3: graph path search + bubble typing (this k only) ---
-  echo "  [$K_ONE] step 3 graph_path_search"
+  # --- 3: per-K allele caller (NEW — replaces graph_path_search + pick_alleles) ---
+  # Uses matdetangler.run_per_k: GFA-segment BLAST → labeler → bubble classifier
+  # → trim → dedup → emit. Writes $SDIR/$K_ONE/result.tsv + alleles.fasta.
+  echo "  [$K_ONE] step 3 run_per_k (new caller)"
+  GFA_HERE="$SPADES_DIR/$K_ONE/assembly_graph_after_simplification.gfa"
   GS_RC=0
-  "$PY" -m matdetangler.graph_path_search --sample "$SAMPLE" --spades-dir "$SPADES_DIR" \
-    --queries-dir "$QDIR" --ks "$K_ONE" --outdir "$SDIR" \
-    --anchors-contigs "$SDIR/anchor_contig_${K_ONE}.fasta" $ANCHOR_SEG_ARG \
-    ${REPEATS:+--repeats "$REPEATS"} \
-    --locus-ref "$LOCUS_REF" \
-    --max-locus-len "$MAX_LOC" --min-allele-len "$MIN_AL" --max-walk-bp "$MAX_WALK_BP" \
-    --genome-coverage "$K_GENOMECOV" --expected-count "$EXPECTED" $( [ "$ASYM_BFS" -eq 1 ] && echo --asymmetric-bfs ) \
-    ${INIT_HOPS:+--init-hops "$INIT_HOPS"} ${MAX_HOPS:+--max-hops "$MAX_HOPS"} \
-    --blast-out-dir "$SDIR" \
-    --threads "$THREADS" 2>&1 | tee "$LDIR/03_graph_path_search_${K_ONE}.log" || GS_RC=$?
-  mv -f "$SDIR/bubble_alleles.fasta"  "$SDIR/bubble_alleles_${K_ONE}.fasta"
-  mv -f "$SDIR/bubble_alleles.ann.tsv" "$SDIR/bubble_alleles_${K_ONE}.ann.tsv" 2>/dev/null || true
-
-  # --- 2.2 trigger 2 (per k): step 3 short, 2.2 not yet tried this k ---
-  if [ "$GS_RC" -ne 0 ] && [ "$TRIED_22" -eq 0 ]; then
-    echo "  [$K_ONE] step 3 short -> step 2.2 add segment anchors, retry step 3"
-    "$PY" -m matdetangler.anchor_search --sample "$SAMPLE" --source segments --spades-dir "$SPADES_DIR" \
-      --queries-dir "$QDIR" --ks "$K_ONE" --outdir "$SDIR" \
-      --min-len 200 --blastn-pid "$BLASTN_PID" --blastn-minlen "$BLASTN_MINLEN" \
-      --tblastn-pid "$TBLASTN_PID" --tblastn-aa "$TBLASTN_AA" \
-      --tblastx-pid "$TBLASTX_PID" --tblastx-aa "$TBLASTX_AA" \
-      --flank-pid "$FLANK_PID" --flank-minlen "$FLANK_MINLEN" \
-      --threads "$THREADS" \
-      $( [ "$DEBUG" -eq 1 ] && echo --include-flanks ) --blast-out-dir "$SDIR" \
-      2>&1 | tee "$LDIR/02_2_anchor_search_segments_${K_ONE}.log"
-    mv -f "$SDIR/anchor_segments.fasta"   "$SDIR/anchor_segments_${K_ONE}.fasta"
-    mv -f "$SDIR/anchor_segments.ann.tsv" "$SDIR/anchor_segments_${K_ONE}.ann.tsv" 2>/dev/null || true
-    TRIED_22=1
-    "$PY" -m matdetangler.graph_path_search --sample "$SAMPLE" --spades-dir "$SPADES_DIR" \
-      --queries-dir "$QDIR" --ks "$K_ONE" --outdir "$SDIR" \
-      --anchors-contigs "$SDIR/anchor_contig_${K_ONE}.fasta" \
-      --anchors-segments "$SDIR/anchor_segments_${K_ONE}.fasta" \
-      ${REPEATS:+--repeats "$REPEATS"} \
-      --max-locus-len "$MAX_LOC" --min-allele-len "$MIN_AL" --max-walk-bp "$MAX_WALK_BP" \
-      --genome-coverage "$K_GENOMECOV" --expected-count "$EXPECTED" $( [ "$ASYM_BFS" -eq 1 ] && echo --asymmetric-bfs ) \
-      ${INIT_HOPS:+--init-hops "$INIT_HOPS"} ${MAX_HOPS:+--max-hops "$MAX_HOPS"} \
-      --blast-out-dir "$SDIR" \
-      --threads "$THREADS" 2>&1 | tee "$LDIR/03_graph_path_search_retry_${K_ONE}.log" || GS_RC=$?
-    mv -f "$SDIR/bubble_alleles.fasta"   "$SDIR/bubble_alleles_${K_ONE}.fasta"   2>/dev/null || true
-    mv -f "$SDIR/bubble_alleles.ann.tsv" "$SDIR/bubble_alleles_${K_ONE}.ann.tsv" 2>/dev/null || true
+  "$PY" -u -m matdetangler.run_per_k --sample "$SAMPLE" --k "$K_ONE" \
+    --gfa "$GFA_HERE" \
+    --queries-dir "$QDIR" \
+    --hd-proteins "$PROTEINS" \
+    --cov-file "$K_COV_FILE" \
+    --outdir "$SDIR" --threads "$THREADS" \
+    2>&1 | tee "$LDIR/03_run_per_k_${K_ONE}.log" || GS_RC=$?
+  # Backward-compat alias: bubble_alleles_${K_ONE}.fasta points to the new alleles.fasta
+  if [ -s "$SDIR/$K_ONE/alleles.fasta" ]; then
+    cp -f "$SDIR/$K_ONE/alleles.fasta" "$SDIR/bubble_alleles_${K_ONE}.fasta"
   fi
 
-  # NOTE: in-loop cat-into-cumulative DELIBERATELY OMITTED here. graph_path_search.run()
-  # truncates bubble_alleles.fasta at start of every call, so any cumulative built in
-  # bubble_alleles.fasta during k_i would be wiped by k_{i+1}'s step 3. We rebuild the
-  # cumulative pools ONCE after the per-k loop, from all per-k files.
+  # 2.2 retry trigger removed — new caller doesn't depend on segment anchors;
+  # it BLASTs directly against GFA segments. The anchor_search step 2.1 still
+  # runs and its outputs (anchor_contig_*.fasta) remain available for diagnostics
+  # but are NOT consumed by run_per_k.
 
-  # Per-K early break REMOVED (2026-05-30): always run every k in --ks so the
-  # Level-2 cross-K picker in step 4 sees all per-k pairs and compares them.
-  # If step 3 succeeds early at one k, the others still run — their candidates
-  # join the combined pool and the picker chooses among them.
   if [ "$GS_RC" -eq 0 ]; then
-    echo "[$SAMPLE] $K_ONE delivered >= $EXPECTED distinct complete alleles (continuing remaining k's for cross-K picking)"
+    echo "[$SAMPLE] $K_ONE caller produced result.tsv (verdict pending cross-K pick)"
     [ -z "$DONE_K" ] && DONE_K="$K_ONE"
   else
-    echo "[$SAMPLE] $K_ONE produced < $EXPECTED distinct complete alleles (rc=$GS_RC); continuing next k"
+    echo "[$SAMPLE] $K_ONE caller exit=$GS_RC; continuing next k"
   fi
 done
 if [ -z "$DONE_K" ]; then
-  echo "[$SAMPLE] no single k delivered $EXPECTED distinct complete alleles by itself; cross-K picker resolves on combined pool"
+  echo "[$SAMPLE] no k produced a per-k result; downstream may fail"
 fi
 
 # Rebuild cumulative pools from every per-k file that exists with content.
@@ -550,7 +519,6 @@ for K_ONE in ${KS//,/ }; do
   [ -s "$SDIR/anchor_contig_${K_ONE}.ann.tsv"   ] && cat "$SDIR/anchor_contig_${K_ONE}.ann.tsv"   >> "$SDIR/anchor_contig.ann.tsv"
   [ -s "$SDIR/anchor_segments_${K_ONE}.fasta"   ] && cat "$SDIR/anchor_segments_${K_ONE}.fasta"   >> "$SDIR/anchor_segments.fasta"
   [ -s "$SDIR/bubble_alleles_${K_ONE}.fasta"    ] && cat "$SDIR/bubble_alleles_${K_ONE}.fasta"    >> "$SDIR/bubble_alleles.fasta"
-  [ -s "$SDIR/bubble_alleles_${K_ONE}.ann.tsv"  ] && cat "$SDIR/bubble_alleles_${K_ONE}.ann.tsv"  >> "$SDIR/bubble_alleles.ann.tsv"
 done
 echo "[$SAMPLE] cumulative bubble_alleles.fasta rebuilt from per-k files: $(grep -c '^>' "$SDIR/bubble_alleles.fasta") records"
 
@@ -559,50 +527,21 @@ PRIMARY="$SDIR/primary_alleles.fasta"
 if [ "$SKIP_PICK" -eq 1 ]; then
   echo "=== [$SAMPLE] 4) pick alleles    -> SKIPPED (--skip-pick) ==="
   echo "  QC/dev mode: aliasing bubble_alleles.fasta as primary_alleles.fasta so steps 6+ run on the full candidate pool."
-  # Build the alias. bubble_alleles.fasta from step 3 contains every graph-walk candidate.
   if [ -s "$SDIR/bubble_alleles.fasta" ]; then
     cp "$SDIR/bubble_alleles.fasta" "$PRIMARY"
   else
     echo "[$SAMPLE] step 3 produced no bubble_alleles.fasta; nothing to QC; aborting" >&2; exit 1
   fi
 else
-  # ----- Step 5: pick alleles from COMBINED pool (anchor_contig + bubble_alleles) -----
-  # cand_combined.fasta concatenates the contig-level and graph-walk candidate
-  # sources; cand_combined.ann.tsv concatenates their annotations. SCHEMAS DIFFER
-  # but the picker only reads col-0 (name) and col-3 (segments-or-source-tag);
-  # both anchor_contig (6-col) and bubble_alleles (10-col) populate col-3 with
-  # something meaningful (anchor_contig has source kind "bubble"/"seg";
-  # bubble_alleles has the actual segment path).
-  # The picker reads step 3's `picker_candidates.fasta` + `picker_candidates.ann.tsv`
-  # directly (filtered anchor contigs ∪ all bubble paths; fragment-anchor drop
-  # lives in `_emit_picker_candidates` inside graph_path_search.py). We keep
-  # `cand_combined.fasta` as a stable symlink-equivalent so older notebooks /
-  # downstream scripts still find the same path.
-  cp -f "$SDIR/picker_candidates.fasta"   "$SDIR/cand_combined.fasta"
-  cp -f "$SDIR/picker_candidates.ann.tsv" "$SDIR/cand_combined.ann.tsv"
-  # pick_alleles uses genome_cov for the coverage-aware tiebreak. Use the value
-  # for the chosen k if step 3 succeeded; otherwise the last k tried; otherwise
-  # the user-supplied value; otherwise 0.
-  PICK_COV="${GENOMECOV:-}"
-  if [ -z "$PICK_COV" ]; then
-    if [ -n "$DONE_K" ] && [ -s "$SDIR/genome_cov_spades_${DONE_K}.txt" ]; then
-      PICK_COV=$(cat "$SDIR/genome_cov_spades_${DONE_K}.txt")
-    elif [ -n "${K_GENOMECOV:-}" ]; then
-      PICK_COV="$K_GENOMECOV"
-    else
-      PICK_COV="0"
-    fi
-  fi
-  echo "=== [$SAMPLE] 4) pick alleles (completeness + divergence) from combined pool — genome_cov=${PICK_COV} ==="
-  "$PY" -m matdetangler.pick_alleles --sample "$SAMPLE" \
-    --candidates "$SDIR/cand_combined.fasta" --cand-ann "$SDIR/cand_combined.ann.tsv" \
-    --queries-dir "$QDIR" --outdir "$SDIR" \
-    --spades-dir "$SPADES_DIR" --locus-ref "$LOCUS_REF" \
-    --expected-count "$EXPECTED" --genome-coverage "$PICK_COV" \
-    --tblastn-pid "$TBLASTN_PID" --tblastn-aa "$TBLASTN_AA" \
-    --flank-pid "$FLANK_PID" --flank-minlen "$FLANK_MINLEN" \
-    --degHD-id "$DEGHD_ID" --degHD-minlen "$DEGHD_MINLEN" \
-    --max-locus-len "$MAX_LOC" --min-allele-len "$MIN_AL" 2>&1 | tee "$LDIR/04_pick_alleles.log"
+  # ----- Step 4: cross-K pick (NEW — replaces pick_alleles) -----
+  # pick_k consolidates the per-K result.tsv files under $SDIR/<k>/ into a
+  # single picks.tsv (legacy schema, one row per allele) + picks_summary.tsv
+  # (sample-level new schema) + primary_alleles.fasta (concatenated FASTA).
+  echo "=== [$SAMPLE] 4) pick_k cross-K consolidation ==="
+  "$PY" -u -m matdetangler.pick_k --outdir "$SDIR" \
+    --picks-tsv "$SDIR/picks.tsv" \
+    --primary-fasta "$PRIMARY" \
+    2>&1 | tee "$LDIR/04_pick_k.log"
 fi
 
 [ -s "$PRIMARY" ] || { echo "[$SAMPLE] no primary_alleles.fasta (step 4 picked nothing or step 3 yielded nothing); aborting downstream" >&2; exit 1; }
