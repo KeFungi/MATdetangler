@@ -260,7 +260,9 @@ def _try_one_pass(seeds: set[str], all_edges: set[frozenset],
                    genome_cov: float | None,
                    divergence_threshold: float,
                    apply_cov_filter: bool,
-                   lo_mult: float, hi_mult: float) -> dict:
+                   lo_mult: float, hi_mult: float,
+                   max_paths: int = 50,
+                   max_path_length: int = 15) -> dict:
     """One pass: BFS-expand seeds N hops, optionally cov-filter, classify,
     return verdict dict with arm sequences attached if it classified."""
     nhood = bfs_expand_segments(seeds, adj_und, n_hops)
@@ -273,7 +275,9 @@ def _try_one_pass(seeds: set[str], all_edges: set[frozenset],
     nodes, edges_pp, labels, var_per, provenance = directional_split(
         pass_seg_labels, pass_seg_length, pass_edges, pass_endpoints,
     )
-    res = classify(nodes, edges_pp, labels, var_per)
+    res = classify(nodes, edges_pp, labels, var_per,
+                    max_paths=max_paths, max_path_length=max_path_length)
+    res["_bfs_limits"] = res.get("bfs_limits", {})
     res["_provenance"] = provenance
     res["_nhood"] = nhood
     res["_var_per_node"] = var_per
@@ -296,18 +300,23 @@ def find_alleles(
         seg_label_hits_tsv: str,
         gfa_path: str,
         genome_cov: float | None = None,
-        init_nhop: int = 5,
+        init_nhop: int = 3,
         max_nhop: int = 10,
         divergence_threshold: float = 0.05,
-        lo_mult: float = 0.25,
+        lo_mult: float = 0.2,
         hi_mult: float = 2.0,
         k: int | str | None = None,
         var_proteins_ref: str | None = None,
         expected_var_tags: set[str] | None = None,
-        locus_padding: int = 1500,
+        locus_padding: int = 4000,
         contig_seeds: set[str] | None = None,
         queries_dir: str | None = None,
         out_candidate_fa: str | None = None,
+        seeds_mode: str = "both",            # "flank" | "var" | "both"
+        cov_filter: bool = True,             # cov filter ON by default
+        max_paths: int = 50,
+        max_path_length: int = 15,
+        min_allele_bp: int = 3000,           # hard floor on per-allele length
 ) -> dict:
     """Run the full orchestrator. Returns a dict with the final classification
     and any emitted allele/chimera sequences:
@@ -335,124 +344,121 @@ def find_alleles(
         adj_und.setdefault(a, set()).add(b)
         adj_und.setdefault(b, set()).add(a)
 
-    # Seeds for the two phases. Optional contig_seeds = GFA segments walked
-    # by SPAdes contigs that BLAST-hit the locus (HD/flank); used to anchor
-    # the BFS in samples where the labeler's segment-level hits split the
-    # locus across disconnected GFA components.
+    # Seeds: derived from seeds_mode argument.
+    #   "var"   → seed BFS from var-labeled GFA segments only
+    #   "flank" → seed from flank-labeled segments only
+    #   "both"  → union (default — broadest entry into the locus)
+    # contig_seeds is added regardless (when populated by upstream).
     contig_seeds = set(contig_seeds or ())
-    var_seeds = {s for s, hits in seg_labels.items()
-                 if any(h.kind == "var" for h in hits)} | contig_seeds
-    flank_seeds = {s for s, hits in seg_labels.items()
-                   if any(h.kind == "flank" for h in hits)} | contig_seeds
+    var_seg_set = {s for s, hits in seg_labels.items()
+                    if any(h.kind == "var" for h in hits)}
+    flank_seg_set = {s for s, hits in seg_labels.items()
+                      if any(h.kind == "flank" for h in hits)}
+    if seeds_mode == "var":
+        seeds = var_seg_set | contig_seeds
+    elif seeds_mode == "flank":
+        seeds = flank_seg_set | contig_seeds
+    else:  # "both"
+        seeds = var_seg_set | flank_seg_set | contig_seeds
 
-    def _log(phase: str, nhop: int, use_cov: bool, res: dict) -> None:
+    def _log(nhop: int, res: dict) -> None:
         n_arms = res.get("n_arms", 0)
         n_var  = res.get("n_var", 0)
         nhood  = len(res.get("_nhood", ()))
-        print(f"  [nhop={nhop} {phase} cov={'on' if use_cov else 'off':>3}] "
-              f"|nhood|={nhood:<6} var={n_var:<3} cls={res['class']:<14} arms={n_arms}",
+        limits = res.get("_bfs_limits", {})
+        lim_str = ""
+        if limits.get("max_paths_hit") or limits.get("max_path_length_hit"):
+            lim_str = (f"  ⚠ limits: max_paths_hit={limits.get('max_paths_hit',0)}"
+                       f" max_path_length_hit={limits.get('max_path_length_hit',0)}")
+        print(f"  [nhop={nhop} seeds={seeds_mode} cov={'on' if cov_filter else 'off'}] "
+              f"|nhood|={nhood:<6} var={n_var:<3} cls={res['class']:<14} arms={n_arms}{lim_str}",
               flush=True)
 
-    # New design (item 1 in BFS proposal):
-    #   outer  = nhop                            (5..10)
-    #   middle = phase                           (main, flank_fallback)
-    #   inner  = use_cov                         (True, False)
-    # Each (nhop, phase, cov) iteration produces per-network candidates.
-    # Acceptance check (α): closed_bubble + 2 divergent arms + complete_locus.
-    # If ANY candidate accepts at ANY iteration, all remaining iterations
-    # are skipped — fast path for clean diploid samples.
-    #
-    # When loop exhausts without acceptance, pick best candidate by the
-    # 6-tier ranking (bubble_priority > complete_locus > complete_var >
-    # cov_on > basepair > diploid_dist), gather all SAME-iteration
-    # siblings, then run a cross-network dedup to produce final alleles.
-    # Sample verdict = "separate" iff ≥ 2 surviving networks; else the
-    # single surviving network's sub-verdict.
+    # New design (loop simplified per user spec):
+    #   - drop phase 2 (flank_fallback was a no-op in 144/144 picks)
+    #   - drop cov-off pass (cov-on won 144/144 picks; cov-off only added noise)
+    #   - seeds + cov_filter are configuration, not loop axes
+    # The loop is just `for nhop in init_nhop..max_nhop`, with a single
+    # variant per nhop. Hard short-circuit on the first complete closed_bubble.
+    # All emitted candidates ranked at the end by the unified 4-tier key.
 
-    candidates: list[dict] = []   # one per (iter, network)
+    candidates: list[dict] = []
     iter_metadata: dict[str, dict] = {}
     short_circuit = False
 
     for nhop in range(init_nhop, max_nhop + 1):
         if short_circuit: break
-        for phase, seeds in [("main",            var_seeds),
-                              ("flank_fallback",  var_seeds | flank_seeds)]:
-            if short_circuit: break
-            for use_cov in (True, False):
-                iter_id = f"h{nhop}_{phase[0]}_c{'on' if use_cov else 'off'}"
-                res = _try_one_pass(
-                    seeds, all_edges, endpoints, adj_und, nhop,
-                    seg_labels, seg_length, depths, gfa_seqs,
-                    genome_cov, divergence_threshold,
-                    apply_cov_filter=use_cov,
-                    lo_mult=lo_mult, hi_mult=hi_mult,
-                )
-                res["_phase"]      = phase
-                res["_n_hops"]     = nhop
-                res["_cov_filter"] = use_cov
-                _log(phase, nhop, use_cov, res)
+        iter_id = f"h{nhop}"
+        res = _try_one_pass(
+            seeds, all_edges, endpoints, adj_und, nhop,
+            seg_labels, seg_length, depths, gfa_seqs,
+            genome_cov, divergence_threshold,
+            apply_cov_filter=cov_filter,
+            lo_mult=lo_mult, hi_mult=hi_mult,
+            max_paths=max_paths, max_path_length=max_path_length,
+        )
+        res["_phase"]      = seeds_mode
+        res["_n_hops"]     = nhop
+        res["_cov_filter"] = cov_filter
+        _log(nhop, res)
 
-                # Skip if classifier produced no var-bearing content
-                if res.get("n_var", 0) == 0 or res["class"] == "no_var":
-                    continue
+        if res.get("n_var", 0) == 0 or res["class"] == "no_var":
+            continue
 
-                # Run trim + dedup + pool-build (per-network) — return only the
-                # pool list without merging.
-                pools_out = _emit_result(
-                    res, gfa_seqs, depths=depths,
-                    divergence_threshold=divergence_threshold,
-                    var_proteins_ref=var_proteins_ref,
-                    locus_padding=locus_padding,
-                    expected_var_tags=expected_var_tags,
-                    genome_cov=genome_cov,
-                    lo_mult=lo_mult, hi_mult=hi_mult,
-                    queries_dir=queries_dir,
-                    return_pools=True,
-                )
-                pools = pools_out["pools"]
-                iter_metadata[iter_id] = {
-                    "res": res, "pools_out": pools_out,
-                    "phase": phase, "nhop": nhop, "cov": use_cov,
-                }
+        pools_out = _emit_result(
+            res, gfa_seqs, depths=depths,
+            divergence_threshold=divergence_threshold,
+            var_proteins_ref=var_proteins_ref,
+            locus_padding=locus_padding,
+            expected_var_tags=expected_var_tags,
+            genome_cov=genome_cov,
+            lo_mult=lo_mult, hi_mult=hi_mult,
+            queries_dir=queries_dir,
+            return_pools=True,
+            min_allele_bp=min_allele_bp,
+        )
+        pools = pools_out["pools"]
+        iter_metadata[iter_id] = {
+            "res": res, "pools_out": pools_out,
+            "phase": seeds_mode, "nhop": nhop, "cov": cov_filter,
+        }
 
-                # Build a candidate per non-empty pool (per network)
-                for net_i, pool in enumerate(pools, start=1):
-                    if not pool["alleles"]: continue
-                    # When there's only one pool (non-separate case), the
-                    # network index is 0 by convention (no per-network split).
-                    net_in_iter = net_i if len(pools) > 1 else 0
-                    cand = {
-                        "iter_id":   iter_id,
-                        "net_in_iter": net_in_iter,
-                        "phase":     phase,
-                        "nhop":      nhop,
-                        "cov":       use_cov,
-                        "verdict":   pool.get("verdict") or res["class"],
-                        "alleles":   pool["alleles"],
-                        "allele_cov": pool["allele_cov"],
-                        "extend_bounds": pool["extend_bounds"],
-                        "allele_segments": pool["allele_segments"],
-                        "n_dedup":   pool["n_dedup"],
-                        "n_raw":     pool["n_raw"],
-                        "complete_var":   bool(pool.get("complete_var")),
-                        "complete_locus": bool(pool.get("complete_locus")),
-                        "basepair":  pool["basepair"],
-                        "diploid_dist": pool["diploid_dist"],
-                        "found_tags": pool["found_tags_surviving"],
-                    }
-                    candidates.append(cand)
+        for net_i, pool in enumerate(pools, start=1):
+            if not pool["alleles"]: continue
+            net_in_iter = net_i if len(pools) > 1 else 0
+            cand = {
+                "iter_id":   iter_id,
+                "net_in_iter": net_in_iter,
+                "phase":     seeds_mode,
+                "nhop":      nhop,
+                "cov":       cov_filter,
+                "verdict":   pool.get("verdict") or res["class"],
+                "alleles":   pool["alleles"],
+                "allele_cov": pool["allele_cov"],
+                "extend_bounds": pool["extend_bounds"],
+                "allele_segments": pool["allele_segments"],
+                "n_dedup":   pool["n_dedup"],
+                "n_raw":     pool["n_raw"],
+                # Tri-state at the NETWORK level: 0=none, 1=some, 2=all
+                "complete_var":   int(pool.get("complete_var") or 0),
+                "complete_locus": int(pool.get("complete_locus") or 0),
+                "basepair":  pool["basepair"],
+                "diploid_dist": pool["diploid_dist"],
+                "found_tags": pool["found_tags_surviving"],
+            }
+            candidates.append(cand)
 
-                    # New acceptance check (α): hard short-circuit on gold-
-                    # standard candidate. Pool-level "verdict" is the per-
-                    # network sub-class (never "separate").
-                    if (cand["verdict"] == "closed_bubble"
-                            and cand["n_dedup"] >= 2
-                            and cand["complete_locus"]):
-                        print(f"  [accept] {iter_id} net={net_in_iter}: "
-                              f"closed_bubble n={cand['n_dedup']} complete — short-circuiting",
-                              flush=True)
-                        short_circuit = True
-                        break
+            # Acceptance: closed_bubble n≥2 with FULLY complete locus + var
+            # (both tri-states at level 2).
+            if (cand["verdict"] == "closed_bubble"
+                    and cand["n_dedup"] >= 2
+                    and cand["complete_locus"] >= 2
+                    and cand["complete_var"] >= 2):
+                print(f"  [accept] {iter_id} net={net_in_iter}: "
+                      f"closed_bubble n={cand['n_dedup']} complete — short-circuiting",
+                      flush=True)
+                short_circuit = True
+                break
 
     # Write candidate_allele.fasta if requested — every emitted sequence
     # across every (iter, network), tagged with its provenance in the header.
@@ -464,15 +470,17 @@ def find_alleles(
         # so the caller can write a "no result" row.
         return _empty_find_alleles_result(k, genome_cov)
 
-    # Pick best candidate by the 6-tier ranking.
+    # Unified ranking — 4 tiers (smaller value = better):
+    #   0. bubble_priority      (K-picker order)
+    #   1. complete_locus       DESC   tri-state 2 > 1 > 0
+    #   2. complete_var         DESC   tri-state 2 > 1 > 0
+    #   3. diploid_dist         ASC    |mean(allele_cov)/D_k − 0.5|
     def _rank_key(c: dict) -> tuple:
         return (
             _bubble_priority(c["verdict"], c["n_dedup"]),    # 0
-            not c["complete_locus"],                          # 1
-            not c["complete_var"],                            # 2
-            not c["cov"],                                     # 3
-            -c["basepair"],                                   # 4
-            c["diploid_dist"],                                # 5
+            -int(c["complete_locus"]),                        # 1 (negate so 2 sorts first)
+            -int(c["complete_var"]),                          # 2
+            c["diploid_dist"],                                # 3
         )
 
     best = min(candidates, key=_rank_key)
@@ -493,6 +501,7 @@ def find_alleles(
         queries_dir=queries_dir,
         seg_labels=seg_labels,
         k=k,
+        min_allele_bp=min_allele_bp,
     )
 
 
@@ -519,6 +528,48 @@ def _bubble_priority(verdict: str, n_dedup: int) -> int:
         cls = "div2" if n_dedup == 2 else "other"
         return _BUBBLE_PRIORITY[(verdict, cls)]
     return 99
+
+
+def build_longest_alleles_fasta(candidate_fa: str, out_fa: str,
+                                  divergence_threshold: float = 0.05) -> int:
+    """Read every emission from `candidate_fa` (= candidate_allele.fasta),
+    run length-first RC-aware dedup at `divergence_threshold` (5% default),
+    and write the surviving sequences — the LONGEST representative of each
+    edit-distance equivalence class — to `out_fa`. Returns # records written.
+
+    Different from the primary picker:
+      - Operates on the FULL candidate pool (all iterations, all networks)
+      - Length-first rank (keep longest per class), not completeness-first
+      - Output is the "longest unique walks ever seen" — useful for
+        downstream analyses that want a wide net of variants.
+    """
+    import os
+    if not os.path.exists(candidate_fa): return 0
+    seqs: list[tuple[str, str]] = []
+    cur = None; buf: list[str] = []
+    with open(candidate_fa) as fh:
+        for ln in fh:
+            ln = ln.rstrip()
+            if ln.startswith(">"):
+                if cur is not None: seqs.append((cur, "".join(buf)))
+                cur = ln[1:].split()[0]; buf = []
+            else:
+                buf.append(ln)
+        if cur is not None: seqs.append((cur, "".join(buf)))
+    seqs.sort(key=lambda x: -len(x[1]))
+    kept: list[tuple[str, str]] = []
+    for n, s in seqs:
+        if not s: continue
+        if any(not is_divergent(s, ks, threshold=divergence_threshold)
+                for _, ks in kept):
+            continue
+        kept.append((n, s))
+    with open(out_fa, "w") as fh:
+        for n, s in kept:
+            fh.write(f">{n}\n")
+            for i in range(0, len(s), 80):
+                fh.write(s[i:i + 80] + "\n")
+    return len(kept)
 
 
 def _write_candidate_fasta(candidates: list[dict], out_path: str) -> None:
@@ -564,7 +615,8 @@ def _finalize_candidates(siblings: list[dict], iter_meta: dict,
                           genome_cov: float | None,
                           queries_dir: str | None,
                           seg_labels: dict,
-                          k) -> dict:
+                          k,
+                          min_allele_bp: int = 3000) -> dict:
     """Take all same-iteration sibling candidates, run cross-network dedup
     (RC-aware, completeness-first ranking), and build the final output dict
     in the same shape that the legacy _emit_result+_finalize path produced.
@@ -575,10 +627,14 @@ def _finalize_candidates(siblings: list[dict], iter_meta: dict,
     """
     # Flatten: each sibling contributes its (allele, cov, bound, segs)
     # tuples — keep network-of-origin so we can detect cross-network survival.
+    # Apply the same hard min_allele_bp floor as in-pool dedup — drops any
+    # sub-min-bp fragment that came in via a sibling (e.g. KYH069 n1's 308 bp
+    # pair sneaking through because they pass at the sibling-dedup level).
     items = []
     for s in siblings:
         for (name, seq), cov, bnd, segs in zip(
                 s["alleles"], s["allele_cov"], s["extend_bounds"], s["allele_segments"]):
+            if min_allele_bp > 0 and len(seq) < min_allele_bp: continue
             items.append({
                 "name": name, "seq": seq,
                 "net": s["net_in_iter"], "cov": cov,
@@ -594,9 +650,11 @@ def _finalize_candidates(siblings: list[dict], iter_meta: dict,
     # actually duplicate calls of the same allele in two different graph
     # components.
     def _sort_key(it):
-        return (not it["sib_complete_locus"],
-                not it["sib_complete_var"],
-                -len(it["seq"]),
+        # Unified 4-tier (no bubble_priority — siblings share the iter's
+        # verdict so tier 0 is constant; tiers 1–3 differentiate).
+        # Tri-state DESC → negate.
+        return (-int(it["sib_complete_locus"]),
+                -int(it["sib_complete_var"]),
                 it["diploid_dist"])
     items.sort(key=_sort_key)
 
@@ -645,12 +703,17 @@ def _finalize_candidates(siblings: list[dict], iter_meta: dict,
     for s in siblings:
         surviving_tags |= s["found_tags"]
 
-    if expected_var_tags is not None:
-        complete_var = expected_var_tags <= surviving_tags
+    # Sample-level tri-states: report the MAX across surviving sibling
+    # networks (the best per-network completeness this sample achieved).
+    if siblings:
+        complete_var   = max(int(s.get("complete_var",   0)) for s in siblings)
+        complete_locus = max(int(s.get("complete_locus", 0)) for s in siblings)
+    else:
+        complete_var = 0; complete_locus = 0
+    if expected_var_tags:
         locus_coverage = (len(expected_var_tags & surviving_tags)
                           / max(1, len(expected_var_tags)))
     else:
-        complete_var = None
         locus_coverage = None
 
     # Emitted sub-node IDs → materialized sub-seqs (for run_per_k's
@@ -681,8 +744,8 @@ def _finalize_candidates(siblings: list[dict], iter_meta: dict,
     return {
         "verdict": sample_verdict,
         "topology": res.get("class", sample_verdict),
-        "complete_var": complete_var,
-        "complete_locus": complete_var,
+        "complete_var": complete_var,       # tri-state 0/1/2 (max across networks)
+        "complete_locus": complete_locus,   # tri-state 0/1/2 (max across networks)
         "locus_coverage": locus_coverage,
         "found_var_tags": sorted(surviving_tags),
         "n_candidates": sum(s["n_raw"] for s in siblings),
@@ -761,15 +824,20 @@ def _tblastn_trim_each(
         padding: int,
         min_pid: float = 30.0,
         min_aa: int = 50,
-) -> tuple[list[tuple[str, str]], dict[str, set[str]]]:
+) -> tuple[list[tuple[str, str]], dict[str, set[str]], dict[str, tuple[int, int]]]:
     """Run a single tblastn(var proteins → all candidates concat-as-multi-fasta).
     For each candidate, trim to [min hit start − padding, max hit end + padding].
     Drop candidates with no hits.
 
-    Returns (kept_named_seqs, found_tags_by_name).
+    Returns (kept_named_seqs, found_tags_by_name, hd_span_in_padded).
+
+    `hd_span_in_padded[name] = (lo, hi)` — coordinates of the HD-only region
+    INSIDE the padded `kept_named_seqs` slice (so callers can do
+    `seq[lo:hi]` to get the un-padded HD span for var-region-only
+    divergence in dedup).
     """
     import subprocess, tempfile, os
-    if not named_seqs: return [], {}
+    if not named_seqs: return [], {}, {}
     with tempfile.TemporaryDirectory() as td:
         sfa = os.path.join(td, "all_cands.fa")
         with open(sfa, "w") as fh:
@@ -790,13 +858,19 @@ def _tblastn_trim_each(
                 spans_by.setdefault(sid, []).append((min(ss, se), max(ss, se)))
                 tags_by .setdefault(sid, set()).add(qid)
         kept: list[tuple[str, str]] = []
+        hd_span: dict[str, tuple[int, int]] = {}
         for name, seq in named_seqs:
             spans = spans_by.get(name)
             if not spans: continue
-            lo = max(0, min(s for s, _ in spans) - padding)
-            hi = min(len(seq), max(e for _, e in spans) + padding)
-            kept.append((name, seq[lo:hi]))
-    return kept, tags_by
+            hd_lo = min(s for s, _ in spans)
+            hd_hi = max(e for _, e in spans)
+            lo = max(0, hd_lo - padding)
+            hi = min(len(seq), hd_hi + padding)
+            padded = seq[lo:hi]
+            kept.append((name, padded))
+            # HD coords in the padded slice: (hd_lo - lo, hd_hi - lo)
+            hd_span[name] = (hd_lo - lo, hd_hi - lo)
+    return kept, tags_by, hd_span
 
 
 def _dedup_named(named_seqs: list[tuple[str, str]],
@@ -817,21 +891,33 @@ def _dedup_named(named_seqs: list[tuple[str, str]],
 
 def _dedup_named_ranked(named_seqs: list[tuple[str, str]],
                          divergence_threshold: float,
-                         key_fn) -> list[tuple[str, str]]:
+                         key_fn,
+                         compare_seqs: dict[str, str] | None = None) -> list[tuple[str, str]]:
     """Same as _dedup_named, but the walk order is determined by `key_fn`
     (smaller value = higher priority) instead of length-desc. This lets us
     rank by completeness FIRST so the more-complete representative of each
-    equivalence class survives, not just the longest one. The divergence
-    check itself (5% edit-distance, RC-aware) is unchanged."""
+    equivalence class survives, not just the longest one.
+
+    `compare_seqs`: optional {name: seq_for_comparison}. When given, the
+    divergence check uses these sequences instead of the candidate's full
+    emitted sequence — e.g. the HD-only span sliced from the padded
+    candidate, so dedup focuses on the var region and ignores conserved
+    flank context that would otherwise dilute the divergence signal.
+    The kept tuple is still (name, emit_seq) — only the comparison changes.
+    """
     nonempty = [(n, s) for n, s in named_seqs if s]
     nonempty.sort(key=lambda ns: key_fn(ns[0], ns[1]))
-    kept: list[tuple[str, str]] = []
+    def _cmp(name: str, seq: str) -> str:
+        if compare_seqs is None: return seq
+        return compare_seqs.get(name, seq)
+    kept: list[tuple[str, str, str]] = []   # (name, emit_seq, cmp_seq)
     for n, s in nonempty:
-        if any(not is_divergent(s, ks, threshold=divergence_threshold)
-               for _, ks in kept):
+        cmp_s = _cmp(n, s)
+        if any(not is_divergent(cmp_s, k_cmp, threshold=divergence_threshold)
+               for _, _, k_cmp in kept):
             continue
-        kept.append((n, s))
-    return kept
+        kept.append((n, s, cmp_s))
+    return [(n, s) for n, s, _ in kept]
 
 
 def _blastn_flank_presence(named_seqs: list[tuple[str, str]],
@@ -909,6 +995,7 @@ def _emit_result(res: dict, gfa_seqs: dict[str, str],
                   hi_mult: float = 2.0,
                   queries_dir: str | None = None,
                   return_pools: bool = False,
+                  min_allele_bp: int = 3000,
                   force: bool = False) -> dict:
     """Pipe every var-bearing candidate through trim → dedup → emit.
 
@@ -1076,11 +1163,26 @@ def _emit_result(res: dict, gfa_seqs: dict[str, str],
 
         n_raw_pool = len(local_raw)
 
-        # Locus trim — drops no-HD candidates
+        # Hard minimum-length floor — applied as the FIRST dedup filter,
+        # BEFORE tblastn locus-trim. Drops fragment candidates (e.g. the
+        # KYH069 n1 308bp segments) before paying the tblastn cost.
+        if min_allele_bp > 0:
+            local_raw = [(n, s) for n, s in local_raw if len(s) >= min_allele_bp]
+
+        # Locus trim — drops no-HD candidates and trims survivors to
+        # [min_hit − padding, max_hit + padding]. Also returns the
+        # HD-only span coords WITHIN each padded slice so dedup can
+        # compare on the var-region-only sequence (flanks excluded).
         local_found: dict[str, set[str]] = {}
+        local_hd_span: dict[str, tuple[int, int]] = {}
         if var_proteins_ref:
-            local_raw, local_found = _tblastn_trim_each(
+            local_raw, local_found, local_hd_span = _tblastn_trim_each(
                 local_raw, var_proteins_ref, locus_padding)
+
+        # Second min_allele_bp pass — after locus-trim, in case the trim
+        # window narrowed a survivor below the floor.
+        if min_allele_bp > 0:
+            local_raw = [(n, s) for n, s in local_raw if len(s) >= min_allele_bp]
 
         depths_d = depths or {}
         _cov  = lambda rn: _path_mean_cov(local_path.get(rn, []), prov, depths_d)
@@ -1101,19 +1203,43 @@ def _emit_result(res: dict, gfa_seqs: dict[str, str],
         }
 
         def _rank_key(name: str, seq: str) -> tuple:
+            """Unified 4-tier rank, tri-state form. bubble_priority lives at
+            the candidate (pool) level — within a pool all entries share the
+            verdict so tier 0 is constant; tiers 1–3 differentiate.
+
+            Per-CANDIDATE tri-states (computed here):
+              cv_level  = 0/1/2 of expected_var_tags found in this candidate
+              cl_level  = 0/1/2 of {flankL, flankR} present in this candidate
+            """
             fv = local_found.get(name, set())
-            cv = bool(expected_var_tags) and (expected_var_tags <= fv)
+            if expected_var_tags:
+                hit = fv & expected_var_tags
+                if not hit:                          cv_level = 0
+                elif hit == set(expected_var_tags):  cv_level = 2
+                else:                                cv_level = 1
+            else:
+                cv_level = 0
             hL, hR = flank_presence.get(name, (False, False))
-            cl = cv and hL and hR
-            bp = len(seq)
+            cl_level = int(hL) + int(hR)
             cov = _cov(name)
             diploid_dist = abs(cov / genome_cov - 0.5) if genome_cov else 1.0
-            # sort ascending: smaller is better → negate for DESC tiers
-            return (not cl, not cv, -bp, diploid_dist)
+            return (-cl_level, -cv_level, diploid_dist)
 
-        # Dedup within this pool only (no cross-network collapse), now with
-        # completeness-first ranking. is_divergent threshold unchanged.
-        local_dedup = _dedup_named_ranked(local_raw, divergence_threshold, _rank_key)
+        # Dedup within this pool — divergence is computed on the HD-ONLY
+        # slice (var region without padding) so flank conservation can't
+        # dilute the var-region divergence signal. The emitted sequences
+        # remain the full padded versions.
+        hdonly_by = {
+            name: padded_seq[lo:hi]
+            for (name, padded_seq), (lo, hi) in (
+                (ns, local_hd_span.get(ns[0], (0, len(ns[1]))))
+                for ns in local_raw
+            )
+        }
+        local_dedup = _dedup_named_ranked(
+            local_raw, divergence_threshold, _rank_key,
+            compare_seqs=hdonly_by,
+        )
         nd = len(local_dedup)
 
         # seg_processor.directional_split now emits clean position-indexed
@@ -1155,21 +1281,31 @@ def _emit_result(res: dict, gfa_seqs: dict[str, str],
         for rn, _ in local_dedup:
             surviving |= local_found.get(rn, set())
 
-        # Pool-level metrics (used by find_alleles for cross-iteration ranking)
-        complete_var_p = (expected_var_tags is not None
-                           and bool(expected_var_tags)
-                           and expected_var_tags <= surviving)
-        # Flank presence — taken from the per-candidate blastn we already ran
-        # above. A pool is flank-complete iff at least one surviving allele has
-        # BOTH flanks (the canonical L→R locus walk). For pools with multiple
-        # alleles, "both flanks at the pool level" means each emitted allele
-        # individually has both flanks — needed for closed_bubble acceptance.
-        all_have_flanks = bool(alleles_p) and all(
-            flank_presence.get(rn, (False, False))[0]
-            and flank_presence.get(rn, (False, False))[1]
-            for rn, _ in local_dedup
-        )
-        complete_locus_p = complete_var_p and all_have_flanks
+        # Per-ALLELE tri-state, then MIN-aggregated to pool level.
+        # 0/1/2 = none/some/all for the SET in question:
+        #   complete_var   : expected_var_tags ⊆ THIS allele's found tags
+        #   complete_locus : {flankL, flankR}   ⊆ THIS allele's blastn hits
+        # MIN across alleles = pool scores "all" only when EVERY emitted allele
+        # individually scores "all". Avoids the union-pathology where two
+        # single-HD fragments union to look fully complete (the KYH069
+        # n1 308 bp pair case).
+        def _allele_cv(rn):
+            if not expected_var_tags: return 0
+            fv = local_found.get(rn, set())
+            hit = fv & expected_var_tags
+            if not hit: return 0
+            if hit == set(expected_var_tags): return 2
+            return 1
+        def _allele_cl(rn):
+            hL, hR = flank_presence.get(rn, (False, False))
+            return int(hL) + int(hR)
+        if local_dedup:
+            per_allele_cv = [_allele_cv(rn) for rn, _ in local_dedup]
+            per_allele_cl = [_allele_cl(rn) for rn, _ in local_dedup]
+            complete_var_p   = min(per_allele_cv)
+            complete_locus_p = min(per_allele_cl)
+        else:
+            complete_var_p = 0; complete_locus_p = 0
         basepair_p = sum(len(s) for _, s in alleles_p)
         # Diploid signature: closer to ½ × genome_cov is better. Use the
         # mean of all emitted alleles' covs vs genome_cov.

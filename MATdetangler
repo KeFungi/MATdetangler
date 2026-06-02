@@ -618,10 +618,22 @@ else
 fi
 
 _prefix_key_outputs() {
+  # Build sample-level longest_alleles.fasta = union of all per-k
+  # <k>/longest_alleles.fasta, prefixing each header with the source k so
+  # entries from different k's stay distinguishable.
+  : > "$SDIR/longest_alleles.fasta"
+  for K_ONE in ${KS//,/ }; do
+    LF="$SDIR/$K_ONE/longest_alleles.fasta"
+    [ -s "$LF" ] || continue
+    awk -v k="$K_ONE" '/^>/{print ">" k "_" substr($0,2); next} {print}' "$LF" \
+        >> "$SDIR/longest_alleles.fasta"
+  done
+
   # Copy key per-sample outputs to sample-name-prefixed names so they're
   # self-identifying when shared/aggregated. Originals stay in place.
   local files=(
     primary_alleles.fasta
+    longest_alleles.fasta
     consensus_alleles.fasta
     reads.sorted.bam reads.sorted.bam.bai
     identity.tsv identity_consensus.tsv

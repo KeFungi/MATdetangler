@@ -23,7 +23,9 @@ from __future__ import annotations
 import argparse, os, subprocess, sys, tempfile, traceback
 
 from matdetangler.graph_classifier.labeler import emit_seg_label_hits
-from matdetangler.graph_classifier.per_k_caller import find_alleles, write_fasta
+from matdetangler.graph_classifier.per_k_caller import (
+    find_alleles, write_fasta, build_longest_alleles_fasta,
+)
 
 
 def _extract_segs_from_gfa(gfa: str, out_fa: str) -> int:
@@ -75,12 +77,23 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--outdir", required=True,
                      help="per-sample output root; writes outdir/<k>/...")
     ap.add_argument("--threads", type=int, default=4)
-    ap.add_argument("--init-nhop", type=int, default=5)
+    ap.add_argument("--init-nhop", type=int, default=3)
     ap.add_argument("--max-nhop",  type=int, default=10)
-    ap.add_argument("--lo-mult",   type=float, default=0.25)
+    ap.add_argument("--lo-mult",   type=float, default=0.2)
     ap.add_argument("--hi-mult",   type=float, default=2.0)
-    ap.add_argument("--locus-padding", type=int, default=1500)
+    ap.add_argument("--locus-padding", type=int, default=4000)
     ap.add_argument("--divergence-threshold", type=float, default=0.05)
+    ap.add_argument("--seeds", choices=("var","flank","both"), default="both",
+                    help="BFS seed source (var-labeled, flank-labeled, or both). Default: both.")
+    ap.add_argument("--cov-filter", choices=("on","off"), default="on",
+                    help="Depth filter on the BFS neighborhood. Default: on.")
+    ap.add_argument("--max-paths", type=int, default=50,
+                    help="Hard cap on simple paths per anchor in classifier. Default: 50.")
+    ap.add_argument("--max-path-length", type=int, default=15,
+                    help="Hard cap on individual path length (# of post-P1 nodes). Default: 15.")
+    ap.add_argument("--min-allele-bp", type=int, default=3000,
+                    help="Hard minimum per-allele length (bp) — alleles shorter than "
+                         "this are dropped from dedup/picker. Default: 3000.")
     args = ap.parse_args(argv)
 
     out_k = os.path.join(args.outdir, args.k)
@@ -138,6 +151,11 @@ def main(argv: list[str] | None = None) -> int:
             divergence_threshold=args.divergence_threshold,
             queries_dir=args.queries_dir,
             out_candidate_fa=candidate_fa,
+            seeds_mode=args.seeds,
+            cov_filter=(args.cov_filter == "on"),
+            max_paths=args.max_paths,
+            max_path_length=args.max_path_length,
+            min_allele_bp=args.min_allele_bp,
         )
     except Exception as e:
         with open(result_tsv, "w") as fh:
@@ -145,6 +163,19 @@ def main(argv: list[str] | None = None) -> int:
         traceback.print_exc(); return 1
 
     write_fasta(res["alleles"], fasta, sample=f"{args.sample}_{args.k}")
+
+    # Longest-allele dedup over the FULL candidate pool (all iterations,
+    # all networks) — length-first RC-aware edlib HW dedup at the same 5%
+    # threshold. Output: <k>/longest_alleles.fasta. Different from
+    # alleles.fasta (which uses completeness-first dedup and emits only
+    # the picked iteration's surviving alleles).
+    longest_fa = os.path.join(out_k, "longest_alleles.fasta")
+    n_longest = build_longest_alleles_fasta(
+        candidate_fa, longest_fa,
+        divergence_threshold=args.divergence_threshold,
+    )
+    print(f"[{args.sample}/{args.k}] longest_alleles.fasta: {n_longest} records",
+          flush=True)
 
     # Sub-node side FASTA — one record per unique split-segment sub-node ID
     # ({parent}#N), with the materialized sub-region sequence (strand-flipped

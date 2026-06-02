@@ -254,55 +254,49 @@ and **unlabeled connector** (neither). The input may also contain **composite**
 nodes (a single GFA segment with BOTH flank and var tags, e.g. `HD1+flankL`). The
 preprocessing removes composites and identifies the bubble:
 
-**P1. Directional split — `n_label`-based 3-piece-max rule**
+**P1. Directional split — all-split rule (one sub-segment per BLAST hit)**
 
-Each multi-labeled segment becomes a short chain of sub-segments, where the
-number of pieces is bounded by the count of **distinct labels** on the segment
-(NOT by the number of individual hits):
+Each multi-hit segment becomes a chain of sub-segments, one per hit,
+ordered along the parent segment's stored strand:
 
 ```
-n_label = 1   →  1 piece    (segment unchanged; just labeled)
-n_label = 2   →  up to 3 pieces  (L-piece + middle + R-piece, middle omitted
-                                  when the two label spans touch)
-n_label ≥ 3   →  exactly 3 pieces (L-piece + unified middle + R-piece)
-                 — the middle keeps any var labels whose spans fall between
-                 the two end-piece labels; flank labels in the middle are
-                 dropped (canonical layout = flanks at ends).
+n_hits = 0   →  1 piece (parent segment kept whole, no label)
+n_hits = 1   →  1 piece (parent kept whole, labeled with the single hit's tag)
+n_hits ≥ 2   →  one sub-segment per hit, ordered by hit start coordinate.
+                 Boundaries between adjacent sub-segments are placed at
+                 the midpoint of the inter-hit gap. Each sub-segment
+                 carries exactly the tag of its hit.
 ```
-
-`L_tag` = the label whose span starts leftmost on the segment;
-`R_tag` = the label whose span ends rightmost.
 
 Sub-node IDs are coordinate-free: `{parent_seg}#1`, `{parent_seg}#2`, …
-(1 = L-piece, 2 = middle if present, trailing # = R-piece). The provenance
-dict `{sub_id: (parent_seg, start, end, strand)}` carries the actual
+(1-based, ordered by hit start). The provenance dict
+`{sub_id: (parent_seg, start, end, strand)}` carries the actual
 coordinates for sequence materialization downstream — IDs stay clean for
 display in `bubble.txt` / `bubble.gfa` / `bubble.png`.
 
-Example (the AG3-class composite with all four labels on one segment):
+Example (the AG3-class composite with four hits on one segment):
 
 ```
 input:  ─── flankL + HD1 + HD2 + flankR composite (5906 bp) ───
-P1 out: ─── [flankL]#1 ─── [HD1+HD2]#2 ─── [flankR]#3 ───
-                              ↑
-                  middle KEEPS both var labels — losing them would
-                  erase real HD content sandwiched between the flanks
-                  and the classifier would report no_var on a clearly
-                  HD-bearing segment.
+              ↑ flankL hit at [0-352]
+              ↑ HD1 hit at [993-2943]
+              ↑ HD2 hit at [3156-5048]
+              ↑ flankR hit at [5585-5906]
+P1 out: ─── [flankL]#1 ─── [HD1]#2 ─── [HD2]#3 ─── [flankR]#4 ───
+            (4 pieces, one per hit; boundaries at midpoints)
 ```
 
-The earlier rule split at every hit boundary (one piece per BLAST HSP),
-which inflated graph size when multiple same-label hits sat on the same
-segment, and lost biologically-meaningful collapsing. The current rule
-emits a fixed-shape 3-piece skeleton that captures: "this segment has L
-labels on the left, R labels on the right, and these var tags in the
-middle" — which is what the classifier actually needs.
-
-After P1, every node is pure-flank, pure-var (possibly with multiple var
-tags after middle-consolidation), or unlabeled connector; **no composites
-remain.** Each neighbor edge of the original segment attaches to the
-sub-segment whose label range covers its connection end (GFA L-line
+After P1, every node carries exactly one label (one tag per sub-segment).
+No composites remain. Each neighbor edge of the original segment attaches
+to the sub-segment whose hit-range covers its connection end (GFA L-line
 orientation gives this).
+
+History note: an earlier `n_label`-based 3-piece-max rule was tried
+(collapsing same-tag hits and absorbing middle labels into one piece);
+reverted in favor of the all-split rule because the simpler one-piece-per-
+hit form lets the BFS / classifier reason about each individual HD
+detection separately and produces cleaner verdict transitions across
+fork-explosion samples.
 
 **P2. Bubble BFS** — starting from every pure-var node, BFS through unlabeled-only
 neighbors. The set of nodes reached forms the **bubble**; everything else is
@@ -406,67 +400,68 @@ the rest is a single counting step.
 
 ### 3.7 `find_alleles` BFS loop
 
-`find_alleles(seg_label_hits_tsv, gfa_path, genome_cov, init_nhop=5, max_nhop=10, var_proteins_ref=…, expected_var_tags=…, locus_padding=1500, lo_mult=0.25, hi_mult=2.0, divergence_threshold=0.05, queries_dir=…, out_candidate_fa=…)`
+`find_alleles(seg_label_hits_tsv, gfa_path, genome_cov, init_nhop=3, max_nhop=10, var_proteins_ref=…, expected_var_tags=…, locus_padding=4000, lo_mult=0.2, hi_mult=2.0, divergence_threshold=0.05, queries_dir=…, out_candidate_fa=…, seeds_mode="both", cov_filter=True, max_paths=50, max_path_length=15)`
 
-The orchestrator runs a 24-iteration grid (nhop × phase × cov), collects a
-per-network candidate from every iteration, optionally short-circuits when a
-"gold-standard" candidate appears, then picks across the whole pool. Saves
-every emission to `candidate_allele.fasta` for forensic audit.
+The orchestrator runs the BFS at increasing hop counts, collects per-network
+candidates from every iteration, optionally short-circuits when a fully
+complete candidate appears, then picks across the pool. Loop axes
+**seeds_mode** and **cov_filter** are caller-time configuration (not loop
+variants), so the loop is just over `nhop`.
 
 ```python
+# Seeds — set ONCE from seeds_mode
+seeds = var_segs              if seeds_mode == "var"
+      | flank_segs            if seeds_mode == "flank"
+      | (var_segs|flank_segs) if seeds_mode == "both"          # default
+
 candidates = []
 short_circuit = False
 
-for nhop in 5..10:                                # outer: 6 nhops
-    for phase in (var_seeded, var+flank_seeded):  # middle: 2 phases
-        for use_cov in (True, False):             # inner: 2 cov states
-            res = _try_one_pass(seeds, nhop, use_cov)
-            log(nhop, phase, use_cov, |nhood|, n_var, class, n_arms)
+for nhop in init_nhop..max_nhop:                  # default 3..10
+    res = _try_one_pass(seeds, nhop, cov_filter,  # cov_filter = True by default
+                        max_paths, max_path_length)
+    log(nhop, |nhood|, n_var, class, n_arms,
+        bfs_limits_hit)                            # logs cap hits when fired
 
-            if res.class == "no_var" or res.n_var == 0:
-                continue                          # skip empty iterations
+    if res.class == "no_var" or res.n_var == 0:
+        continue
 
-            # Per-network candidates: 1 per pool (1 pool if non-separate,
-            # N pools when classifier returns 'separate' with N sub_results)
-            pools = _emit_result(res, ..., return_pools=True)
-            for i, pool in enumerate(pools):
-                if not pool.alleles: continue
-                c = {
-                    iter_id, net_in_iter=(i+1 if N>1 else 0),
-                    verdict=pool.sub_verdict,     # NEVER 'separate' at pool level
-                    alleles, allele_cov, basepair,
-                    complete_var, complete_locus,
-                    diploid_dist,
-                    ...
-                }
-                candidates.append(c)
+    pools = _emit_result(res, ..., return_pools=True)
+    for i, pool in enumerate(pools):
+        if not pool.alleles: continue
+        c = {
+            iter_id, net_in_iter=(i+1 if N>1 else 0),
+            verdict=pool.sub_verdict,             # NEVER 'separate' at pool level
+            complete_var,                          # tri-state 0/1/2 — per-allele MIN
+            complete_locus,                        # tri-state 0/1/2 — per-allele MIN
+            alleles, allele_cov, basepair, diploid_dist,
+            ...
+        }
+        candidates.append(c)
 
-                # Acceptance gate (α — hard short-circuit)
-                if (c.verdict == "closed_bubble"
-                        and c.n_dedup >= 2
-                        and c.complete_locus):
-                    short_circuit = True
+        # Acceptance gate (α — hard short-circuit): tri-state == 2 required
+        if (c.verdict == "closed_bubble"
+                and c.n_dedup >= 2
+                and c.complete_locus >= 2
+                and c.complete_var >= 2):
+            short_circuit = True
 
-            if short_circuit: break
-        ...
+    if short_circuit: break
 
 write_candidate_fasta(candidates, out_candidate_fa)
 
-# === Picker: rank all candidates, take the single best ============
+# === Unified 4-tier rank (used at all 4 picker/dedup sites) =======
 best = min(candidates, key=lambda c: (
-    bubble_priority(c.verdict),         # 0. K-picker order
-    not c.complete_locus,               # 1. complete locus DESC
-    not c.complete_var,                 # 2. complete var DESC
-    not c.cov,                          # 3. cov-on > cov-off
-    -c.basepair,                        # 4. longer DESC
-    c.diploid_dist,                     # 5. closer to ½ × D_k ASC
+    bubble_priority(c.verdict, c.n_dedup),     # 0. K-picker priority order
+    -c.complete_locus,                          # 1. tri-state DESC
+    -c.complete_var,                            # 2. tri-state DESC
+    c.diploid_dist,                             # 3. |allele_cov/D_k − ½|  ASC
 ))
 
 # === Cross-network sibling dedup (same iteration only) ============
 siblings = [c for c in candidates if c.iter_id == best.iter_id]
-# Combined sequences from all siblings, RC-aware dedup with same
-# completeness-first ordering. Disallows cross-iteration mixing.
 final = dedup_ranked_cross_network(siblings, divergence_threshold)
+                                              # same 4-tier rank, RC-aware edlib HW
 
 # === Sample verdict ================================================
 surviving_nets = {c.net for c in final}
@@ -474,58 +469,73 @@ sample_verdict = ("separate" if len(surviving_nets) >= 2
                   else siblings[0].verdict)
 ```
 
+#### Loop axes that were dropped
+
+Earlier the loop had `phase × nhop × cov_filter` = 24 iterations. Empirical
+results on a 148-sample whitelist showed:
+
+| Loop axis | Wins on which samples | Decision |
+|---|---|---|
+| Phase 2 (`flank_fallback`) | 0 / 144 picks | dropped — moved to `seeds_mode` config |
+| `cov_filter=False` pass | 1 / 292 per-k results, never wins K-pick | dropped — moved to `cov_filter` config |
+
+Iteration count is now `max_nhop − init_nhop + 1` = up to 8 (default 3..10).
+
 #### Key invariants
 
-- **All 24 iterations may run.** Phase 2 (flank-seeded) runs at every nhop —
-  not "only when phase 1 failed". Acceptance can short-circuit early but
-  doesn't have to.
-- **Acceptance (α) is a hard short-circuit**, not a fallback condition. It
-  fires the moment ANY candidate is a clean diploid: `closed_bubble`,
-  `n_dedup ≥ 2`, `complete_locus`. All remaining iterations are skipped.
+- **Acceptance (α) is a hard short-circuit**, not a fallback. Fires the
+  moment ANY candidate is `closed_bubble`, `n_dedup ≥ 2`, AND both tri-state
+  completeness scores at level 2 (all expected var tags AND both flanks
+  present in EVERY emitted allele of the candidate's pool — the per-allele
+  MIN aggregation prevents the "two single-HD fragments union to look
+  complete" pathology).
 - **No candidate ever carries `verdict="separate"`.** When the classifier
-  returns `class="separate"` (var-bearing nodes form disjoint subgraphs),
-  each network's sub-classification (`closed_bubble`/`open_bubble`/`single`/
-  `complexed`) becomes its candidate's verdict. The `separate` label is
-  applied AT THE SAMPLE LEVEL only — after dedup, if ≥ 2 distinct networks
-  survived.
+  returns `class="separate"`, each network's sub-classification
+  (`closed_bubble`/`open_bubble`/`single`/`complexed`) becomes its
+  candidate's verdict. The `separate` label is applied AT THE SAMPLE LEVEL
+  only — after dedup, if ≥ 2 distinct networks survived.
 - **Cross-iteration mixing is disallowed**: the picker chooses ONE
   candidate, and only its same-`iter_id` siblings join it for the
-  cross-network dedup. You can't combine network 1 from iteration X with
-  network 2 from iteration Y.
+  cross-network dedup.
 - **`candidate_allele.fasta`** captures every emitted sequence across the
   loop, with headers tagging `(iter_id, network, cov, verdict)` — purely
-  for audit / debugging; not used by downstream tools.
+  for audit / debugging.
 
 #### `_try_one_pass` (single iteration)
 
 Each `_try_one_pass` BFS-expands seeds by `nhop` hops, optionally applies a
-depth filter `[lo_mult × D_k, hi_mult × D_k]` (default `[0.25, 2.0]`),
+depth filter `[lo_mult × D_k, hi_mult × D_k]` (default `[0.2, 2.0]`),
 restricts edges, runs P1 directional split (§3.3), runs the classifier
-(§3.4–3.6), and stashes `_provenance` + `_var_per_node` on the result.
-Self-loop GFA edges (where source == target) are skipped when building
-adjacency.
+(§3.4–3.6), and stashes `_provenance` + `_var_per_node` + `_bfs_limits` on
+the result. Self-loop GFA edges (where source == target) are skipped.
 
 The classifier's `class="separate"` recursion (per-network sub-classification)
 also happens here — sub_results are attached to `res` and consumed by
 `_emit_result(return_pools=True)` to produce per-network pools.
 
+#### BFS path enumeration — shortest-first, with hard caps
+
+The classifier's arm enumeration uses **BFS by path length** (not DFS). At
+each iteration of the outer BFS, all simple paths of length L are emitted
+before any path of length L+1 starts. So when `max_paths` fires, the
+SHORTEST `max_paths` paths survive — the real diploid pair (typically 2–6
+nodes) always makes it into the cap even on fork-explosion samples where
+DFS would plunge deep on one branch and miss the other arms.
+
+Two hard caps:
+- `max_paths = 50` — total number of simple paths per starting anchor
+- `max_path_length = 15` — drop any path whose node count exceeds this
+
+Each iteration's log line shows `⚠ limits: max_paths_hit=N max_path_length_hit=M`
+when either cap fired (suppressed when both = 0).
+
 #### Completeness — graph-level flank check
 
-The new acceptance and ranking rely on `complete_locus = complete_var AND
-has_flankL AND has_flankR`. The flank-presence check is **graph-level**,
-NOT a blastn on the locus-trimmed sequence:
-
-```python
-has_flank(path, side) := any(side in label(n) for n in path)
-                        OR any(side in label(m) for ep in (path[0], path[-1])
-                                                  for m in adj_pp[ep])
-```
-
-The candidate's pre-trim path nodes carry flank labels directly when an arm
-endpoint IS a flank-labeled segment; otherwise the bubble's flank anchor sits
-just OUTSIDE the path as a post-P1 neighbor. A blastn on the trimmed
-sequence would always return False here because the trim window
-(`var_start − 1500` to `var_end + 1500`) strips flanks by design.
+Flank presence per allele is detected by a single blastn pass over the
+candidate FASTA (`queries/flankL.fasta` + `queries/flankR.fasta`, pid ≥ 85%,
+aln ≥ 100 bp). Per-allele `cl_level = int(has_flankL) + int(has_flankR)` ∈
+{0, 1, 2}. The pool-level `complete_locus` is the MIN across surviving
+alleles — see §3.8.
 
 ### 3.8 Emission rule (trim → dedup → emit)
 
@@ -558,8 +568,12 @@ build sequences via provenance (orig_seg, start, end, strand)
     │  collect found_var_tags per surviving candidate
     ▼
 [completeness-first dedup]
-    │  RANK candidates by:
-    │    (¬complete_locus, ¬complete_var, −basepair, diploid_dist)
+    │  RANK candidates by (smaller = better):
+    │    (−cl_level, −cv_level, diploid_dist)
+    │  where cl_level/cv_level are PER-CANDIDATE tri-states (0/1/2):
+    │    cv_level = how many expected_var_tags found in THIS candidate
+    │               (0=none, 1=some, 2=all)
+    │    cl_level = how many of {flankL, flankR} present in THIS candidate
     │  WALK in rank order:
     │    keep s iff is_divergent(s, k, threshold) for every already-kept k
     │    where is_divergent uses RC-aware edlib HW edit-distance:
@@ -571,16 +585,32 @@ build sequences via provenance (orig_seg, start, end, strand)
 emit: allele1 / allele1+allele2 / chimera1..N (by post-dedup count)
     │
     ▼
-[per-allele depth + completeness + extend_bounds]
+[per-allele depth + tri-state completeness + extend_bounds]
     allele_cov = length-weighted DP:f: mean per allele path
-    surviving_tags = union of found_var_tags across survivors
-    complete_var = (expected_var_tags ⊆ surviving_tags)
-    complete_locus = complete_var AND has_flankL AND has_flankR
-                     (flank presence via graph-level path-node labels;
-                     see §3.7 "Completeness")
+    surviving_tags = union of found_var_tags across survivors (info-only)
+    per-allele cv_level = 0/1/2  (this allele's tblastn vs expected_var_tags)
+    per-allele cl_level = 0/1/2  (this allele's blastn vs flankL+flankR)
+    pool-level complete_var  = MIN(per-allele cv_level across surviving)
+    pool-level complete_locus = MIN(per-allele cl_level across surviving)
+    diploid_dist = |Σ(allele_cov)/D_k − 1| ... actually we use
+                   |mean(allele_cov)/D_k − ½| per pool
     extend_bounds = per allele, (innermost_flankL_node,
                     innermost_flankR_node)
 ```
+
+#### Why per-allele MIN aggregation (not union)
+
+A naive union — "pool is complete iff the surviving alleles' tag sets UNION
+to expected_var_tags" — has a pathology: two single-HD fragments (one allele
+with HD1 only, another with HD2 only) union to look fully complete, even
+when neither allele individually covers the locus. This was the KYH069 n1
+case: two 308 bp single-HD fragments in a disjoint network scored
+`complete_var = 2` under union aggregation.
+
+Per-allele MIN aggregation requires EVERY surviving allele to score at the
+same level — a pool scores `complete_var = 2` only when every emitted
+allele individually has all expected var tags. KYH069 n1's per-allele
+levels become {1, 1} → pool MIN = 1, demoted below true diploid networks.
 
 #### Pool-level outputs the orchestrator consumes
 

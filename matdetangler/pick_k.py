@@ -79,7 +79,15 @@ def _load_result(path: str) -> dict | None:
     for k in ("locus_coverage", "genome_cov"):
         try: row[k] = float(row.get(k, "") or 0.0)
         except ValueError: row[k] = 0.0
-    row["complete_var"] = row.get("complete_var", "") == "True"
+    # Tri-state completeness: accept either the new int format (0/1/2) OR
+    # the legacy "True"/"False" boolean (gets mapped to 2 / 0).
+    for k in ("complete_var", "complete_locus"):
+        v = row.get(k, "")
+        if v in ("True", "true"):  row[k] = 2
+        elif v in ("False", "false", "", "None"): row[k] = 0
+        else:
+            try: row[k] = int(v)
+            except (TypeError, ValueError): row[k] = 0
     return row
 
 
@@ -94,20 +102,25 @@ def _allele_cov_mean(row: dict) -> float:
 
 
 def _score(row: dict) -> tuple:
+    """Unified K-picker rank — same 4 tiers as the in-pool dedup, the
+    cross-network finalize dedup, and the cross-iteration candidate picker.
+    Smaller value = better.
+        0. bubble_priority (closed_bubble > open_bubble > separate(n=2) > …)
+        1. complete_locus DESC   tri-state 0/1/2 (none/some/all)
+        2. complete_var   DESC   tri-state 0/1/2
+        3. |mean(allele_cov)/D_k − 0.5|  ASC  (diploid signature)
+    """
     verdict = row.get("bubble_type", "")
     n_dedup = row.get("n_dedup", 0)
     prio = _priority(verdict, n_dedup)
     ac_mean = _allele_cov_mean(row)
     gen_cov = row.get("genome_cov", 0.0)
-    # tie-break vector — lower is better
     cv_balance = abs((ac_mean / gen_cov) - 0.5) if gen_cov else 1.0
     return (
-        prio,                           # 1. priority class (lower is better)
-        not row.get("complete_var"),     # 2. True < False (prefer complete)
-        -row.get("locus_coverage", 0),  # 3. higher locus_cov better
-        cv_balance,                      # 4. ½-cov balance for diploid
-        -row.get("basepair", 0),         # 5. longer total bp better
-        row.get("n_cand", 0),            # 6. fewer raw candidates better
+        prio,
+        -int(row.get("complete_locus", 0) or 0),
+        -int(row.get("complete_var",   0) or 0),
+        cv_balance,
     )
 
 
@@ -205,12 +218,13 @@ def main(argv: list[str] | None = None) -> int:
                 continue
             n_samples += 1
 
-            # summary row (sample-level)
+            # summary row (sample-level) — complete_var / complete_locus are
+            # tri-state 0/1/2 (none/some/all) integers.
             stsv.write("\t".join([
                 sample, win["_k"], win.get("bubble_type", ""),
                 str(win.get("n_dedup", 0)),
-                str(win.get("complete_var", False)),
-                str(win.get("complete_locus", "")),
+                str(int(win.get("complete_var", 0) or 0)),
+                str(int(win.get("complete_locus", 0) or 0)),
                 f"{win.get('locus_coverage', 0):.3f}",
                 str(win.get("basepair", 0)),
                 f"{win.get('genome_cov', 0):.2f}",
@@ -235,7 +249,8 @@ def main(argv: list[str] | None = None) -> int:
             origin = ("path" if win.get("bubble_type") in ("closed_bubble",
                                                             "open_bubble", "single")
                             else "graph")  # complexed / separate → "graph"
-            type_lbl = ("complete" if win.get("complete_var") else "partial")
+            # "complete" requires ALL expected var tags (tri-state == 2)
+            type_lbl = ("complete" if int(win.get("complete_var", 0) or 0) >= 2 else "partial")
             for i, name in enumerate(allele_names):
                 name = name.strip()
                 if not name: continue
@@ -254,7 +269,9 @@ def main(argv: list[str] | None = None) -> int:
                     segs_v = sample_union_segs
                 # n_variable_genes "found/expected" — sample-level approximation
                 nv_found = len((win.get("found_var_tags", "") or "").split(",")) if win.get("found_var_tags") and win.get("found_var_tags") != "-" else 0
-                n_variable = f"{nv_found}/{nv_found}" if win.get("complete_var") else f"?/{nv_found}"
+                n_variable = (f"{nv_found}/{nv_found}"
+                              if int(win.get("complete_var", 0) or 0) >= 2
+                              else f"?/{nv_found}")
                 has_both_flanks = "True" if (L_ok and R_ok) else "False"
                 ptsv.write("\t".join([
                     sample, name, origin, win["_k"], type_lbl, str(ln),

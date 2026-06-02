@@ -584,11 +584,11 @@ def run(sample: str, gfa: str, primary_alleles_fa: str, queries_dir: str, outdir
             if tagn not in merged_labels: merged_labels[tagn] = labels.get(n, "")
             if tagn not in merged_seqs:   merged_seqs[tagn]   = seqs.get(n, "")
         arm_paths.append(tagged_path)
-    # Orient each row so its var-tag fingerprint matches the first row's
-    # (the leftmost var-bearing node on every row carries the same gene tag
-    # — matching the File-S1-style canonical convention). A row whose
-    # var-tag order is the EXACT REVERSE of row 0's gets walked backwards.
-    # Rows with disjoint or ambiguous fingerprints are left alone.
+    # Orient each row so its var-tag order matches the REFERENCE protein
+    # query order (the order tags appear in queries_dir/variable_proteins.fasta).
+    # A row whose order is the EXACT REVERSE of the reference order gets
+    # walked backwards — so HD2/HD1 (or whatever the reference order is)
+    # appears consistently L→R across every emitted row + sample.
     def _vartag_seq(arm: list[str]) -> list[str]:
         out: list[str] = []
         for n in arm:
@@ -597,12 +597,37 @@ def run(sample: str, gfa: str, primary_alleles_fa: str, queries_dir: str, outdir
             if toks and (not out or out[-1] != toks[0]):
                 out.append(toks[0])
         return out
+
+    def _ref_vartag_order() -> list[str]:
+        """Read the protein query FASTA in queries_dir; return tags in file
+        order. Falls back to row 0's fingerprint if the file is absent."""
+        import os
+        candidates = [
+            os.path.join(queries_dir, "variable_proteins.fasta"),
+            os.path.join(queries_dir, "Suilu4_HDs.fasta"),
+        ]
+        for qp in candidates:
+            if not os.path.exists(qp): continue
+            order = []
+            with open(qp) as fh:
+                for ln in fh:
+                    if ln.startswith(">"):
+                        tag = ln[1:].strip().split()[0]
+                        if tag and tag not in order:
+                            order.append(tag)
+            if order: return order
+        return _vartag_seq(arm_paths[0]) if arm_paths else []
+
     if arm_paths:
-        canon = _vartag_seq(arm_paths[0])
-        if canon:
-            for i in range(1, len(arm_paths)):
+        ref_order = _ref_vartag_order()
+        if ref_order:
+            for i in range(len(arm_paths)):
                 vs = _vartag_seq(arm_paths[i])
-                if vs and vs == list(reversed(canon)):
+                if not vs: continue
+                # If the row's tag-order is the reverse of the reference's
+                # restriction to tags actually present in this row → flip.
+                ref_in_row = [t for t in ref_order if t in vs]
+                if vs == list(reversed(ref_in_row)):
                     arm_paths[i] = list(reversed(arm_paths[i]))
     arm1 = arm_paths[0] if arm_paths else []
     arm2 = arm_paths[1] if len(arm_paths) > 1 else None
