@@ -400,7 +400,7 @@ the rest is a single counting step.
 
 ### 3.7 `find_alleles` BFS loop
 
-`find_alleles(seg_label_hits_tsv, gfa_path, genome_cov, init_nhop=3, max_nhop=10, var_proteins_ref=…, expected_var_tags=…, locus_padding=4000, lo_mult=0.2, hi_mult=2.0, divergence_threshold=0.05, queries_dir=…, out_candidate_fa=…, seeds_mode="both", cov_filter=True, max_paths=50, max_path_length=15)`
+`find_alleles(seg_label_hits_tsv, gfa_path, genome_cov, init_nhop=3, max_nhop=10, var_proteins_ref=…, expected_var_tags=…, locus_padding=4000, lo_mult=0.2, hi_mult=2.0, divergence_threshold=0.05, queries_dir=…, out_candidate_fa=…, seeds_mode="both", cov_filter=True, max_paths=50, max_path_length=15, min_allele_bp=3000)`
 
 The orchestrator runs the BFS at increasing hop counts, collects per-network
 candidates from every iteration, optionally short-circuits when a fully
@@ -666,6 +666,40 @@ distinct (forward HW edit-distance between them would be near-zero on the
 shared part, but the orientation flip looks like total dissimilarity to
 infix-anchored alignment if the target is shorter than the query).
 
+#### HD-only divergence — comparing the var region, not the flanks
+
+The dedup comparison uses only the **HD-only span** of each candidate, not
+the full padded sequence. Two alleles whose HD cores diverge 30% but whose
+flanks are 100% identical would look ~85% identical at the whole-allele
+level — the flanks dominate the length. Restricting the comparison to the
+var region surfaces the biologically-meaningful divergence signal.
+
+Mechanics:
+- `_tblastn_trim_each(seqs, ref, padding)` returns `(padded_seqs,
+  found_tags, hd_span)`. The third value records the HD-only coords
+  `(lo, hi)` *within each padded slice*, so the caller can do `seq[lo:hi]`
+  to get the un-padded HD region.
+- `_dedup_named_ranked(seqs, threshold, key_fn, compare_seqs=…)` takes an
+  optional `compare_seqs={name: hd_only_seq}` dict. Sort order still uses
+  the full rank, but `is_divergent()` is computed on the HD-only slice.
+- Emitted alleles remain the full padded ~9 kb sequences — only the
+  divergence metric narrows to the var region.
+
+#### Hard minimum-length floor (`min_allele_bp`, default 3000)
+
+Three-stage filter that drops sub-3kb fragment candidates:
+1. **Pre-locus-trim** — applied to raw walk content before tblastn, so
+   fragment-network walks (e.g. KYH069 n1's 308 bp single-HD segments)
+   never reach the tblastn step.
+2. **Post-locus-trim** — second pass after the trim window narrows
+   sequences, catches any survivor that fell below the floor.
+3. **Cross-network sibling dedup** — same floor applied when gathering
+   per-iteration siblings, catches fragments that came in via a sibling
+   network's emission.
+
+Clean closed_bubble samples (real 4.5–5 kb diploid pairs) are unaffected;
+fragment-only "n1 308 bp" pools are dropped entirely.
+
 The current `_blastn_flank_presence()` helper still exists for fallback /
 diagnostic use but is NOT consulted during normal emission — the
 graph-level path check (§3.7) replaces it. Calling code that wants
@@ -784,11 +818,12 @@ extend_bounds  allele_segments
 
 | file | content |
 |---|---|
-| `alleles.fasta` | post-dedup picked alleles, FASTA |
-| `result.tsv` | the 22-column row above |
+| `alleles.fasta` | post-dedup picked alleles, FASTA. Post-`min_allele_bp` (default 3000 bp). |
+| `longest_alleles.fasta` | length-first RC-aware dedup over the full candidate pool — keeps the LONGEST representative of each edit-distance equivalence class (HD-only divergence, 5%). Wider net than `alleles.fasta`; the bash wrapper unions per-k versions into a sample-level `<sample>/longest_alleles.fasta` with `k{NN}_` prefixed headers. |
+| `result.tsv` | the 22-column row above. `complete_var` and `complete_locus` are now tri-state integers (0=none, 1=some, 2=all). |
 | `seg_label_hits.tsv` | labeler output (§3.2) |
 | `subnode_seqs.fasta` | one record per unique `{parent}#N` sub-node ID, with the materialized sub-region DNA (RC'd if post-P1 strand was `-`). Consumed by `graph_paths.py` to draw `bubble.gfa` / `bubble.png` with coord-free IDs. |
-| `candidate_allele.fasta` | forensic record — every emitted sequence across all 24 BFS iterations. Headers carry `cand{id}_h{nhop}_p{phase}_c{cov}_n{net}_v{verdict}_{allele_name}`. Not consumed by downstream stages. |
+| `candidate_allele.fasta` | forensic record — every emitted sequence across all BFS iterations (post `min_allele_bp` filter). Headers carry `cand{id}_h{nhop}_n{net}_c{cov}_{verdict}_{allele_name}`. Not consumed by downstream stages. |
 | `flankL_blastn.tsv`, `flankR_blastn.tsv`, `HD_tblastn.tsv` | raw BLAST inputs to the labeler |
 
 Cross-K integration (picking the best K across the per-k results) lives in
@@ -930,11 +965,19 @@ when the cache is warm; all hits are USE).
 | `bubble.gfa` | sub-GFA of just the walks' segments + L-links (loads in Bandage) |
 | `bubble.dot` | Graphviz DOT |
 | `bubble.tsv` | edge list |
-| `bubble.png` | matplotlib: one row per allele. **Node coloring**: yellow = carries any variable gene (e.g. HD1/HD2; flank tag, if any, ignored for color); blue = flank-only (label is purely flankL/flankR, no variable gene); white = pure-number / unlabeled. **Dashed gray cross-arm lines**: (a) one per GFA segment ID shared between the two arms — same node = definite homology; (b) fallback only when no flank-only segment ID is shared for a given flank type — one extra line connects the outermost flank-only node of each arm (leftmost flankL = arm entry, rightmost flankR = arm exit). |
+| `bubble.png` | matplotlib: one row per allele. **Node coloring**: yellow = carries any variable gene (e.g. HD1/HD2; flank tag, if any, ignored for color); blue = flank-only (label is purely flankL/flankR, no variable gene); white = pure-number / unlabeled. **Dashed gray cross-arm lines**: (a) one per GFA segment ID shared between the two arms — same node = definite homology; (b) fallback only when no flank-only segment ID is shared for a given flank type — one extra line connects the outermost flank-only node of each arm (leftmost flankL = arm entry, rightmost flankR = arm exit). Capped at 4 rows displayed (extras dropped from the picture; the title notes `[showing 4 of N]`). |
 
 When both alleles came from the same K, node IDs are bare. When they came from
 different K's (cross-K pair), node IDs are prefixed `K33:` / `K55:` etc. so the user
 can tell at a glance which graph each allele lives in.
+
+**Row orientation — canonical to the protein query order.** Each row's
+var-tag sequence (e.g. `[HD2, HD1]` or `[HD1, HD2]`) is compared to the
+order tags appear in `queries_dir/variable_proteins.fasta` (or
+`Suilu4_HDs.fasta`). Rows whose order is the exact reverse of the
+reference order get walked backwards before drawing, so HD2/HD1 ends align
+consistently L→R across rows AND across samples. The title shows
+`{sample}: {bubble_type} (N alleles)`.
 
 ---
 
