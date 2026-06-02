@@ -1066,3 +1066,180 @@ With the rules from A.4 in place, the suite is **275 pass, 0 fail,
 PYTHONHASHSEED=0 python3 -m test.graph_classifier.run_tests       # all layers
 PYTHONHASHSEED=0 python3 -m test.graph_classifier.run_tests -v    # per-series detail
 ```
+
+---
+
+## Appendix B. Final classifier — segment processing + bubble classification
+
+After iterating against real GFA data (Pcub-40 + Suilu-154 batches), the
+classifier reduced to one preprocessing pass and one path-counting rule.
+This is the version intended for production integration.
+
+### B.1. Segment preprocessing
+
+The classifier consumes a graph with three node categories: **pure-flank**
+(label has flankL or flankR, no var-gene tag), **pure-var** (var-gene
+tag, no flank tag), and **unlabeled connector** (neither). The input may
+also contain **composite** nodes (a single GFA segment with BOTH flank and
+var tags, e.g., `HD1+flankL`). The preprocessing removes composites:
+
+**P1. Directional split** — each multi-labeled segment becomes a chain
+of single-labeled sub-segments along the segment's direction:
+
+```
+input:  ─── HD1+flankL+flankR composite ───
+P1 out: ─── [flankL] ─── [HD1] ─── [flankR] ───
+```
+
+The split uses the **per-end label coordinates** that the pipeline's
+upstream BLAST hits already record (start/end on each segment).
+After P1, every node is pure-flank, pure-var, or unlabeled connector;
+**no composites remain.** Each neighbor edge of the original segment
+attaches to the sub-segment whose label range covers its connection
+end (GFA L-line orientation gives this).
+
+**P2. Bubble BFS** — starting from every pure-var node, BFS
+through unlabeled-only neighbors. The set of nodes reached forms the
+**bubble**; everything else is **flank-region**:
+
+```
+Bubble       = pure-var nodes ∪ unlabeled connectors reachable from var
+                                  via unlabeled-only paths
+Flank-region = nodes - Bubble
+```
+
+P2 is one BFS — no iteration over rounds, no parameters. A long unlabeled
+spacer between var and a flank gets pulled INTO the bubble (it becomes
+part of the bubble interior); a noise chain dangling off a pure flank
+with no var-reachable path stays in flank-region. Flank-region naturally
+contains all pure flanks plus any "shoulder" connectors that only reach
+flank, not var.
+
+### B.2. Bubble shape (after preprocessing)
+
+The bubble is a connected subgraph that may be:
+
+- A linear chain (synthetic clean closed_bubble, vars connect directly)
+- A Y-fork at a Uvar joint (AG10's 1027237 connects three var nodes)
+- A cycle (closed_bubble where joints are unlabeled, e.g. AG17 shape)
+- A multi-fork hub (complex_case5 where one var node branches to 3+)
+- Multiple disjoint components (when var content lives in separate locations)
+
+The classifier does NOT make structural assumptions about the bubble's
+internal shape. It just counts paths through it.
+
+### B.3. Anchors
+
+```
+L-anchor = bubble node adjacent to ANY flankL-tagged node (in flank-region)
+R-anchor = bubble node adjacent to ANY flankR-tagged node (in flank-region)
+```
+
+After P1+P2, every flank-tagged node is in the flank-region (composites
+are gone; pure flanks and inherited unlabeled connectors are flank-region).
+The anchor definition is one statement with no special cases.
+
+### B.4. Arms
+
+An **arm** is a distinct simple path through the bubble that:
+
+1. Starts at an L-anchor or an R-anchor.
+2. Passes through ≥1 var-gene node.
+3. Either ends at an opposite-side anchor (**closed**) OR dead-ends in the
+   bubble (**dangling** — kept only if the path's var content is not
+   entirely already covered by some closed arm).
+
+"Simple path" has its standard graph-theory meaning: no node revisit.
+This guarantees finite enumeration on cyclic bubbles.
+
+**No further dedup.** If two arms route through shared Uvar hubs in
+substantially different combinations, those ARE distinct arms — that's
+structural complexity, and it correctly drives the verdict toward
+'complexed'.
+
+### B.5. Verdict
+
+Precedence rule applied first:
+
+- Var nodes split across 2+ connected components of the **full graph** ⇒ `separate`
+
+Then by arm count:
+
+| arms | configuration | verdict |
+|------|---------------|---------|
+| 0    | no var-bearing route                    | complexed |
+| 1    | one arm                                  | single |
+| 2    | both closed                              | closed_bubble |
+| 2    | mixed (≥1 dangling)                      | open_bubble |
+| ≥3   | three or more                            | complexed |
+
+### B.6. Why the spec is deductive
+
+Every step is a single graph operation with no parameters:
+
+- **P1**: rewrite (split nodes by label coordinate)
+- **P2**: BFS from var through unlabeled
+- **R1** (anchors): adjacency test
+- **R2** (arms): simple-path enumeration with var-content filter
+
+No `MAX_LINKER_PADDING` parameter, no validity horizon, no clean-chain
+check, no var-series/flank-series special handling, no minimal-var-set
+dedup, no arm-membership consolidation. The composite mess is handled
+upstream by P1; the long-spacer mess is handled by P2; the rest is a
+single counting step.
+
+### B.7. What changed from Appendix A's classifier
+
+| Appendix A | Appendix B |
+|---|---|
+| 5 rules (var-series + flank-region + validity-horizon + clean-chain + same-single-anchor) | 1 preprocessing pass (P1+P2) + 1 path-counting rule |
+| `MAX_LINKER_PADDING=5` validity parameter | none |
+| "treat all flank-tagged as boundary" | composites split into pure pieces, flanks include inherited connectors |
+| Multiple-var-set dedup to suppress frankenstein paths | dropped — frankenstein paths legitimately indicate complex topology |
+| ~280 LOC in `classifier.py` | ~150 LOC (estimated) |
+| 275/0/4 on synthetic; 164/188 on real | same synthetic targets; real samples honestly classified — shared-spine cases (AG5-shape, ~9 samples) move from `closed_bubble` to `complexed` |
+
+### B.8. Implementation
+
+Four modules under `test/graph_classifier/`:
+
+| module | role | key function |
+|---|---|---|
+| `seg_processor.py` | P1 directional split | `directional_split(seg_labels, seg_length, edges, edge_endpoints)` |
+| `bubble_bfs.py`    | P2 Bubble BFS from var through unlabeled | `bubble_bfs(adj, var_nodes, unlabeled)` |
+| `bubble_classifier.py` | R1–R4 verdict over the post-P1 graph | `classify(nodes, edges, label_per_node, var_per_node)` |
+| `labeler.py`       | Aggregator: BLAST cache TSVs + GFA → `seg_label_hits.tsv` | `emit_seg_label_hits(gfa_path, blast_tsvs, out_tsv)` |
+
+Test suite: `test/graph_classifier/directional_test.py` covers the
+classifier with 8 hand-built synthetic cases that exercise composites,
+long unlabeled spacers, Y-fork bubbles, dangling arms, multi-arm
+complexity, and disjoint var subgraphs. All 8 pass.
+
+Pseudocode for the end-to-end pipeline:
+
+```python
+from test.graph_classifier import seg_processor, bubble_classifier
+
+# Input: per-segment label hits (from labeler) and edges (from GFA)
+nodes, edges, label_per_node, var_per_node = seg_processor.directional_split(
+    seg_labels, seg_length, edges, edge_endpoints,
+)
+result = bubble_classifier.classify(
+    nodes, edges, label_per_node, var_per_node,
+)
+# result["class"] is the verdict
+```
+
+### B.9. Upstream plumbing required
+
+P1 needs per-end label coordinates on each GFA segment. The pipeline
+already produces these in BLAST output (start/end of hit on segment); the
+picker / `graph_paths.py` annotation step would need to emit them to the
+classifier-facing data (`bubble.tsv` or equivalent). Minimal plumbing
+change, no algorithmic work.
+
+If per-end coordinates are absent, the fallback is to retain the
+composite node as-is and use a simpler anchor rule (composite carrying a
+flank tag is also an anchor). This is less crisp but still correct for
+common shapes; the production classifier should use directional input.
+

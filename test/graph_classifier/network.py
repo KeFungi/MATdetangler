@@ -208,6 +208,148 @@ def complex_case5() -> TestNetwork:
     return net
 
 
+def closed_bubble_with_connector_joints() -> TestNetwork:
+    """Real-data shape (AG17-like). Bubble joints are UNLABELED connector
+    segments; flanks attach to the joints from outside the cycle.
+
+      flankL — Jl — HDa — Jr — flankR
+                 \\ HDb /
+
+    Jl (left joint) and Jr (right joint) are pure connectors shared between
+    both arms. Each arm goes through its own var node (HDa or HDb)."""
+    net = TestNetwork(name="closed_bubble_with_connector_joints",
+                       expected="closed_bubble")
+    net.add_node("flankL", label="flankL")
+    net.add_node("flankR", label="flankR")
+    net.add_node("Jl")
+    net.add_node("Jr")
+    net.add_node("HDa", label="HD", vars={"HD"})
+    net.add_node("HDb", label="HD", vars={"HD"})
+    for e in [("flankL", "Jl"), ("Jl", "HDa"), ("HDa", "Jr"), ("Jr", "flankR"),
+              ("Jl", "HDb"), ("HDb", "Jr")]:
+        net.add_edge(*e)
+    return net
+
+
+def closed_bubble_ag17_shape() -> TestNetwork:
+    """Exact AG17 shape: arm1 has 1 var seg, arm2 has 3 var segs, joints are
+    unlabeled connectors, flankR is a composite (var+flankR)."""
+    net = TestNetwork(name="closed_bubble_ag17_shape", expected="closed_bubble")
+    net.add_node("flankL", label="flankL")
+    net.add_node("Jl")
+    net.add_node("Jr")
+    net.add_node("HD_arm1", label="HD1+HD2", vars={"HD1", "HD2"})
+    net.add_node("HD_arm2a", label="HD1", vars={"HD1"})
+    net.add_node("HD_arm2b", label="HD1+HD2", vars={"HD1", "HD2"})
+    net.add_node("flankR_comp", label="HD2+flankR", vars={"HD2"})
+    for e in [("flankL", "Jl"),
+              ("Jl", "HD_arm1"), ("HD_arm1", "Jr"),
+              ("Jl", "HD_arm2a"), ("HD_arm2a", "HD_arm2b"), ("HD_arm2b", "Jr"),
+              ("Jr", "flankR_comp")]:
+        net.add_edge(*e)
+    return net
+
+
+def closed_bubble_long_flank_chain() -> TestNetwork:
+    """Long flankL chain alternating with unlabeled connectors, terminating in
+    a composite var+flankL+flankR node. Two arms diverge only at the final
+    composite. Mirrors 2019NZAus082.1 / AG12-shape real data.
+
+    flankL — fL_link1 — flankL — fL_link2 — flankL — composite_a(HD+flankL+flankR)
+                                                    composite_b(HD+flankL+flankR)
+    """
+    net = TestNetwork(name="closed_bubble_long_flank_chain",
+                       expected="closed_bubble")
+    net.add_node("flankL_1", label="flankL")
+    net.add_node("flankL_2", label="flankL")
+    net.add_node("flankL_3", label="flankL")
+    net.add_node("link_1")
+    net.add_node("link_2")
+    net.add_node("composite_a", label="HD1+HD2+flankL+flankR",
+                  vars={"HD1", "HD2"})
+    net.add_node("composite_b", label="HD1+HD2+flankL+flankR",
+                  vars={"HD1", "HD2"})
+    for e in [("flankL_1", "link_1"), ("link_1", "flankL_2"),
+              ("flankL_2", "link_2"), ("link_2", "flankL_3"),
+              ("flankL_3", "composite_a"), ("flankL_3", "composite_b")]:
+        net.add_edge(*e)
+    return net
+
+
+def closed_bubble_long_unlabeled_to_flank() -> TestNetwork:
+    """Long unlabeled connector chain (= MAX_LINKER_PADDING) between var
+    content and the opposite flank. Mirrors SA93-shape (4–5 unlabeled
+    intermediates between flankR and the nearest var).
+
+    flankL — HDa — HDb — link — link — link — link — link — flankR
+           \\ HDa2 — HDb2 /
+    """
+    net = TestNetwork(name="closed_bubble_long_unlabeled_to_flank",
+                       expected="closed_bubble")
+    net.add_node("flankL", label="flankL")
+    net.add_node("flankR", label="flankR")
+    net.add_node("HDa", label="HD1", vars={"HD1"})
+    net.add_node("HDb", label="HD2", vars={"HD2"})
+    net.add_node("HDa2", label="HD1", vars={"HD1"})
+    net.add_node("HDb2", label="HD2", vars={"HD2"})
+    for i in range(5):
+        net.add_node(f"link_{i}")
+    for e in [("flankL", "HDa"), ("HDa", "HDb"),
+              ("flankL", "HDa2"), ("HDa2", "HDb2"),
+              ("HDb", "link_0"), ("HDb2", "link_0"),
+              ("link_0", "link_1"), ("link_1", "link_2"),
+              ("link_2", "link_3"), ("link_3", "link_4"),
+              ("link_4", "flankR")]:
+        net.add_edge(*e)
+    return net
+
+
+def closed_bubble_var_spine_shared() -> TestNetwork:
+    """Two arms share part of the var "spine" — the HD2 and HD2+flankR
+    composite are the SAME node for both arms; only HD1 differs. Mirrors
+    AG5-shape with shared var content.
+
+    flankL — HD1a — link — HD2_shared — link — HD2_flankR_shared
+           \\ HD1b /
+    """
+    net = TestNetwork(name="closed_bubble_var_spine_shared",
+                       expected="closed_bubble")
+    net.add_node("flankL", label="flankL")
+    net.add_node("HD1a", label="HD1+flankL", vars={"HD1"})
+    net.add_node("HD1b", label="HD1+flankL", vars={"HD1"})
+    net.add_node("link_1")
+    net.add_node("HD2_shared", label="HD2", vars={"HD2"})
+    net.add_node("link_2")
+    net.add_node("HD2_R_shared", label="HD2+flankR", vars={"HD2"})
+    for e in [("flankL", "HD1a"), ("flankL", "HD1b"),
+              ("HD1a", "link_1"), ("HD1b", "link_1"),
+              ("link_1", "HD2_shared"),
+              ("HD2_shared", "link_2"),
+              ("link_2", "HD2_R_shared")]:
+        net.add_edge(*e)
+    return net
+
+
+def single_one_composite_node() -> TestNetwork:
+    """A single composite var+flankL+flankR node with pure-flank chains on
+    each side. The graph genuinely has one allele; picker forces 2-allele
+    pair so picks-heuristic would mislabel. Mirrors AJB36-shape.
+
+    flankL — flankL — composite(HD1+HD2+flankL+flankR) — flankR — flankR
+    """
+    net = TestNetwork(name="single_one_composite_node", expected="single")
+    net.add_node("flankL_1", label="flankL")
+    net.add_node("flankL_2", label="flankL")
+    net.add_node("composite", label="HD1+HD2+flankL+flankR",
+                  vars={"HD1", "HD2"})
+    net.add_node("flankR_1", label="flankR")
+    net.add_node("flankR_2", label="flankR")
+    for e in [("flankL_1", "flankL_2"), ("flankL_2", "composite"),
+              ("composite", "flankR_1"), ("flankR_1", "flankR_2")]:
+        net.add_edge(*e)
+    return net
+
+
 def separate() -> TestNetwork:
     """Two completely disjoint flank-HD-flank chains."""
     net = TestNetwork(name="separate", expected="separate")
@@ -225,8 +367,14 @@ def separate() -> TestNetwork:
 # All clean cases, grouped by ground truth
 CLEAN_CASES = [
     closed_bubble,
+    closed_bubble_with_connector_joints,
+    closed_bubble_ag17_shape,
+    closed_bubble_long_flank_chain,
+    closed_bubble_long_unlabeled_to_flank,
+    closed_bubble_var_spine_shared,
     open_bubble_case1,
     open_bubble_case2,
     complex_case1, complex_case2, complex_case3, complex_case4, complex_case5,
     separate,
+    single_one_composite_node,
 ]
