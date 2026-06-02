@@ -100,6 +100,85 @@ def parse_gfa(gfa_path: str
     return sequences, depths, edges, endpoints
 
 
+def parse_contigs_paths(path: str) -> dict[str, list[str]]:
+    """Parse SPAdes contigs.paths. Returns {contig_name: [seg_id, ...]}.
+
+    Format (modern SPAdes):
+        NODE_1_length_5000_cov_45.6
+        12+,3-,45+;
+        78+,9-;
+        NODE_1_length_5000_cov_45.6'                   ← RC variant
+        45-,3+,12-
+        ...
+
+    Each contig has 1+ subpaths (semicolon-separated) of `seg_id±` tokens.
+    We strip orientation marks and return the union of all visited seg IDs
+    (orientation-insensitive). RC entries (trailing `'`) are merged into
+    their parent contig.
+    """
+    walks: dict[str, list[str]] = {}
+    cur: str | None = None
+    with open(path) as fh:
+        for raw in fh:
+            line = raw.strip()
+            if not line: continue
+            if cur is None:
+                cur = line.rstrip("'")                          # strip RC marker
+                walks.setdefault(cur, [])
+            else:
+                for chunk in line.replace(";", ",").split(","):
+                    seg = chunk.rstrip("+-").strip()
+                    if seg:
+                        walks[cur].append(seg)
+                cur = None
+    return walks
+
+
+def contig_seeds_for_locus(
+        contig_blast_tsvs: list[str],
+        contigs_paths_file: str,
+        min_pid: float = 80.0,
+        min_alnlen: int = 100,
+) -> set[str]:
+    """Identify GFA segments anchored by any contig that BLAST-hits the locus.
+
+    Reads outfmt-6 contig-BLAST TSVs (qseqid sseqid pident length ...),
+    keeps subjects (sseqid = contig names) with pident ≥ min_pid AND
+    length ≥ min_alnlen. Maps those contigs → segments via contigs.paths.
+    Returns the union of segments across all locus-bearing contigs.
+    """
+    import os
+    if not os.path.exists(contigs_paths_file):
+        return set()
+    walks = parse_contigs_paths(contigs_paths_file)
+    locus_contigs: set[str] = set()
+    for path in contig_blast_tsvs:
+        if not os.path.exists(path): continue
+        with open(path) as fh:
+            for ln in fh:
+                f = ln.rstrip("\n").split("\t")
+                if len(f) < 4: continue
+                try:
+                    pid = float(f[2]); ln_ = int(f[3])
+                except ValueError: continue
+                if pid >= min_pid and ln_ >= min_alnlen:
+                    locus_contigs.add(f[1])
+    segs: set[str] = set()
+    for c in locus_contigs:
+        # SPAdes contigs.paths may name contigs without prefix; also
+        # strip the trailing _cov_X.X if header has it. Try both forms.
+        if c in walks:
+            segs.update(walks[c])
+            continue
+        # Heuristic: tolerate suffix differences
+        cn = c.rstrip("'")
+        for k, v in walks.items():
+            if k == cn or k.startswith(cn + "_") or cn.startswith(k + "_"):
+                segs.update(v)
+                break
+    return segs
+
+
 def bfs_expand_segments(seeds: set[str], adj_und: dict[str, set[str]],
                          n_hops: int) -> set[str]:
     """N-hop BFS in the GFA undirected adjacency, returns the reachable set."""
@@ -193,6 +272,18 @@ def _try_one_pass(seeds: set[str], all_edges: set[frozenset],
     res["_provenance"] = provenance
     res["_nhood"] = nhood
     res["_var_per_node"] = var_per
+    res["_label_per_node"] = labels
+    # Adjacency over post-P1 nodes — needed by _emit_result to look up the
+    # exterior neighbors of each candidate path's endpoints (for the
+    # innermost-flank record).
+    _adj_pp: dict[str, set[str]] = {}
+    for e in edges_pp:
+        t = tuple(e)
+        if len(t) == 1: continue
+        a, b = t
+        _adj_pp.setdefault(a, set()).add(b)
+        _adj_pp.setdefault(b, set()).add(a)
+    res["_adj"] = _adj_pp
     return res
 
 
@@ -209,6 +300,7 @@ def find_alleles(
         var_proteins_ref: str | None = None,
         expected_var_tags: set[str] | None = None,
         locus_padding: int = 1500,
+        contig_seeds: set[str] | None = None,
 ) -> dict:
     """Run the full orchestrator. Returns a dict with the final classification
     and any emitted allele/chimera sequences:
@@ -236,11 +328,15 @@ def find_alleles(
         adj_und.setdefault(a, set()).add(b)
         adj_und.setdefault(b, set()).add(a)
 
-    # Seeds for the two phases
+    # Seeds for the two phases. Optional contig_seeds = GFA segments walked
+    # by SPAdes contigs that BLAST-hit the locus (HD/flank); used to anchor
+    # the BFS in samples where the labeler's segment-level hits split the
+    # locus across disconnected GFA components.
+    contig_seeds = set(contig_seeds or ())
     var_seeds = {s for s, hits in seg_labels.items()
-                 if any(h.kind == "var" for h in hits)}
+                 if any(h.kind == "var" for h in hits)} | contig_seeds
     flank_seeds = {s for s, hits in seg_labels.items()
-                   if any(h.kind == "flank" for h in hits)}
+                   if any(h.kind == "flank" for h in hits)} | contig_seeds
 
     def _accept(res: dict) -> bool:
         if res["class"] != "closed_bubble": return False
@@ -493,6 +589,39 @@ def _emit_result(res: dict, gfa_seqs: dict[str, str],
     prov = res.get("_provenance", {})
     var_per_node = res.get("_var_per_node", {})
     var_nodes = {n for n, v in var_per_node.items() if v}
+    # Label tokens per post-P1 node (set by directional_split). Carries
+    # the per-node tag string like "HD1+HD2" or "flankL"; empty for Uvars.
+    label_per_node = res.get("_label_per_node", {})
+    adj_pp = res.get("_adj", {})
+
+    def _is_flankL(n: str) -> bool:
+        return "flankL" in (label_per_node.get(n, "")).split("+")
+
+    def _is_flankR(n: str) -> bool:
+        return "flankR" in (label_per_node.get(n, "")).split("+")
+
+    def _innermost_flank_bounds(p: list[str]) -> tuple[str | None, str | None]:
+        """Find innermost flank-labeled nodes bracketing the candidate path.
+        Path nodes are bubble-internal (var + unlabeled); flank-labeled
+        nodes sit OUTSIDE the bubble, adjacent to its boundary. So we look
+        at each endpoint's exterior neighbors:
+            L_bound = a flankL-labeled neighbor of path[0]   (or None)
+            R_bound = a flankR-labeled neighbor of path[-1]  (or None)
+        Emission stays var-trimmed; this is a metadata record only."""
+        if not p: return (None, None)
+        L_bound = R_bound = None
+        for nb in adj_pp.get(p[0], ()):
+            if _is_flankL(nb): L_bound = nb; break
+        for nb in adj_pp.get(p[-1], ()):
+            if _is_flankR(nb): R_bound = nb; break
+        # Symmetric check (in case the path's "first" is actually flankR-side
+        # due to enumeration order from a different anchor): try swapping.
+        if L_bound is None and R_bound is None:
+            for nb in adj_pp.get(p[-1], ()):
+                if _is_flankL(nb): L_bound = nb; break
+            for nb in adj_pp.get(p[0], ()):
+                if _is_flankR(nb): R_bound = nb; break
+        return (L_bound, R_bound)
 
     def _seq_full(p): return _arm_sequence_for(p, prov, gfa_seqs)
 
@@ -538,23 +667,32 @@ def _emit_result(res: dict, gfa_seqs: dict[str, str],
     deduped_named = _dedup_named(raw, divergence_threshold)
     n = len(deduped_named)
 
-    # 4. Emit by post-dedup count. Compute length-weighted mean depth per allele.
+    # 4. Emit by post-dedup count. Compute length-weighted mean depth per allele
+    #    AND record the innermost-flank boundary nodes per allele (metadata
+    #    only — emitted sequence stays var-trimmed; the boundary tells the
+    #    consumer where the immediate flank context would extend to).
     depths = depths or {}
     cov_for = lambda raw_name: _path_mean_cov(path_by_name.get(raw_name, []), prov, depths)
+    bounds_for = lambda raw_name: _innermost_flank_bounds(path_by_name.get(raw_name, []))
+
     if n <= 1:
         if deduped_named:
             rn, rs = deduped_named[0]
             alleles = [("allele1", rs)]
             allele_cov = [cov_for(rn)]
+            extend_bounds = [bounds_for(rn)]
         else:
             alleles = []
             allele_cov = []
+            extend_bounds = []
     elif n == 2:
         alleles = [("allele1", deduped_named[0][1]), ("allele2", deduped_named[1][1])]
         allele_cov = [cov_for(deduped_named[0][0]), cov_for(deduped_named[1][0])]
+        extend_bounds = [bounds_for(deduped_named[0][0]), bounds_for(deduped_named[1][0])]
     else:
         alleles = [(f"chimera{i+1}", s) for i, (_, s) in enumerate(deduped_named)]
         allele_cov = [cov_for(rn) for rn, _ in deduped_named]
+        extend_bounds = [bounds_for(rn) for rn, _ in deduped_named]
 
     # Aggregate var tags hit by the surviving (post-dedup) candidates.
     surviving_tags: set[str] = set()
@@ -582,6 +720,7 @@ def _emit_result(res: dict, gfa_seqs: dict[str, str],
         "cov_filter_used": res.get("_cov_filter"),
         "alleles": alleles,
         "allele_cov": allele_cov,                                       # length-weighted DP:f: mean per allele
+        "extend_bounds": extend_bounds,                                 # per allele (innermost_flankL, innermost_flankR)
         "info": {k: v for k, v in res.items() if not k.startswith("_")
                  and k not in ("closed_arms", "dangling_arms", "var_components")},
     }

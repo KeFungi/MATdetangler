@@ -1128,34 +1128,61 @@ The bubble is a connected subgraph that may be:
 The classifier does NOT make structural assumptions about the bubble's
 internal shape. It just counts paths through it.
 
-### B.3. Anchors
+### B.3. Anchors (universal-leaf rule)
+
+An **anchor** is a bubble node that meets the outside world, defined
+purely by graph topology:
 
 ```
-L-anchor = bubble node adjacent to ANY flankL-tagged node (in flank-region)
-R-anchor = bubble node adjacent to ANY flankR-tagged node (in flank-region)
+anchor = bubble node n such that
+            n has ≥1 neighbor OUTSIDE the bubble  (any label)
+        OR  n has bubble-degree ≤ 1               (dead-end leaf)
 ```
 
-After P1+P2, every flank-tagged node is in the flank-region (composites
-are gone; pure flanks and inherited unlabeled connectors are flank-region).
-The anchor definition is one statement with no special cases.
+This generalizes the prior "flank-adjacent only" rule: flank-adjacent
+nodes still qualify (they have a flank-labeled neighbor outside the
+bubble), and Uvar dead-end leaves also qualify (they have ≤ 1 neighbor
+inside the bubble — bubble truncated by BFS hop limit, fragmented
+assembly, or chromosome end).
+
+L/R distinction is decorative — derived from flank labels when present
+— but does NOT gate arm enumeration:
+
+```
+flank_L_adj = anchors with a flankL-labeled outside neighbor
+flank_R_adj = anchors with a flankR-labeled outside neighbor
+```
+
+Anchors that are neither L- nor R-decorated are "bare leaves" — they
+get used as path endpoints with a different downstream label (dangling
+rather than closed; see B.4).
 
 ### B.4. Arms
 
-An **arm** is a distinct simple path through the bubble that:
+An **arm** is a var-bearing simple path between two distinct anchors,
+classified by its endpoint flank-status:
 
-1. Starts at an L-anchor or an R-anchor.
-2. Passes through ≥1 var-gene node.
-3. Either ends at an opposite-side anchor (**closed**) OR dead-ends in the
-   bubble (**dangling** — kept only if the path's var content is not
-   entirely already covered by some closed arm).
+```
+closed   = both anchors are flank-decorated, one on L side and
+           one on R side (a proper L→R locus walk)
+dangling = exactly one endpoint is flank-decorated (the other is a
+           bare leaf — one side anchored, other side dangling)
+ignored  = same-side (L→L, R→R) or leaf-only (no flank-adjacent
+           endpoint) — not biologically meaningful as arms
+```
+
+Single-node bridge: ONE var node that is adjacent to BOTH a flankL
+node AND a flankR node (a composite segment spanning the whole locus)
+counts as a closed arm of length 1.
 
 "Simple path" has its standard graph-theory meaning: no node revisit.
 This guarantees finite enumeration on cyclic bubbles.
 
-**No further dedup.** If two arms route through shared Uvar hubs in
-substantially different combinations, those ARE distinct arms — that's
-structural complexity, and it correctly drives the verdict toward
-'complexed'.
+**No further dedup at the classifier.** If two arms route through
+shared Uvar hubs in substantially different combinations, those ARE
+distinct arms — that's structural complexity and it correctly drives
+the verdict toward 'complexed'. (Sequence-level dedup happens later
+in `_emit_result`; see B.8.)
 
 ### B.5. Verdict
 
@@ -1319,10 +1346,18 @@ build sequences via provenance (orig_seg, start, end, strand)
 emit: allele1 / allele1+allele2 / chimera1..N (by post-dedup count)
     │
     ▼
-[per-allele depth + completeness]   ← derived from surviving candidates
+[per-allele depth + completeness + extend_bounds]
     allele_cov = length-weighted DP:f: mean per allele path
     surviving_tags = union of found_var_tags across survivors
     complete_var / complete_locus / locus_coverage
+    extend_bounds = per allele, the (innermost_flankL_node,
+                    innermost_flankR_node) — found by looking at
+                    each candidate path's endpoint EXTERIOR
+                    neighbors (flank nodes sit outside the bubble,
+                    adjacent to the boundary). Metadata only —
+                    emitted sequence stays var-trimmed; this gives
+                    the consumer the locus context markers without
+                    changing what's emitted.
 ```
 
 | post-dedup `n` | emitted records           | verdict (= origin) |
@@ -1380,6 +1415,10 @@ one k**. The output dict:
                        [("chimera1", "ACGT..."), ("chimera2", "ACGT..."), ...],
     "component_list":  list of emitted names (parallel to alleles),
     "allele_cov":      list[float],  # length-weighted DP:f: mean per allele
+    "extend_bounds":   list[(str|None, str|None)],
+                       # per allele, (innermost_flankL_node,
+                       # innermost_flankR_node). Either side is None if
+                       # no flank-labeled neighbor was found on that side.
     "basepair":        sum of emitted allele lengths,
 
     # Completeness (post-trim tblastn over surviving candidates)
@@ -1406,13 +1445,18 @@ one k**. The output dict:
 ```
 
 The driver in `test/_k53_new_pipeline/run_one.py` flattens this dict
-into a 20-column TSV row with header:
+into a 21-column TSV row with header:
 
 ```
 sample  k  bubble_type  components  complete_var  complete_locus  locus_coverage
 basepair  genome_cov  allele_cov  n_cand  n_dedup  divergent  n_hops_used  phase
 cov_filter_used  allele_lens  segments  segments_labeled  found_var_tags
+extend_bounds
 ```
+
+`extend_bounds` is encoded as `L:R;L:R;…` (one `L:R` pair per emitted
+allele, `;`-joined). `-` placeholder where no flank was reached on
+that side.
 
 To pick the **best K** across the per-k results, run `find_alleles()`
 once per k and apply a cross-k selection rule (preference order:

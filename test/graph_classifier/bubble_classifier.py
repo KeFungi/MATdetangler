@@ -95,31 +95,78 @@ def classify(nodes: set[str], edges: set[frozenset],
     bubble = bubble_bfs(adj, var_nodes, unlabeled)
     info["bubble_size"] = len(bubble)
 
-    # R2. ANCHORS — bubble nodes adjacent to flank-region members
-    L_anchors = {n for n in bubble if any(m in flankL for m in adj.get(n, ()))}
-    R_anchors = {n for n in bubble if any(m in flankR for m in adj.get(n, ()))}
-    info["n_L_anchors"] = len(L_anchors)
-    info["n_R_anchors"] = len(R_anchors)
+    # R2. ANCHORS — topological boundary of the bubble.
+    #
+    # Anchor = bubble node that meets the outside world, defined as either:
+    #   (a) has ≥1 neighbor OUTSIDE the bubble (covers flank-adjacent nodes
+    #       and any node whose neighbor isn't var/unlabeled-reachable), OR
+    #   (b) has bubble-degree ≤ 1 (dead-end leaf of the bubble subgraph)
+    #
+    # This is the universal-leaf rule: it generalizes the previous
+    # flank-adjacency rule (those nodes still qualify under (a)) and adds
+    # robustness when the BFS-expanded subgraph contains var content but
+    # no flank labels reached (chromosome ends, fragmented assemblies,
+    # truncated BFS). L/R distinction is decorative — derived from flank
+    # labels when present — but arm enumeration uses the universal set.
+    flank_L_adj = {n for n in bubble if any(m in flankL for m in adj.get(n, ()))}
+    flank_R_adj = {n for n in bubble if any(m in flankR for m in adj.get(n, ()))}
+    anchors: set[str] = set()
+    for n in bubble:
+        deg_in  = sum(1 for m in adj.get(n, ()) if m in bubble)
+        deg_out = sum(1 for m in adj.get(n, ()) if m not in bubble)
+        if deg_out > 0 or deg_in <= 1:
+            anchors.add(n)
+    # L/R labels for orientation diagnostics; not used for arm membership.
+    L_anchors = (anchors & flank_L_adj) or anchors
+    R_anchors = (anchors & flank_R_adj) or anchors
+    info["n_anchors"]   = len(anchors)
+    info["n_L_anchors"] = len(L_anchors & flank_L_adj)
+    info["n_R_anchors"] = len(R_anchors & flank_R_adj)
 
-    # R3. ARMS — closed (L→R) and dangling (one-sided with novel var content)
+    # R3. ARMS — simple paths between anchors, classified by endpoint flank status.
+    #
+    # Closed = path with one flankL-adjacent endpoint AND one flankR-adjacent
+    #          endpoint (a proper L→R locus walk).
+    # Dangling = path with one flank-adjacent endpoint and one bare-leaf
+    #            endpoint (one side anchored, other side dangling).
+    # Ignored: same-side paths (L→L, R→R) and leaf→leaf paths — not
+    #          biologically meaningful as arms.
+    def _is_closed_endpoints(p: list[str]) -> bool:
+        eps = {p[0], p[-1]}
+        return bool(eps & flank_L_adj) and bool(eps & flank_R_adj)
+
+    def _is_dangling_endpoints(p: list[str]) -> bool:
+        eps = {p[0], p[-1]}
+        any_flank = eps & (flank_L_adj | flank_R_adj)
+        any_leaf  = eps - (flank_L_adj | flank_R_adj)
+        return bool(any_flank) and bool(any_leaf)
+
     closed: dict[tuple, list[str]] = {}
-    for s in L_anchors:
-        for p in _enum_paths(adj, s, R_anchors, bubble):
-            if any(n in var_nodes for n in p):
+    dangling: dict[tuple, list[str]] = {}
+    for s in anchors:
+        for p in _enum_paths(adj, s, anchors - {s}, bubble):
+            if not any(n in var_nodes for n in p): continue
+            if _is_closed_endpoints(p):
                 closed.setdefault(_canonical(p), p)
-    for n in L_anchors & R_anchors & var_nodes:       # single-node bridge
+            elif _is_dangling_endpoints(p):
+                dangling.setdefault(_canonical(p), p)
+            # else: same-side or leaf-only — drop
+
+    # Single-node bridge: ONE var node that has BOTH flankL and flankR
+    # adjacency (a composite segment spanning the whole locus).
+    for n in anchors & flank_L_adj & flank_R_adj & var_nodes:
         closed.setdefault(_canonical([n]), [n])
 
     closed_var_union: set[str] = set()
     for p in closed.values():
         closed_var_union |= set(p) & var_nodes
 
-    dangling: dict[tuple, list[str]] = {}
-    for s in L_anchors | R_anchors:
-        if s in L_anchors and s in R_anchors: continue
-        opp = R_anchors if s in L_anchors else L_anchors
+    # Also collect _enum_dangling paths from flank anchors (those that
+    # dead-end inside the bubble — paths that never reach another anchor).
+    flank_anchored = anchors & (flank_L_adj | flank_R_adj)
+    for s in flank_anchored:
         for p in _enum_dangling(adj, s, bubble, var_nodes, closed_var_union):
-            if p[-1] in opp: continue
+            if p[-1] in flank_anchored and p[-1] != s: continue
             dangling.setdefault(_canonical(p), p)
 
     n_closed = len(closed); n_dangling = len(dangling)

@@ -84,28 +84,6 @@ Add a synthetic test case `case_uvar_bounded_bubble`:
 `Uvar — var — var — Uvar` with a parallel `Uvar — var — var — Uvar`
 and no flank nodes; expect `closed_bubble` with 2 arms.
 
-### BFS-from-both-sides fallback for the bubble classifier
-
-The Appendix-B classifier currently does P2 Bubble BFS by starting from
-all var nodes and walking through unlabeled connectors. If this fails
-to produce a usable bubble (zero var-bearing arms found between
-anchors), as a fallback, **also try BFS from the flanks** — start from
-pure-flank nodes and walk inward through unlabeled connectors until
-hitting a var node. The two BFS frontiers can meet somewhere in the
-middle; the bubble is then "everything in between."
-
-This helps cases where:
-  - Var nodes are very small / sparse and the unlabeled connector chain
-    dominates the bubble territory; var-only BFS terminates immediately
-    while the chain belongs to the bubble.
-  - Composite flanks contain the only var signal but the BFS from var
-    can't reach a flank because the composite IS the flank boundary
-    (and the var on it doesn't have unlabeled outward).
-
-Implementation: run flank-side BFS only when var-side BFS yields zero
-arms. Mark the merged set as the bubble; otherwise keep the current
-single-side BFS result.
-
 ### graph classifier
 develop robust graph classifier assumed flanks and var genes are determined; can be further generalized determine var genes and flank on the flight if var and/or flank is not known later;
 make an isolated graph classifier to test algorithm
