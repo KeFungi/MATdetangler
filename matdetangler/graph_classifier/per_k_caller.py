@@ -1242,63 +1242,228 @@ def _emit_result(res: dict, gfa_seqs: dict[str, str],
         )
         nd = len(local_dedup)
 
+        # Joint detection via multi-source BFS in the post-P1 graph.
+        # "Joints" are the cycle convergence points where ≥ 2 surviving
+        # arms meet when extended outward through the FULL graph — they
+        # are the topological boundary of the bubble's cycle, defined by
+        # graph structure alone, NOT by labels (so an unlabeled hub-node
+        # joint is detected just as well as a flank-labeled one).
+        #
+        # Each surviving arm's full walk = [joint_L, ..., arm_internal,
+        # ..., joint_R]. The emission FASTA uses the first-non-joint to
+        # last-non-joint slice (joints stripped at the ends only), then
+        # tblastn-trim. Dedup ranking + divergence compare still use
+        # `local_raw` (var-trimmed → HD-only slice) — emission is decoupled
+        # from dedup.
+        survivor_pre: dict[str, list[str]] = {
+            rn: list(local_path_pre.get(rn, []) or [])
+            for rn, _ in local_dedup
+        }
+        arm_internals: dict[str, set[str]] = {
+            rn: set(p) for rn, p in survivor_pre.items()
+        }
+
+        def _bfs_outward(src: str, exclude: set[str]) -> dict[str, tuple[int, str | None]]:
+            """BFS in adj_pp from src, never entering nodes in `exclude`.
+            Returns {node: (dist, prev)} for every node reached (incl. src)."""
+            visited: dict[str, tuple[int, str | None]] = {src: (0, None)}
+            front: list[str] = [src]
+            while front:
+                nxt: list[str] = []
+                for u in front:
+                    for v in adj_pp.get(u, ()):
+                        if v in visited or v in exclude: continue
+                        visited[v] = (visited[u][0] + 1, u)
+                        nxt.append(v)
+                front = nxt
+            return visited
+
+        # Per-arm BFS from each endpoint. For a single-node arm, both
+        # endpoints are the same node — one BFS, shared as L and R.
+        arm_bfs: dict[str, tuple[dict, dict]] = {}
+        for rn, p in survivor_pre.items():
+            if not p:
+                arm_bfs[rn] = ({}, {}); continue
+            excl_l = arm_internals[rn] - {p[0]}
+            vl = _bfs_outward(p[0], excl_l)
+            if len(p) == 1:
+                arm_bfs[rn] = (vl, vl)
+            else:
+                excl_r = arm_internals[rn] - {p[-1]}
+                vr = _bfs_outward(p[-1], excl_r)
+                arm_bfs[rn] = (vl, vr)
+
+        # Candidate joints: nodes reached by BFSes of ≥ 2 distinct arms,
+        # excluding any arm's internal nodes.
+        all_internal = set().union(*arm_internals.values()) if arm_internals else set()
+        joint_visits: dict[str, dict[str, int]] = {}
+        for rn, (vl, vr) in arm_bfs.items():
+            for n_id in (set(vl.keys()) | set(vr.keys())) - all_internal:
+                d_l = vl.get(n_id, (10**9, None))[0]
+                d_r = vr.get(n_id, (10**9, None))[0]
+                joint_visits.setdefault(n_id, {})[rn] = min(d_l, d_r)
+        joint_cands: dict[str, dict[str, int]] = {
+            n_id: dists for n_id, dists in joint_visits.items()
+            if len(dists) >= 2
+        }
+
+        def _trace(visits: dict[str, tuple[int, str | None]],
+                    target: str) -> list[str] | None:
+            """Reconstruct path from BFS source to `target` via `visits`."""
+            if target not in visits: return None
+            out: list[str] = []; cur: str | None = target
+            while cur is not None:
+                out.append(cur); cur = visits[cur][1]
+            return list(reversed(out))   # source at out[0], target at out[-1]
+
+        # Pick 2 joints by minimizing TOTAL walk length across all arms over
+        # the joint-pair. Picking simply by min(max_dist) tie-breaks badly
+        # in true closed-bubble graphs where ≥ 3 nodes hit the same max_dist
+        # (e.g., vietnam_BD1417 k45: {flankL_anchor, flankR_anchor,
+        # arm2_flankL_subseg} all at max=2). The flank anchors sit on
+        # opposite sides of the cycle (short walks); the false candidate is
+        # one arm's own flank sub-seg (only reachable from the OTHER arm by
+        # walking all the way around → long walks). Pair-total-length
+        # selection naturally prefers the short-walk pair.
+        #
+        # Restrict candidate set to the K smallest-max_dist nodes to bound
+        # the O(k²) pair enumeration; K = 20 is comfortably larger than any
+        # real-graph candidate count we've seen.
+        K_MAX = 20
+        sorted_j = sorted(joint_cands.keys(),
+                          key=lambda n: max(joint_cands[n].values()))
+        cand_set = sorted_j[:K_MAX]
+
+        def _pair_total(j_x: str, j_y: str) -> tuple[float, dict[str, tuple]]:
+            """Total walk length for (j_x, j_y) across all surviving arms.
+            Returns (total, per_arm_chosen_options). Each option is
+            (j_left_for_arm, j_right_for_arm, pl, pr) for multi-node arms,
+            or (j_a, j_b, pa, pb) for single-node arms. inf if any arm
+            can't reach both joints."""
+            total = 0; per_arm: dict[str, tuple] = {}
+            for rn, p in survivor_pre.items():
+                if not p:
+                    per_arm[rn] = (None, None, None, None); continue
+                vl, vr = arm_bfs[rn]
+                if len(p) == 1:
+                    pa = _trace(vl, j_x); pb = _trace(vl, j_y)
+                    if not pa or not pb: return float("inf"), {}
+                    per_arm[rn] = (j_x, j_y, pa, pb)
+                    total += len(pa) + len(pb) - 1
+                    continue
+                opts = []
+                for jl, jr in ((j_x, j_y), (j_y, j_x)):
+                    pl = _trace(vl, jl); pr = _trace(vr, jr)
+                    if pl and pr:
+                        opts.append((len(pl) + len(pr), jl, jr, pl, pr))
+                if not opts: return float("inf"), {}
+                opts.sort()
+                w, jl, jr, pl, pr = opts[0]
+                per_arm[rn] = (jl, jr, pl, pr)
+                total += w
+            return total, per_arm
+
+        chosen_joints: set[str] = set()
+        j_a: str | None = None
+        j_b: str | None = None
+        best_per_arm: dict[str, tuple] = {}
+        if len(survivor_pre) >= 2 and len(cand_set) >= 2:
+            best_total = float("inf")
+            for i in range(len(cand_set)):
+                for j in range(i + 1, len(cand_set)):
+                    j_x, j_y = cand_set[i], cand_set[j]
+                    total, per_arm = _pair_total(j_x, j_y)
+                    if total < best_total:
+                        best_total = total; j_a, j_b = j_x, j_y
+                        best_per_arm = per_arm
+            if j_a is not None:
+                chosen_joints.add(j_a); chosen_joints.add(j_b)
+        elif len(survivor_pre) >= 2 and len(cand_set) == 1:
+            j_a = cand_set[0]; chosen_joints.add(j_a)
+
+        def _flank_extend(p: list[str]) -> tuple[list[str], set[str]]:
+            """Legacy fallback when no joint pair exists (single-arm pool
+            or disconnected): prepend the L-side flank neighbor and append
+            the R-side flank neighbor of the arm endpoints. Returns the
+            extended walk AND the set of added neighbors (treated as
+            implicit joints for the non-joint emission slice)."""
+            walk = list(p); added: set[str] = set()
+            if not p: return walk, added
+            Lb_s = next((nb for nb in adj_pp.get(p[0],  ()) if _is_flankL(nb)), None)
+            Rb_e = next((nb for nb in adj_pp.get(p[-1], ()) if _is_flankR(nb)), None)
+            Lb_e = next((nb for nb in adj_pp.get(p[-1], ()) if _is_flankL(nb)), None)
+            Rb_s = next((nb for nb in adj_pp.get(p[0],  ()) if _is_flankR(nb)), None)
+            if Lb_s or Rb_e:
+                if Lb_s: walk.insert(0, Lb_s); added.add(Lb_s)
+                if Rb_e: walk.append(Rb_e);   added.add(Rb_e)
+            elif Lb_e or Rb_s:
+                if Rb_s: walk.insert(0, Rb_s); added.add(Rb_s)
+                if Lb_e: walk.append(Lb_e);   added.add(Lb_e)
+            return walk, added
+
+        # Build full_walk for every survivor.
+        full_walk: dict[str, list[str]] = {}
+        for rn, p in survivor_pre.items():
+            if not p:
+                full_walk[rn] = []; continue
+            if j_a is None:
+                walk, added = _flank_extend(p)
+                full_walk[rn] = walk
+                chosen_joints |= added
+                continue
+            vl, vr = arm_bfs[rn]
+            if j_b is None:
+                # Only one joint candidate — extend whichever side reaches it.
+                t_l = _trace(vl, j_a)
+                t_r = _trace(vr, j_a) if vr is not vl else None
+                if t_l and (not t_r or len(t_l) <= len(t_r)):
+                    full_walk[rn] = list(reversed(t_l))[:-1] + list(p)
+                elif t_r:
+                    full_walk[rn] = list(p) + t_r[1:]
+                else:
+                    walk, added = _flank_extend(p)
+                    full_walk[rn] = walk
+                    chosen_joints |= added
+                continue
+            # Two joints: reuse the per-arm pairing chosen by _pair_total
+            # so the global "min total walk length" decision drives every
+            # arm's individual walk too.
+            chosen = best_per_arm.get(rn)
+            if chosen is None:
+                walk, added = _flank_extend(p)
+                full_walk[rn] = walk
+                chosen_joints |= added
+                continue
+            jl, jr, pl, pr = chosen
+            if len(p) == 1:
+                # pl = [ep, ..., j_a]; pr = [ep, ..., j_b]
+                full_walk[rn] = list(reversed(pl)) + pr[1:]
+            else:
+                # pl = [p[0], ..., j_l]; pr = [p[-1], ..., j_r]
+                left_ext  = list(reversed(pl))[:-1]
+                right_ext = pr[1:]
+                full_walk[rn] = left_ext + list(p) + right_ext
+
         # seg_processor.directional_split now emits clean position-indexed
         # sub-node IDs ("{parent}#1", "{parent}#2", "{parent}#N"). The
         # provenance dict carries the coords for sequence materialization;
         # the IDs themselves stay coord-free for clean display in bubble.*.
-        # NOTE: emission FASTA is now first-non-joint→last-non-joint sliced,
-        # but the seg list reported here (→ result.tsv / bubble.*) is the
-        # FULL pre-trim arm PLUS the flank-bearing anchor neighbors at both
-        # endpoints, so bubble rendering shows the full anchor-to-anchor
-        # walk. We pick each anchor on the SIDE whose path-endpoint
-        # neighbors it, so the prepend/append direction matches the walk
-        # orientation (L_anchor before p[0], R_anchor after p[-1] — but
-        # swapped if pre is oriented R→L).
+        # `_segs` returns the FULL WALK (joint-to-joint) so result.tsv /
+        # bubble.* show the complete bubble cycle. Emission FASTA uses the
+        # non-joint slice (joints stripped at the ends) — see below.
         def _segs(rn):
-            pre = list(local_path_pre.get(rn, ()))
-            walk: list[str] = list(pre)
-            if pre:
-                # Find a flankL-bearing neighbor on the p[0] side and a
-                # flankR-bearing neighbor on the p[-1] side; if reversed
-                # (rare — path enumeration started from the other anchor),
-                # swap the prepend/append slots.
-                Lb_at_start = next((nb for nb in adj_pp.get(pre[0],  ()) if _is_flankL(nb)), None)
-                Rb_at_end   = next((nb for nb in adj_pp.get(pre[-1], ()) if _is_flankR(nb)), None)
-                Lb_at_end   = next((nb for nb in adj_pp.get(pre[-1], ()) if _is_flankL(nb)), None)
-                Rb_at_start = next((nb for nb in adj_pp.get(pre[0],  ()) if _is_flankR(nb)), None)
-                if Lb_at_start or Rb_at_end:                  # natural orientation
-                    if Lb_at_start: walk.insert(0, Lb_at_start)
-                    if Rb_at_end:   walk.append(Rb_at_end)
-                elif Lb_at_end or Rb_at_start:                # reversed orientation
-                    if Rb_at_start: walk.insert(0, Rb_at_start)
-                    if Lb_at_end:   walk.append(Lb_at_end)
             out, seen = [], set()
-            for sub in walk:
+            for sub in full_walk.get(rn, []):
                 if sub not in prov: continue
                 if sub in seen: continue
                 seen.add(sub); out.append(sub)
             return out
 
-        # Emission sequence: for each surviving candidate, emit the sequence
-        # from "first non-joint seg" to "last non-joint seg" of its PRE-TRIM
-        # arm, then tblastn-trim to the var window (same padding rule as
-        # dedup-time trim). "joint" = a post-P1 node that appears in two or
-        # more candidate arm paths within this pool — typically the bubble's
-        # anchor/fork nodes shared by sibling arms. Internal joints (if any)
-        # are kept; only end-joints are stripped. Dedup ranking + divergence
-        # comparison still use `local_raw` (var-trimmed → HD-only slice).
-        all_pre_paths = list(local_path_pre.values())
-        node_counts: dict[str, int] = {}
-        for pth in all_pre_paths:
-            for n in set(pth):
-                node_counts[n] = node_counts.get(n, 0) + 1
-        joints: set[str] = {n for n, c in node_counts.items() if c >= 2}
-
         def _nonjoint_slice(rn) -> list[str]:
-            pre = local_path_pre.get(rn, []) or []
-            nj  = [i for i, n in enumerate(pre) if n not in joints]
-            if not nj: return list(pre)
-            return pre[nj[0]: nj[-1] + 1]
+            walk = full_walk.get(rn, [])
+            nj = [i for i, n in enumerate(walk) if n not in chosen_joints]
+            if not nj: return list(walk)
+            return walk[nj[0]: nj[-1] + 1]
 
         def _emit_seq(rn) -> str:
             return _arm_sequence_for(_nonjoint_slice(rn), prov, gfa_seqs)

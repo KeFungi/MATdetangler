@@ -377,11 +377,101 @@ def emit_png_paired(arms: list[list[str]], arm_names: list[str], labels: dict[st
     # Top row = (N-1)/2, bottom row = -(N-1)/2. Plenty of headroom so the
     # outermost rows don't clip on annotations.
     ys = [(N - 1) / 2.0 - i for i in range(N)]
-    def positions(path, y):
-        n = len(path)
-        if n < 2: return [(0.5, y)]
-        return [(i / (n - 1), y) for i in range(n)]
-    row_pos = [positions(arm, ys[i]) for i, arm in enumerate(arms)]
+
+    def _is_flank_only(lab: str, want: str) -> bool:
+        toks = [t for t in lab.split("+") if t]
+        return bool(toks) and all(t.startswith("flank") for t in toks) and want in toks
+
+    def _connection(a_node: str, b_node: str) -> str | None:
+        """Returns 'same' (solid black, identical IDs across rows),
+        'flank' (dashed gray, different IDs sharing a flank side label),
+        or None (no connection)."""
+        if a_node == b_node: return "same"
+        la = labels.get(a_node, ""); lb = labels.get(b_node, "")
+        for side in ("flankL", "flankR"):
+            if _is_flank_only(la, side) and _is_flank_only(lb, side):
+                return "flank"
+        return None
+
+    # Build anchor pairs between every consecutive row pair: for row i and
+    # row i+1, decide which (idx_in_i, idx_in_i+1) pairs of nodes get a
+    # homology line, AND should share the same x-coord. Anchors are
+    # selected greedily L→R, prioritizing same-ID matches over flank-only
+    # matches, and skipping pairs that would cross already-placed anchors
+    # (preserves order monotonicity along the row).
+    def _anchor_pairs(a: list[str], b: list[str]) -> list[tuple[int, int, str]]:
+        # Same-ID anchors only (drawn as solid black lines). Flank-side
+        # "dashed" anchors were removed at user request — visual clutter
+        # without much value.
+        used_b: set[int] = set()
+        pairs: list[tuple[int, int, str]] = []
+        b_idx_by_id: dict[str, list[int]] = {}
+        for j, n in enumerate(b): b_idx_by_id.setdefault(n, []).append(j)
+        last_j = -1
+        for i, n in enumerate(a):
+            cands = [j for j in b_idx_by_id.get(n, []) if j > last_j and j not in used_b]
+            if not cands: continue
+            j = cands[0]
+            pairs.append((i, j, "same"))
+            used_b.add(j); last_j = j
+        return pairs
+
+    row_anchors: list[list[tuple[int, int, str]]] = []
+    if N >= 2:
+        for k in range(N - 1):
+            row_anchors.append(_anchor_pairs(arms[k], arms[k + 1]))
+    else:
+        row_anchors = []
+
+    # Compute per-row x-positions such that anchored nodes (in adjacent
+    # rows) share the same x. We solve top-down: row 0 is laid out evenly,
+    # then row 1 is laid out to honor row 0's anchored x's, then row 2
+    # honors row 1's, etc.
+    def _row_xs_even(n: int) -> list[float]:
+        if n < 2: return [0.5]
+        return [i / (n - 1) for i in range(n)]
+
+    def _row_xs_aligned(n_b: int,
+                         pairs: list[tuple[int, int, str]],
+                         xs_a: list[float]) -> list[float]:
+        """Layout row b. For each (i, j) anchor, x_b[j] = xs_a[i]. Between
+        anchors, distribute b's remaining nodes evenly in the gap."""
+        if n_b == 0: return []
+        if not pairs: return _row_xs_even(n_b)
+        xs_b = [None] * n_b
+        for (i, j, _) in pairs:
+            xs_b[j] = xs_a[i]
+        # Anchor boundary indices (sorted by b-index)
+        b_anch = sorted([j for (_, j, _) in pairs])
+        # Fill left of first anchor — spread from 0 to first_x.
+        first_b = b_anch[0]
+        first_x = xs_b[first_b]
+        for k in range(first_b):
+            xs_b[k] = first_x * (k / first_b) if first_b > 0 else first_x
+        # Fill right of last anchor
+        last_b = b_anch[-1]
+        last_x = xs_b[last_b]
+        for k in range(last_b + 1, n_b):
+            xs_b[k] = last_x + (1.0 - last_x) * ((k - last_b) / (n_b - last_b))
+        # Fill between consecutive anchors
+        for a, c in zip(b_anch[:-1], b_anch[1:]):
+            x_a, x_c = xs_b[a], xs_b[c]
+            gap = c - a
+            for k in range(a + 1, c):
+                xs_b[k] = x_a + (x_c - x_a) * ((k - a) / gap)
+        # Sanity: any None means an unconstrained run — fill linearly
+        for k in range(n_b):
+            if xs_b[k] is None: xs_b[k] = k / max(1, n_b - 1)
+        # Clamp to [0, 1] for safety
+        return [max(0.0, min(1.0, x)) for x in xs_b]
+
+    xs_rows: list[list[float]] = []
+    xs_rows.append(_row_xs_even(len(arms[0])))
+    for k in range(1, N):
+        xs_rows.append(_row_xs_aligned(len(arms[k]),
+                                         row_anchors[k - 1] if k - 1 < len(row_anchors) else [],
+                                         xs_rows[k - 1]))
+    row_pos = [[(xs_rows[i][j], ys[i]) for j in range(len(arms[i]))] for i in range(N)]
     palette = ["#3b6db8", "#d97a3a", "#5e9c64", "#a463b5", "#c7503f",
                "#1f8a8a", "#8a6f2e", "#5b5f96"]
     row_colors = [palette[i % len(palette)] for i in range(N)]
@@ -394,36 +484,14 @@ def emit_png_paired(arms: list[list[str]], arm_names: list[str], labels: dict[st
                 else "#cfe8ff" if has_flank
                 else "#ffffff")
 
-    def _is_flank_only(lab: str, want: str) -> bool:
-        toks = [t for t in lab.split("+") if t]
-        return bool(toks) and all(t.startswith("flank") for t in toks) and want in toks
-
-    # Cross-row homology lines — drawn between EVERY consecutive pair of
-    # rows. Same logic as the old 2-arm version, just applied repeatedly.
+    # Cross-row homology lines: SOLID BLACK between rows for same-ID
+    # anchors (the segs are literally the same graph node across rows).
     if N >= 2:
-        OUTER = {"flankL": "first", "flankR": "last"}
         for k in range(N - 1):
-            a, b = arms[k], arms[k + 1]
             pa, pb = row_pos[k], row_pos[k + 1]
-            ids_a: dict[str, int] = {}
-            for i, n in enumerate(a): ids_a.setdefault(n, i)
-            ids_b: dict[str, int] = {}
-            for j, n in enumerate(b): ids_b.setdefault(n, j)
-            shared = set(ids_a) & set(ids_b)
-            for node in shared:
-                i, j = ids_a[node], ids_b[node]
+            for (i, j, _) in row_anchors[k]:
                 ax.plot([pa[i][0], pb[j][0]], [pa[i][1], pb[j][1]],
-                        color="#9aa0a6", lw=0.9, ls="--", zorder=0)
-            for want in ("flankL", "flankR"):
-                ia = [i for i, n in enumerate(a) if _is_flank_only(labels.get(n, ""), want)]
-                ib = [j for j, n in enumerate(b) if _is_flank_only(labels.get(n, ""), want)]
-                if not ia or not ib: continue
-                if any(a[i] in shared for i in ia): continue
-                if any(b[j] in shared for j in ib): continue
-                pick = (lambda xs: xs[0]) if OUTER[want] == "first" else (lambda xs: xs[-1])
-                i = pick(ia); j = pick(ib)
-                ax.plot([pa[i][0], pb[j][0]], [pa[i][1], pb[j][1]],
-                        color="#9aa0a6", lw=0.9, ls="--", zorder=0)
+                        color="black", lw=1.0, ls="-", zorder=0)
 
     # Draw each row: backbone + boxes + row label
     for i, (arm, name, color, pos) in enumerate(zip(arms, arm_names, row_colors, row_pos)):
@@ -599,14 +667,23 @@ def run(sample: str, gfa: str, primary_alleles_fa: str, queries_dir: str, outdir
         return out
 
     def _ref_vartag_order() -> list[str]:
-        """Read the protein query FASTA in queries_dir; return tags in file
-        order. Falls back to row 0's fingerprint if the file is absent."""
-        import os
-        candidates = [
-            os.path.join(queries_dir, "variable_proteins.fasta"),
-            os.path.join(queries_dir, "Suilu4_HDs.fasta"),
-        ]
-        for qp in candidates:
+        """Return var tags in LOCUS POSITION order (L→R along the locus
+        reference), read from queries/manifest.json's variable_genes array.
+        Falls back to the variable_proteins.fasta file order, then to row
+        0's fingerprint, if no manifest is found."""
+        import os, json
+        mf = os.path.join(queries_dir, "manifest.json")
+        if os.path.exists(mf):
+            try:
+                with open(mf) as fh: m = json.load(fh)
+                genes = m.get("variable_genes") or []
+                # Sort by `start` (lower position = earlier on locus = L-side).
+                order = [g["name"] for g in sorted(genes, key=lambda g: g.get("start", 0))]
+                if order: return order
+            except Exception:
+                pass
+        for qp in (os.path.join(queries_dir, "variable_proteins.fasta"),
+                   os.path.join(queries_dir, "Suilu4_HDs.fasta")):
             if not os.path.exists(qp): continue
             order = []
             with open(qp) as fh:
@@ -618,16 +695,45 @@ def run(sample: str, gfa: str, primary_alleles_fa: str, queries_dir: str, outdir
             if order: return order
         return _vartag_seq(arm_paths[0]) if arm_paths else []
 
+    def _flank_endpoint_sides(arm: list[str]) -> tuple[str | None, str | None]:
+        """Return (label at first flank-bearing node, label at last
+        flank-bearing node) — either "flankL", "flankR", or None when
+        no flank-only token is present at that end."""
+        def _side(lab: str) -> str | None:
+            toks = [t for t in (lab or "").split("+") if t]
+            if not toks: return None
+            flanks = [t for t in toks if t.startswith("flank")]
+            if not flanks: return None
+            # If both flankL and flankR sit on the same node, the node is
+            # ambiguous and contributes no orientation signal.
+            if "flankL" in flanks and "flankR" in flanks: return None
+            return flanks[0]
+        first = None; last = None
+        for n in arm:
+            s = _side(merged_labels.get(n, ""))
+            if s is not None: first = s; break
+        for n in reversed(arm):
+            s = _side(merged_labels.get(n, ""))
+            if s is not None: last = s; break
+        return first, last
+
     if arm_paths:
         ref_order = _ref_vartag_order()
-        if ref_order:
-            for i in range(len(arm_paths)):
-                vs = _vartag_seq(arm_paths[i])
-                if not vs: continue
-                # If the row's tag-order is the reverse of the reference's
-                # restriction to tags actually present in this row → flip.
+        for i in range(len(arm_paths)):
+            vs = _vartag_seq(arm_paths[i])
+            if len(vs) >= 2 and ref_order:
+                # PRIMARY: var-tag order (locus-position) — works whenever
+                # the arm has ≥ 2 distinct var tags.
                 ref_in_row = [t for t in ref_order if t in vs]
                 if vs == list(reversed(ref_in_row)):
+                    arm_paths[i] = list(reversed(arm_paths[i]))
+            else:
+                # FALLBACK: with < 2 var tags the var-tag order has no
+                # direction signal (reversed([HD1]) == [HD1] is a no-op).
+                # Use FLANK ENDPOINT order instead: flankR-then-flankL
+                # along the walk means the row is upside-down → flip.
+                first_side, last_side = _flank_endpoint_sides(arm_paths[i])
+                if first_side == "flankR" and last_side == "flankL":
                     arm_paths[i] = list(reversed(arm_paths[i]))
     arm1 = arm_paths[0] if arm_paths else []
     arm2 = arm_paths[1] if len(arm_paths) > 1 else None

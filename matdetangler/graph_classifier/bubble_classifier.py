@@ -154,25 +154,34 @@ def classify(nodes: set[str], edges: set[frozenset],
 
     # R2. ANCHORS — topological boundary of the bubble.
     #
-    # Anchor = bubble node that meets the outside world, defined as either:
-    #   (a) has ≥1 neighbor OUTSIDE the bubble (covers flank-adjacent nodes
-    #       and any node whose neighbor isn't var/unlabeled-reachable), OR
-    #   (b) has bubble-degree ≤ 1 (dead-end leaf of the bubble subgraph)
+    # Anchor = bubble node that meets the outside world. Two rules:
+    #   (a) has ≥ 1 neighbor OUTSIDE the bubble (the common case — typically
+    #       a flank-labeled node).
+    #   (b) has bubble-degree ≤ 1 (dead-end leaf of the bubble subgraph) —
+    #       FALLBACK ONLY, applied when (a) yields fewer than 2 anchors.
     #
-    # This is the universal-leaf rule: it generalizes the previous
-    # flank-adjacency rule (those nodes still qualify under (a)) and adds
-    # robustness when the BFS-expanded subgraph contains var content but
-    # no flank labels reached (chromosome ends, fragmented assemblies,
-    # truncated BFS). L/R distinction is decorative — derived from flank
-    # labels when present — but arm enumeration uses the universal set.
+    # (b) recovers anchors for fragmented assemblies / chromosome-boundary
+    # samples where rule (a) gives no flank-labeled neighbor (lost-label or
+    # truncated-graph cases). Otherwise it can promote tiny graph artifacts
+    # (e.g. a 90 bp leaf hanging off a Y-fork) to anchor status, adding a
+    # spurious dangling arm and downgrading the verdict from closed_bubble
+    # to complexed. The fallback gate keeps the fragmented-recovery case
+    # while leaving clean closed-bubble samples alone.
     flank_L_adj = {n for n in bubble if any(m in flankL for m in adj.get(n, ()))}
     flank_R_adj = {n for n in bubble if any(m in flankR for m in adj.get(n, ()))}
     anchors: set[str] = set()
     for n in bubble:
-        deg_in  = sum(1 for m in adj.get(n, ()) if m in bubble)
         deg_out = sum(1 for m in adj.get(n, ()) if m not in bubble)
-        if deg_out > 0 or deg_in <= 1:
+        if deg_out > 0:
             anchors.add(n)
+    if len(anchors) < 2:
+        # Fallback: admit bubble-leaf nodes as anchors so a fragmented
+        # assembly can still produce arm candidates.
+        for n in bubble:
+            if n in anchors: continue
+            deg_in = sum(1 for m in adj.get(n, ()) if m in bubble)
+            if deg_in <= 1:
+                anchors.add(n)
     # L/R labels for orientation diagnostics; not used for arm membership.
     L_anchors = (anchors & flank_L_adj) or anchors
     R_anchors = (anchors & flank_R_adj) or anchors
