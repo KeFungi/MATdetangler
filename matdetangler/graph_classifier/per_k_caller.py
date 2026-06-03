@@ -1246,33 +1246,97 @@ def _emit_result(res: dict, gfa_seqs: dict[str, str],
         # sub-node IDs ("{parent}#1", "{parent}#2", "{parent}#N"). The
         # provenance dict carries the coords for sequence materialization;
         # the IDs themselves stay coord-free for clean display in bubble.*.
+        # NOTE: emission FASTA is now first-non-joint→last-non-joint sliced,
+        # but the seg list reported here (→ result.tsv / bubble.*) is the
+        # FULL pre-trim arm PLUS the flank-bearing anchor neighbors at both
+        # endpoints, so bubble rendering shows the full anchor-to-anchor
+        # walk. We pick each anchor on the SIDE whose path-endpoint
+        # neighbors it, so the prepend/append direction matches the walk
+        # orientation (L_anchor before p[0], R_anchor after p[-1] — but
+        # swapped if pre is oriented R→L).
         def _segs(rn):
+            pre = list(local_path_pre.get(rn, ()))
+            walk: list[str] = list(pre)
+            if pre:
+                # Find a flankL-bearing neighbor on the p[0] side and a
+                # flankR-bearing neighbor on the p[-1] side; if reversed
+                # (rare — path enumeration started from the other anchor),
+                # swap the prepend/append slots.
+                Lb_at_start = next((nb for nb in adj_pp.get(pre[0],  ()) if _is_flankL(nb)), None)
+                Rb_at_end   = next((nb for nb in adj_pp.get(pre[-1], ()) if _is_flankR(nb)), None)
+                Lb_at_end   = next((nb for nb in adj_pp.get(pre[-1], ()) if _is_flankL(nb)), None)
+                Rb_at_start = next((nb for nb in adj_pp.get(pre[0],  ()) if _is_flankR(nb)), None)
+                if Lb_at_start or Rb_at_end:                  # natural orientation
+                    if Lb_at_start: walk.insert(0, Lb_at_start)
+                    if Rb_at_end:   walk.append(Rb_at_end)
+                elif Lb_at_end or Rb_at_start:                # reversed orientation
+                    if Rb_at_start: walk.insert(0, Rb_at_start)
+                    if Lb_at_end:   walk.append(Lb_at_end)
             out, seen = [], set()
-            for sub in local_path.get(rn, ()):
+            for sub in walk:
                 if sub not in prov: continue
                 if sub in seen: continue
                 seen.add(sub); out.append(sub)
             return out
 
+        # Emission sequence: for each surviving candidate, emit the sequence
+        # from "first non-joint seg" to "last non-joint seg" of its PRE-TRIM
+        # arm, then tblastn-trim to the var window (same padding rule as
+        # dedup-time trim). "joint" = a post-P1 node that appears in two or
+        # more candidate arm paths within this pool — typically the bubble's
+        # anchor/fork nodes shared by sibling arms. Internal joints (if any)
+        # are kept; only end-joints are stripped. Dedup ranking + divergence
+        # comparison still use `local_raw` (var-trimmed → HD-only slice).
+        all_pre_paths = list(local_path_pre.values())
+        node_counts: dict[str, int] = {}
+        for pth in all_pre_paths:
+            for n in set(pth):
+                node_counts[n] = node_counts.get(n, 0) + 1
+        joints: set[str] = {n for n, c in node_counts.items() if c >= 2}
+
+        def _nonjoint_slice(rn) -> list[str]:
+            pre = local_path_pre.get(rn, []) or []
+            nj  = [i for i, n in enumerate(pre) if n not in joints]
+            if not nj: return list(pre)
+            return pre[nj[0]: nj[-1] + 1]
+
+        def _emit_seq(rn) -> str:
+            return _arm_sequence_for(_nonjoint_slice(rn), prov, gfa_seqs)
+
+        # Pre-build raw emission seqs (no tblastn trim yet) for survivors,
+        # then apply tblastn trim once over the survivor set. Falls back to
+        # the raw emission seq if tblastn drops the candidate.
+        emit_raw: list[tuple[str, str]] = [(rn, _emit_seq(rn))
+                                            for rn, _ in local_dedup]
+        if var_proteins_ref and emit_raw:
+            emit_trimmed, _ef, _es = _tblastn_trim_each(
+                emit_raw, var_proteins_ref, locus_padding)
+            emit_by = {n: s for n, s in emit_trimmed}
+            # Fallback: keep raw emission for any survivor tblastn dropped.
+            for rn, rs in emit_raw:
+                emit_by.setdefault(rn, rs)
+        else:
+            emit_by = dict(emit_raw)
+
         # Per-pool label scheme: n=1→allele1, n=2→allele1/2, n>=3→chimeraN
         if nd <= 1:
             if local_dedup:
-                rn, rs = local_dedup[0]
-                alleles_p     = [(f"{prefix}allele1", rs)]
+                rn, _ = local_dedup[0]
+                alleles_p     = [(f"{prefix}allele1", emit_by.get(rn, ""))]
                 cov_p         = [_cov(rn)]
                 bounds_p      = [_bnds(rn)]
                 segs_p        = [_segs(rn)]
             else:
                 alleles_p = []; cov_p = []; bounds_p = []; segs_p = []
         elif nd == 2:
-            alleles_p = [(f"{prefix}allele1", local_dedup[0][1]),
-                          (f"{prefix}allele2", local_dedup[1][1])]
+            alleles_p = [(f"{prefix}allele1", emit_by.get(local_dedup[0][0], "")),
+                          (f"{prefix}allele2", emit_by.get(local_dedup[1][0], ""))]
             cov_p     = [_cov(local_dedup[0][0]), _cov(local_dedup[1][0])]
             bounds_p  = [_bnds(local_dedup[0][0]), _bnds(local_dedup[1][0])]
             segs_p    = [_segs(local_dedup[0][0]), _segs(local_dedup[1][0])]
         else:
-            alleles_p = [(f"{prefix}chimera{k+1}", s)
-                         for k, (_, s) in enumerate(local_dedup)]
+            alleles_p = [(f"{prefix}chimera{k+1}", emit_by.get(rn, ""))
+                         for k, (rn, _) in enumerate(local_dedup)]
             cov_p    = [_cov(rn) for rn, _ in local_dedup]
             bounds_p = [_bnds(rn) for rn, _ in local_dedup]
             segs_p   = [_segs(rn) for rn, _ in local_dedup]

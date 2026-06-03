@@ -88,38 +88,55 @@ def directional_split(
             provenance[seg] = (seg, 0, slen, "+")
             continue
 
-        if len(hits) == 1:
-            h = hits[0]
+        # Merge consecutive same-tag hits into a single "run" — multiple
+        # blastn/tblastn fragments of the same gene/flank on one segment
+        # collapse to one labeled sub-segment, so a composite seg like
+        # flankL/HD1/HD1/HD2/HD2/flankR (6 hits) becomes 4 sub-segments
+        # (flankL/HD1/HD2/flankR) with no unlabeled "linker" sub-segments
+        # between adjacent same-tag fragments.
+        runs: list[Hit] = []
+        for h in hits:
+            if runs and runs[-1].tag == h.tag:
+                prev = runs[-1]
+                runs[-1] = Hit(tag=prev.tag, kind=prev.kind,
+                                start=prev.start,
+                                end=max(prev.end, h.end),
+                                strand=prev.strand)
+            else:
+                runs.append(h)
+
+        if len(runs) == 1:
+            r = runs[0]
             new_nodes.add(seg)
-            new_labels[seg] = h.tag
-            if h.kind == "var":
-                new_vars.setdefault(seg, set()).update(h.tag.split("+"))
+            new_labels[seg] = r.tag
+            if r.kind == "var":
+                new_vars.setdefault(seg, set()).update(r.tag.split("+"))
             seg_subs[seg] = [seg]
             side_to_sub[(seg, "L")] = seg
             side_to_sub[(seg, "R")] = seg
-            # For a single-hit segment, the sub-region IS the whole segment.
-            provenance[seg] = (seg, 0, slen, h.strand)
+            # Single run = single label = whole segment.
+            provenance[seg] = (seg, 0, slen, r.strand)
             continue
 
-        # Multi-hit: split into a chain of pure sub-segments — ONE piece per
-        # hit, boundaries at the midpoints between adjacent hits. Each
-        # sub-segment carries exactly the tag of its hit. Sub-node IDs are
-        # clean position-indexed (#1, #2, …); coords live in provenance.
+        # Multi-run: split into a chain of pure sub-segments — ONE piece per
+        # unique-label run, boundaries at midpoints between adjacent runs.
+        # Sub-node IDs are clean position-indexed (#1, #2, …); coords live
+        # in provenance.
         boundaries = [0]
-        for i in range(len(hits) - 1):
-            boundaries.append((hits[i].end + hits[i + 1].start) // 2)
+        for i in range(len(runs) - 1):
+            boundaries.append((runs[i].end + runs[i + 1].start) // 2)
         boundaries.append(slen)
         subs: list[str] = []
-        for i, h in enumerate(hits):
+        for i, r in enumerate(runs):
             sub_id = f"{seg}#{i + 1}"
             new_nodes.add(sub_id)
-            new_labels[sub_id] = h.tag
-            if h.kind == "var":
-                new_vars.setdefault(sub_id, set()).update(h.tag.split("+"))
+            new_labels[sub_id] = r.tag
+            if r.kind == "var":
+                new_vars.setdefault(sub_id, set()).update(r.tag.split("+"))
             subs.append(sub_id)
             if i > 0:
                 new_edges.add(frozenset((subs[i - 1], sub_id)))
-            provenance[sub_id] = (seg, boundaries[i], boundaries[i + 1], h.strand)
+            provenance[sub_id] = (seg, boundaries[i], boundaries[i + 1], r.strand)
         seg_subs[seg] = subs
         side_to_sub[(seg, "L")] = subs[0]
         side_to_sub[(seg, "R")] = subs[-1]

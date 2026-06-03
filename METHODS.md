@@ -254,49 +254,61 @@ and **unlabeled connector** (neither). The input may also contain **composite**
 nodes (a single GFA segment with BOTH flank and var tags, e.g. `HD1+flankL`). The
 preprocessing removes composites and identifies the bubble:
 
-**P1. Directional split — all-split rule (one sub-segment per BLAST hit)**
+**P1. Directional split — unique-label rule (one sub-segment per unique-tag run)**
 
-Each multi-hit segment becomes a chain of sub-segments, one per hit,
-ordered along the parent segment's stored strand:
+Each multi-hit segment becomes a chain of sub-segments, one per
+**unique-tag run** (a maximal consecutive group of hits sharing the same
+tag), ordered along the parent segment's stored strand:
 
 ```
-n_hits = 0   →  1 piece (parent segment kept whole, no label)
-n_hits = 1   →  1 piece (parent kept whole, labeled with the single hit's tag)
-n_hits ≥ 2   →  one sub-segment per hit, ordered by hit start coordinate.
+n_runs = 0   →  1 piece (parent segment kept whole, no label)
+n_runs = 1   →  1 piece (parent kept whole, labeled with the run's tag)
+n_runs ≥ 2   →  one sub-segment per run, ordered by run start coordinate.
                  Boundaries between adjacent sub-segments are placed at
-                 the midpoint of the inter-hit gap. Each sub-segment
-                 carries exactly the tag of its hit.
+                 the midpoint of the inter-run gap (between the previous
+                 run's max end and the next run's min start). Each
+                 sub-segment carries exactly the run's tag.
 ```
+
+A "run" merges consecutive same-tag hits into one labeled region. So a
+segment with hits `[flankL, HD1, HD1, HD2, HD2, flankR]` (6 raw hits)
+becomes 4 sub-segments `[flankL]#1 / [HD1]#2 / [HD2]#3 / [flankR]#4`,
+**not** 6 — there are no unlabeled "linker" sub-segments between adjacent
+fragments of the same gene. (Runs only merge consecutive hits with the
+same tag; a same-tag pair separated by a different-tag hit stays as two
+distinct sub-segments, preserving tandem-arrangement signal.)
 
 Sub-node IDs are coordinate-free: `{parent_seg}#1`, `{parent_seg}#2`, …
-(1-based, ordered by hit start). The provenance dict
+(1-based, ordered by run start). The provenance dict
 `{sub_id: (parent_seg, start, end, strand)}` carries the actual
 coordinates for sequence materialization downstream — IDs stay clean for
 display in `bubble.txt` / `bubble.gfa` / `bubble.png`.
 
-Example (the AG3-class composite with four hits on one segment):
+Example (the IBUG-14475 k45 closed bubble, parent 18741825 with 6 raw hits):
 
 ```
-input:  ─── flankL + HD1 + HD2 + flankR composite (5906 bp) ───
-              ↑ flankL hit at [0-352]
-              ↑ HD1 hit at [993-2943]
-              ↑ HD2 hit at [3156-5048]
-              ↑ flankR hit at [5585-5906]
+input:  ─── flankL + 2×HD1 + 2×HD2 + flankR composite (6148 bp) ───
+              ↑ flankL hit at [0-421]
+              ↑ HD1    hits at [993-1986], [2404-3067]   (merged into one run)
+              ↑ HD2    hits at [3615-4284], [4498-5518]  (merged into one run)
+              ↑ flankR hit at [6024-6148]
 P1 out: ─── [flankL]#1 ─── [HD1]#2 ─── [HD2]#3 ─── [flankR]#4 ───
-            (4 pieces, one per hit; boundaries at midpoints)
+            (4 pieces, one per unique-label run; boundaries at midpoints)
 ```
 
 After P1, every node carries exactly one label (one tag per sub-segment).
 No composites remain. Each neighbor edge of the original segment attaches
-to the sub-segment whose hit-range covers its connection end (GFA L-line
+to the sub-segment whose run covers its connection end (GFA L-line
 orientation gives this).
 
-History note: an earlier `n_label`-based 3-piece-max rule was tried
-(collapsing same-tag hits and absorbing middle labels into one piece);
-reverted in favor of the all-split rule because the simpler one-piece-per-
-hit form lets the BFS / classifier reason about each individual HD
-detection separately and produces cleaner verdict transitions across
-fork-explosion samples.
+History note: earlier rules tried (a) `n_label`-based 3-piece-max
+(collapsed same-tag hits and absorbed middle labels into one piece) and
+(b) one piece per raw BLAST hit (the all-split rule). The current
+unique-label-run rule is the middle ground: each gene/flank contributes
+exactly one labeled sub-segment regardless of how many BLAST fragments it
+produced, but multiple genes stay separate. This keeps bubble visualization
+clean (no unlabeled linker pieces between adjacent same-tag fragments)
+while still letting the BFS / classifier distinguish multi-gene composites.
 
 **P2. Bubble BFS** — starting from every pure-var node, BFS through unlabeled-only
 neighbors. The set of nodes reached forms the **bubble**; everything else is
@@ -555,19 +567,20 @@ candidate paths from classifier
     │  ordered paths    → subpath [first_var, last_var]
     │  var_components   → only var-labeled nodes
     │
-    │  (pre-trim path kept SEPARATELY — used downstream for
-    │   graph-level flank-presence check — §3.7 "Completeness")
+    │  (pre-trim path kept SEPARATELY — used by the emission step below
+    │   and by graph-level flank-presence check — §3.7 "Completeness")
     ▼
-build sequences via provenance (orig_seg, start, end, strand)
+build var-trimmed sequences via provenance (orig_seg, start, end, strand)
+    │  → used for DEDUP RANKING + HD-only divergence compare ONLY
     │
     ▼
-[tblastn locus-trim]                ← when var_proteins_ref provided
+[tblastn locus-trim] for dedup compare   ← when var_proteins_ref provided
     │  one tblastn pass: var_proteins → all candidates as multi-fasta
     │  per candidate: trim to [min(sstart)−padding, max(send)+padding]
     │  drop candidates with no HD hits
     │  collect found_var_tags per surviving candidate
     ▼
-[completeness-first dedup]
+[completeness-first dedup]              ← runs on var-trimmed → HD-only slice
     │  RANK candidates by (smaller = better):
     │    (−cl_level, −cv_level, diploid_dist)
     │  where cl_level/cv_level are PER-CANDIDATE tri-states (0/1/2):
@@ -581,6 +594,22 @@ build sequences via provenance (orig_seg, start, end, strand)
     │      ed_rc  = edlib.align(q, RC(t),     mode=HW, task=distance)
     │      identity = 1 − min(ed_fwd, ed_rc) / |q|
     │    threshold default = 1% (collapse if identity ≥ 99%)
+    ▼
+[EMIT-time re-trim: non-joint slice + tblastn-trim]
+    │  For each dedup-surviving candidate (separately from the dedup compare):
+    │    1. "joints" = nodes that appear in ≥ 2 of the pool's pre-trim paths
+    │       (the bubble's anchor/fork nodes shared by sibling arms; for a
+    │        single-arm pool joints = ∅).
+    │    2. Slice the pre-trim path from FIRST non-joint node to LAST
+    │       non-joint node (end-joints stripped; internal joints preserved).
+    │    3. Build the emitted sequence from the sliced path via provenance.
+    │    4. Apply tblastn locus-trim (same padding as the dedup-compare trim).
+    │  Rationale: dedup decides WHICH alleles survive (on the var-window
+    │  content where the biology lives); emission decides WHAT we write to
+    │  primary_alleles.fasta (the arm-unique content of each surviving
+    │  allele, with flank-adjacent joint nodes excluded but the
+    │  HD-flanking padding preserved). Falls back to the raw non-joint
+    │  sequence if tblastn drops the survivor.
     ▼
 emit: allele1 / allele1+allele2 / chimera1..N (by post-dedup count)
     │
@@ -788,9 +817,17 @@ The output dict:
     # Segment provenance
     "segments":        sorted list[str],   # union of orig-seg IDs across alleles
     "segments_labeled": list[(seg_id, "tag1+tag2+...")],
-    "allele_segments": list[list[str]],    # PER allele, list of sub-node IDs
-                                            # ({parent}#N format — see §3.3)
-                                            # written to picks.tsv col 8
+    "allele_segments": list[list[str]],    # PER allele, sub-node IDs along the
+                                            # FULL anchor-to-anchor walk: the
+                                            # closed_arm path PLUS the
+                                            # flank-bearing anchor neighbors on
+                                            # either end. ({parent}#N format —
+                                            # see §3.3.) This is the "fullwalk"
+                                            # view used by bubble.txt / bubble.gfa
+                                            # / bubble.png; it is INTENTIONALLY
+                                            # longer than the emitted FASTA
+                                            # sequence (which is the non-joint
+                                            # slice + tblastn-trim — see §3.8).
     "subnode_seqs":    {sub_id: dna_seq},  # materialized sub-node sequences
                                             # for IDs referenced by emitted
                                             # alleles; run_per_k writes to

@@ -241,15 +241,15 @@ layouts.
 
 | file | what |
 |---|---|
-| **`primary_alleles.fasta`** | **The picked allele set** — from the chosen K. Headers `<sample>_<k>_<allele_name>`. Empty if every per-K result errored. Sub-3 kb fragments dropped by the `--min-allele-bp` floor (default 3000). |
-| **`longest_alleles.fasta`** | Union of `<K>/longest_alleles.fasta` across all per-K iterations: length-first RC-aware dedup at the same divergence threshold (5%) over the full candidate pool. Each header is prefixed with the source k (e.g. `k45_…`, `k53_…`). Wider net than `primary_alleles.fasta` — useful for downstream variant analyses that want every distinct LONGEST walk we ever observed across the BFS grid. |
+| **`primary_alleles.fasta`** | **The picked allele set** — from the chosen K. Headers `<sample>_<k>_<allele_name>`. Empty if every per-K result errored. Sub-3 kb fragments dropped by the `--min-allele-bp` floor (default 3000). Each sequence is the "arm-unique" content: the first-non-joint to last-non-joint slice of the closed_arm (anchor/fork nodes shared with siblings excluded at the ends), then tblastn locus-trimmed. Dedup ranking and divergence compare run on the var-trimmed → HD-only slice separately — see METHODS.md §3.8. |
+| **`longest_alleles.fasta`** | Union of `<K>/longest_alleles.fasta` across all per-K iterations: length-first RC-aware dedup at the same divergence threshold (1%) over the full candidate pool. Each header is prefixed with the source k (e.g. `k45_…`, `k53_…`). Wider net than `primary_alleles.fasta` — useful for downstream variant analyses that want every distinct LONGEST walk we ever observed across the BFS grid. |
 | `picks.tsv` | legacy 12-col schema, one row per emitted allele: `sample, allele, origin, k, type, len, from_contig, segments, cov, n_variable_genes, has_both_flanks, is_degHD`. Compatible with downstream `graph_paths` + `summary_table`. |
 | `picks_summary.tsv` | sample-level new schema, one row per sample: `sample, k_chosen, bubble_type, n_dedup, complete_var, complete_locus, locus_coverage, basepair, genome_cov, allele_cov, n_cand, extend_bounds, components, all_k_tried`. |
 | `<K>/result.tsv` | per-K caller output, 22 columns. See METHODS.md §3.11. `complete_var` and `complete_locus` are now tri-state integers (0=none, 1=some, 2=all). |
 | `<K>/alleles.fasta` | per-K picked allele/chimera records (post-dedup, post-`min_allele_bp` floor, HD-only divergence comparison). |
 | `<K>/longest_alleles.fasta` | length-first RC-aware dedup over the candidate pool — keeps the LONGEST representative of each edit-distance class (HD-only divergence). |
 | `<K>/candidate_allele.fasta` | every emission across all BFS iterations (forensic record). Headers `cand{id}_h{nhop}_n{net}_c{cov}_{verdict}_{name}`. |
-| `<K>/subnode_seqs.fasta` | materialized sub-segment sequences for `{parent}#N` IDs (after P1 directional split). Consumed by `graph_paths` to draw bubble outputs with coord-free IDs. |
+| `<K>/subnode_seqs.fasta` | materialized sub-segment sequences for `{parent}#N` IDs (after P1 directional split — one sub-segment per unique-label run on the parent; see METHODS.md §3.3). Consumed by `graph_paths` to draw bubble outputs with coord-free IDs. |
 | `<K>/seg_label_hits.tsv` | labeler output for this K. |
 | `<K>/{flankL,flankR}_blastn.tsv`, `<K>/HD_tblastn.tsv` | full outfmt-6 BLAST caches. |
 | `genome_cov_spades_k<K>.txt` | per-k genome coverage (median of contigs.fasta `cov_` ≥ 5 kb). Bp-equivalent units. |
@@ -260,7 +260,7 @@ layouts.
 | `identity.tsv` | MAFFT id_pct + aln_frac on the picks. |
 | `identity_consensus.tsv` | MAFFT id_pct + aln_frac on the read-derived consensus pair. `--make-consensus` only. |
 | `consensus_qc.tsv` | tblastn(proteins → consensus) + blastn(flanks → consensus); per-allele `complete` flag. `--make-consensus` only. |
-| `bubble.txt` | two-line labeled walks (one per allele). |
+| `bubble.txt` | two-line labeled walks (one per allele) — full anchor-to-anchor walk including the flank-bearing anchor nodes at both endpoints (the "fullwalk"). This is intentionally wider than `primary_alleles.fasta` (which is the non-joint slice + tblastn-trim). |
 | `bubble.png` | matplotlib render: each allele on its own row; flank-bearing nodes linked by dashed gray homology lines. |
 | `bubble.gfa` / `.dot` / `.tsv` | sub-GFA + Graphviz + edge list for any network library. |
 | `summary.tsv` (per-sample) | one row, same schema as the aggregate's row for this sample. |
