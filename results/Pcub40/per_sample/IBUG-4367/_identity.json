@@ -1,1 +1,1 @@
-{"a1": "IBUG-4367_k53_allele1", "a2": "IBUG-4367_k53_allele2", "len_a1": 5899, "len_a2": 5721, "id_pct": 61.4, "aln_frac": 0.47, "distinct": true, "metric": "whole-allele"}
+{"a1": "IBUG-4367_k53_allele1", "a2": "IBUG-4367_k53_allele2", "len_a1": 5899, "len_a2": 5721, "id_pct": 63.5, "aln_frac": 0.46, "distinct": true, "metric": "whole-allele"}

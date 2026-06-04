@@ -1,0 +1,308 @@
+{
+  "args": {},
+  "sample": {
+    "all_k_tried": "k45,k53",
+    "allele1_complete": true,
+    "allele1_path_str": "1169361#1 (flankL) <-> 1169361#2 (NC_062999_HD1) <-> 1169361#3 (NC_062999_HD2) <-> 2700055 (flankR)",
+    "allele1_vs_allele2_aln_frac": 0.79,
+    "allele1_vs_allele2_id_pct": 62.2,
+    "allele2_complete": true,
+    "allele2_path_str": "511705#1 (NC_062999_HD1) <-> 511705#2 (NC_062999_HD2) <-> 2700055 (flankR)",
+    "allele_cov": [
+      7.5,
+      7.7
+    ],
+    "alleles": [
+      {
+        "allele": "allele1",
+        "cov": 7.5,
+        "from_contig": "-",
+        "has_both_flanks": true,
+        "is_degHD": false,
+        "k": "k45",
+        "len": 5139,
+        "n_variable_genes": "2/2",
+        "origin": "path",
+        "sample": "vietnam_BD1418",
+        "segments": [
+          "1169361#1",
+          "1169361#2",
+          "1169361#3",
+          "2700055"
+        ],
+        "type": "complete"
+      },
+      {
+        "allele": "allele2",
+        "cov": 7.7,
+        "from_contig": "-",
+        "has_both_flanks": false,
+        "is_degHD": false,
+        "k": "k45",
+        "len": 3229,
+        "n_variable_genes": "2/2",
+        "origin": "path",
+        "sample": "vietnam_BD1418",
+        "segments": [
+          "2700055",
+          "511705#2",
+          "511705#1"
+        ],
+        "type": "complete"
+      }
+    ],
+    "basepair": 8368,
+    "bubble_type": "open_bubble",
+    "complete_locus": 1,
+    "complete_var": 2,
+    "components": "allele1,allele2",
+    "extend_bounds": "1169361#1:2700055;-:2700055",
+    "finished_nhop": null,
+    "genome_cov": 14.59,
+    "k_chosen": "k45",
+    "locus_coverage": 1.0,
+    "n_cand": 2,
+    "n_dedup": 2,
+    "per_k_pick": {
+      "k45": {
+        "iter_id": "coff_h3",
+        "n_dedup": 2,
+        "net": "1",
+        "verdict": "open_bubble"
+      },
+      "k53": {
+        "iter_id": "coff_h3",
+        "n_dedup": 2,
+        "net": "1",
+        "verdict": "open_bubble"
+      }
+    },
+    "per_k_trace": {
+      "k45": [
+        {
+          "cls": "separate",
+          "cov_pass": "off",
+          "n_arms": 0,
+          "n_var": 5,
+          "nhood": 15,
+          "nhop": 3,
+          "seeds": "both"
+        },
+        {
+          "cls": "separate",
+          "cov_pass": "off",
+          "n_arms": 0,
+          "n_var": 5,
+          "nhood": 19,
+          "nhop": 4,
+          "seeds": "both"
+        },
+        {
+          "cls": "separate",
+          "cov_pass": "off",
+          "n_arms": 0,
+          "n_var": 5,
+          "nhood": 23,
+          "nhop": 5,
+          "seeds": "both"
+        },
+        {
+          "cls": "separate",
+          "cov_pass": "off",
+          "n_arms": 0,
+          "n_var": 5,
+          "nhood": 31,
+          "nhop": 6,
+          "seeds": "both"
+        },
+        {
+          "cls": "separate",
+          "cov_pass": "off",
+          "n_arms": 0,
+          "n_var": 5,
+          "nhood": 43,
+          "nhop": 7,
+          "seeds": "both"
+        },
+        {
+          "cls": "separate",
+          "cov_pass": "off",
+          "n_arms": 0,
+          "n_var": 5,
+          "nhood": 61,
+          "nhop": 8,
+          "seeds": "both"
+        },
+        {
+          "cls": "separate",
+          "cov_pass": "on",
+          "n_arms": 0,
+          "n_var": 5,
+          "nhood": 13,
+          "nhop": 3,
+          "seeds": "both"
+        },
+        {
+          "cls": "separate",
+          "cov_pass": "on",
+          "n_arms": 0,
+          "n_var": 5,
+          "nhood": 17,
+          "nhop": 4,
+          "seeds": "both"
+        },
+        {
+          "cls": "separate",
+          "cov_pass": "on",
+          "n_arms": 0,
+          "n_var": 5,
+          "nhood": 20,
+          "nhop": 5,
+          "seeds": "both"
+        },
+        {
+          "cls": "separate",
+          "cov_pass": "on",
+          "n_arms": 0,
+          "n_var": 5,
+          "nhood": 25,
+          "nhop": 6,
+          "seeds": "both"
+        },
+        {
+          "cls": "separate",
+          "cov_pass": "on",
+          "n_arms": 0,
+          "n_var": 5,
+          "nhood": 32,
+          "nhop": 7,
+          "seeds": "both"
+        },
+        {
+          "cls": "separate",
+          "cov_pass": "on",
+          "n_arms": 0,
+          "n_var": 5,
+          "nhood": 44,
+          "nhop": 8,
+          "seeds": "both"
+        }
+      ],
+      "k53": [
+        {
+          "cls": "separate",
+          "cov_pass": "off",
+          "n_arms": 0,
+          "n_var": 5,
+          "nhood": 10,
+          "nhop": 3,
+          "seeds": "both"
+        },
+        {
+          "cls": "separate",
+          "cov_pass": "off",
+          "n_arms": 0,
+          "n_var": 5,
+          "nhood": 12,
+          "nhop": 4,
+          "seeds": "both"
+        },
+        {
+          "cls": "separate",
+          "cov_pass": "off",
+          "n_arms": 0,
+          "n_var": 5,
+          "nhood": 13,
+          "nhop": 5,
+          "seeds": "both"
+        },
+        {
+          "cls": "separate",
+          "cov_pass": "off",
+          "n_arms": 0,
+          "n_var": 5,
+          "nhood": 16,
+          "nhop": 6,
+          "seeds": "both"
+        },
+        {
+          "cls": "separate",
+          "cov_pass": "off",
+          "n_arms": 0,
+          "n_var": 5,
+          "nhood": 18,
+          "nhop": 7,
+          "seeds": "both"
+        },
+        {
+          "cls": "separate",
+          "cov_pass": "off",
+          "n_arms": 0,
+          "n_var": 5,
+          "nhood": 23,
+          "nhop": 8,
+          "seeds": "both"
+        },
+        {
+          "cls": "separate",
+          "cov_pass": "on",
+          "n_arms": 0,
+          "n_var": 5,
+          "nhood": 9,
+          "nhop": 3,
+          "seeds": "both"
+        },
+        {
+          "cls": "separate",
+          "cov_pass": "on",
+          "n_arms": 0,
+          "n_var": 5,
+          "nhood": 10,
+          "nhop": 4,
+          "seeds": "both"
+        },
+        {
+          "cls": "separate",
+          "cov_pass": "on",
+          "n_arms": 0,
+          "n_var": 5,
+          "nhood": 10,
+          "nhop": 5,
+          "seeds": "both"
+        },
+        {
+          "cls": "separate",
+          "cov_pass": "on",
+          "n_arms": 0,
+          "n_var": 5,
+          "nhood": 13,
+          "nhop": 6,
+          "seeds": "both"
+        },
+        {
+          "cls": "separate",
+          "cov_pass": "on",
+          "n_arms": 0,
+          "n_var": 5,
+          "nhood": 14,
+          "nhop": 7,
+          "seeds": "both"
+        },
+        {
+          "cls": "separate",
+          "cov_pass": "on",
+          "n_arms": 0,
+          "n_var": 5,
+          "nhood": 17,
+          "nhop": 8,
+          "seeds": "both"
+        }
+      ]
+    },
+    "sample": "vietnam_BD1418"
+  },
+  "version": {
+    "describe": "51102df-dirty",
+    "git_hash": "51102df59a0a55f7313066878794d9c30eee0a21"
+  }
+}

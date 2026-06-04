@@ -122,38 +122,43 @@ The estimate `D_k` is consumed by `matdetangler.run_per_k` (depth-filter band +
 per-allele depth) and by `matdetangler.pick_k` (diploid-balance tie-break).
 
 ```
-# 2.05  Median of SPAdes contigs.fasta `cov_` field, restricted to contigs >= L bp
-#       where L = --contig-depth-size-cut (default 5000). Reads-free.
-contigs_fa = "$SPADES_DIR/k${K}/contigs.fasta"
-covs = [float(cov_) for h in headers(contigs_fa)
-        for (length, cov_) in [parse('length_(\d+)_cov_(\d+(?:\.\d+)?)', h)]
-        if length >= --contig-depth-size-cut]
-D_k = median(covs) if covs else 0.0
+# 2.05  Median of the GFA's per-segment `DP:f:` (or KC:i:/RC:i: → count/length)
+#       across S-line segments >= L bp, where L = --contig-depth-size-cut
+#       (default 5000). Reads-free. Handles both .gfa and .gfa.gz transparently.
+gfa = "$SPADES_DIR/k${K}/assembly_graph_after_simplification.gfa[.gz]"
+depths = [DP for (seg_id, seq, tags) in S_lines(gfa)
+          if len(seq) >= --contig-depth-size-cut
+          for DP in [parse_depth_tag(tags)] if DP is not None]
+D_k = median(depths) if depths else 0.0
 write_to("genome_cov_spades_k${K}.txt", D_k)
-log("[k${K}] genome_cov = ${D_k} (median cov_ across contigs >= ${L} bp)")
+log("[k${K}] genome_cov = ${D_k} (median DP across GFA segments >= ${L} bp)")
 ```
 
 ### Rationale
 
-- **Reads-free.** SPAdes already computed contig coverage during assembly; there's no
+- **Reads-free.** SPAdes already computed segment coverage during assembly; there's no
   reason to re-map reads with bowtie2 just to recover it. The pipeline is reads-free
   through step 5 as a result; step 6 (`map_consensus`) is the first step that needs reads.
-- **Same units as GFA segment depths.** Both SPAdes contigs.fasta `cov_` and GFA `DP:f:`
-  segment depths are in bp-equivalent units (k-mer count divided by `(length - k + 1)`,
-  scaled by SPAdes to per-base coverage). So `D_k` is directly comparable to
-  per-segment depth in the per-K caller's depth filter (`[lo_mult × D_k, hi_mult × D_k]`).
-- **Median, not mean.** Contig depths have a heavy right tail from collapsed-repeat
-  short contigs (`cov_` up to ~10⁷ on 46 bp tips in real fungal data). Median is robust
+- **GFA-only — no `contigs.fasta` dependency.** All depth information needed lives in
+  the GFA's `DP:f:` tag. This makes archival demo bundles (`examples/<dataset>/<s>/k<k>/`)
+  with just the GFA fully reproducible — no separate contigs.fasta or pre-computed
+  cov file needed. .gfa.gz is read transparently.
+- **Same scale as downstream segment depths.** The per-segment `DP:f:` we median is the
+  same per-segment depth the per-K caller uses for its filter band
+  (`[lo_mult × D_k, hi_mult × D_k]`).
+- **Median, not mean.** Segment depths have a heavy right tail from collapsed-repeat
+  short segments (`DP:f:` up to ~10⁷ on 46 bp tips in real fungal data). Median is robust
   to those.
-- **Length filter at 5 kb.** Stays well within the noise-free regime; smaller contigs
+- **Length filter at 5 kb.** Stays well within the noise-free regime; smaller segments
   contribute too much variance from short-tip assembly artifacts. Tunable via
-  `--contig-depth-size-cut` if your assembly is unusually fragmented.
-- **PER k, not once per sample.** SPAdes coverage values are in k-mer-multiplicity ×
-  `R/(R-k+1)` units, so they DIFFER across k's for the same sample. The k=33 estimate is
-  ~25% higher than k=53 for R=150 bp reads. Computing per-k means the per-K caller's
-  filter band is automatically scaled to that k's depth distribution.
+  `--contig-depth-size-cut` if your assembly is unusually fragmented (flag name retained
+  for backward compatibility — applies to GFA segments now, not contigs).
+- **PER k, not once per sample.** SPAdes per-segment depth values are in
+  k-mer-multiplicity × `R/(R-k+1)` units, so they DIFFER across k's for the same sample.
+  The k=33 estimate is ~25% higher than k=53 for R=150 bp reads. Computing per-k means
+  the per-K caller's filter band is automatically scaled to that k's depth distribution.
 - **Cached as `genome_cov_spades_k<K>.txt`.** `--continue` reuses the cached value.
-- **What if no contig is long enough?** `D_k = 0.0`. The caller treats this as
+- **What if no segment is long enough?** `D_k = 0.0`. The caller treats this as
   "disable coverage-based filter" — BFS still runs, the depth filter just never fires.
   The picker's diploid-balance tie-break becomes a no-op.
 

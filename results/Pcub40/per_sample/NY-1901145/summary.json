@@ -1,0 +1,377 @@
+{
+  "args": {},
+  "sample": {
+    "all_k_tried": "k45,k53",
+    "allele1_complete": true,
+    "allele1_path_str": "18411 (flankL) <-> 37630272 <-> 37594883#3 (NC_062999_HD1) <-> 37594883#2 (NC_062999_HD2) <-> 37594883#1 (flankR) <-> 39109504 (flankR)",
+    "allele1_vs_allele2_aln_frac": 0.92,
+    "allele1_vs_allele2_id_pct": 60.8,
+    "allele2_complete": true,
+    "allele2_path_str": "18411 (flankL) <-> 37630270 (flankL) <-> 38196809 (NC_062999_HD1) <-> 39082284 <-> 38196799 <-> 17733193 <-> 39116708 <-> 3199271 <-> 14290026 (NC_062999_HD2) <-> 37594881 <-> 1110024 <-> 39109504 (flankR)",
+    "allele_cov": [
+      31.7,
+      39.1,
+      9.2,
+      75.3
+    ],
+    "alleles": [
+      {
+        "allele": "chimera1",
+        "cov": 31.7,
+        "from_contig": "-",
+        "has_both_flanks": false,
+        "is_degHD": false,
+        "k": "k45",
+        "len": 6053,
+        "n_variable_genes": "2/2",
+        "origin": "graph",
+        "sample": "NY-1901145",
+        "segments": [
+          "18411",
+          "37630272",
+          "37594883#3",
+          "37594883#2",
+          "37594883#1",
+          "39109504"
+        ],
+        "type": "complete"
+      },
+      {
+        "allele": "chimera2",
+        "cov": 39.1,
+        "from_contig": "-",
+        "has_both_flanks": false,
+        "is_degHD": false,
+        "k": "k45",
+        "len": 6930,
+        "n_variable_genes": "2/2",
+        "origin": "graph",
+        "sample": "NY-1901145",
+        "segments": [
+          "18411",
+          "37630270",
+          "38196809",
+          "39082284",
+          "38196799",
+          "17733193",
+          "39116708",
+          "3199271",
+          "14290026",
+          "37594881",
+          "1110024",
+          "39109504"
+        ],
+        "type": "complete"
+      },
+      {
+        "allele": "chimera3",
+        "cov": 9.2,
+        "from_contig": "-",
+        "has_both_flanks": false,
+        "is_degHD": false,
+        "k": "k45",
+        "len": 5682,
+        "n_variable_genes": "2/2",
+        "origin": "graph",
+        "sample": "NY-1901145",
+        "segments": [
+          "18411",
+          "37630272",
+          "2535847#1",
+          "2535847#2",
+          "2535847#3",
+          "1110024",
+          "39109504"
+        ],
+        "type": "complete"
+      },
+      {
+        "allele": "chimera4",
+        "cov": 75.3,
+        "from_contig": "-",
+        "has_both_flanks": false,
+        "is_degHD": false,
+        "k": "k45",
+        "len": 9866,
+        "n_variable_genes": "2/2",
+        "origin": "graph",
+        "sample": "NY-1901145",
+        "segments": [
+          "18411",
+          "37630270",
+          "38196809",
+          "39082284",
+          "38196799",
+          "39083514",
+          "38945976",
+          "12732731",
+          "39081327",
+          "2969121",
+          "35764973",
+          "39116720",
+          "39116714",
+          "39116708",
+          "3199271",
+          "14290026",
+          "37594881",
+          "1110024",
+          "39109504"
+        ],
+        "type": "complete"
+      }
+    ],
+    "basepair": 28531,
+    "bubble_type": "complexed",
+    "complete_locus": 2,
+    "complete_var": 2,
+    "components": "chimera1,chimera2,chimera3,chimera4",
+    "extend_bounds": "-:37594883#1;37630270:-;2535847#1:-;37630270:-",
+    "finished_nhop": null,
+    "genome_cov": 65.88,
+    "k_chosen": "k45",
+    "locus_coverage": 1.0,
+    "n_cand": 4,
+    "n_dedup": 4,
+    "per_k_pick": {
+      "k45": {
+        "iter_id": "coff_h6",
+        "n_dedup": 4,
+        "net": "1",
+        "verdict": "complexed"
+      },
+      "k53": {
+        "iter_id": "coff_h3",
+        "n_dedup": 3,
+        "net": "1",
+        "verdict": "complexed"
+      }
+    },
+    "per_k_trace": {
+      "k45": [
+        {
+          "cls": "separate",
+          "cov_pass": "off",
+          "n_arms": 0,
+          "n_var": 17,
+          "nhood": 49,
+          "nhop": 3,
+          "seeds": "both"
+        },
+        {
+          "cls": "separate",
+          "cov_pass": "off",
+          "n_arms": 0,
+          "n_var": 17,
+          "nhood": 71,
+          "nhop": 4,
+          "seeds": "both"
+        },
+        {
+          "cls": "separate",
+          "cov_pass": "off",
+          "n_arms": 0,
+          "n_var": 17,
+          "nhood": 100,
+          "nhop": 5,
+          "seeds": "both"
+        },
+        {
+          "cls": "separate",
+          "cov_pass": "off",
+          "n_arms": 0,
+          "n_var": 17,
+          "nhood": 153,
+          "nhop": 6,
+          "seeds": "both"
+        },
+        {
+          "cls": "separate",
+          "cov_pass": "off",
+          "n_arms": 0,
+          "n_var": 17,
+          "nhood": 225,
+          "nhop": 7,
+          "seeds": "both"
+        },
+        {
+          "cls": "separate",
+          "cov_pass": "off",
+          "n_arms": 0,
+          "n_var": 17,
+          "nhood": 339,
+          "nhop": 8,
+          "seeds": "both"
+        },
+        {
+          "cls": "open_bubble",
+          "cov_pass": "on",
+          "n_arms": 2,
+          "n_var": 4,
+          "nhood": 27,
+          "nhop": 3,
+          "seeds": "both"
+        },
+        {
+          "cls": "complexed",
+          "cov_pass": "on",
+          "n_arms": 4,
+          "n_var": 4,
+          "nhood": 44,
+          "nhop": 4,
+          "seeds": "both"
+        },
+        {
+          "cls": "complexed",
+          "cov_pass": "on",
+          "n_arms": 4,
+          "n_var": 4,
+          "nhood": 65,
+          "nhop": 5,
+          "seeds": "both"
+        },
+        {
+          "cls": "complexed",
+          "cov_pass": "on",
+          "n_arms": 4,
+          "n_var": 4,
+          "nhood": 100,
+          "nhop": 6,
+          "seeds": "both"
+        },
+        {
+          "cls": "complexed",
+          "cov_pass": "on",
+          "n_arms": 4,
+          "n_var": 4,
+          "nhood": 143,
+          "nhop": 7,
+          "seeds": "both"
+        },
+        {
+          "cls": "complexed",
+          "cov_pass": "on",
+          "n_arms": 4,
+          "n_var": 4,
+          "nhood": 217,
+          "nhop": 8,
+          "seeds": "both"
+        }
+      ],
+      "k53": [
+        {
+          "cls": "separate",
+          "cov_pass": "off",
+          "n_arms": 0,
+          "n_var": 18,
+          "nhood": 55,
+          "nhop": 3,
+          "seeds": "both"
+        },
+        {
+          "cls": "separate",
+          "cov_pass": "off",
+          "n_arms": 0,
+          "n_var": 18,
+          "nhood": 92,
+          "nhop": 4,
+          "seeds": "both"
+        },
+        {
+          "cls": "separate",
+          "cov_pass": "off",
+          "n_arms": 0,
+          "n_var": 18,
+          "nhood": 142,
+          "nhop": 5,
+          "seeds": "both"
+        },
+        {
+          "cls": "separate",
+          "cov_pass": "off",
+          "n_arms": 0,
+          "n_var": 18,
+          "nhood": 232,
+          "nhop": 6,
+          "seeds": "both"
+        },
+        {
+          "cls": "separate",
+          "cov_pass": "off",
+          "n_arms": 0,
+          "n_var": 18,
+          "nhood": 346,
+          "nhop": 7,
+          "seeds": "both"
+        },
+        {
+          "cls": "separate",
+          "cov_pass": "off",
+          "n_arms": 0,
+          "n_var": 18,
+          "nhood": 533,
+          "nhop": 8,
+          "seeds": "both"
+        },
+        {
+          "cls": "open_bubble",
+          "cov_pass": "on",
+          "n_arms": 2,
+          "n_var": 4,
+          "nhood": 28,
+          "nhop": 3,
+          "seeds": "both"
+        },
+        {
+          "cls": "complexed",
+          "cov_pass": "on",
+          "n_arms": 4,
+          "n_var": 4,
+          "nhood": 57,
+          "nhop": 4,
+          "seeds": "both"
+        },
+        {
+          "cls": "complexed",
+          "cov_pass": "on",
+          "n_arms": 4,
+          "n_var": 4,
+          "nhood": 89,
+          "nhop": 5,
+          "seeds": "both"
+        },
+        {
+          "cls": "complexed",
+          "cov_pass": "on",
+          "n_arms": 4,
+          "n_var": 4,
+          "nhood": 157,
+          "nhop": 6,
+          "seeds": "both"
+        },
+        {
+          "cls": "complexed",
+          "cov_pass": "on",
+          "n_arms": 4,
+          "n_var": 4,
+          "nhood": 232,
+          "nhop": 7,
+          "seeds": "both"
+        },
+        {
+          "cls": "complexed",
+          "cov_pass": "on",
+          "n_arms": 4,
+          "n_var": 4,
+          "nhood": 369,
+          "nhop": 8,
+          "seeds": "both"
+        }
+      ]
+    },
+    "sample": "NY-1901145"
+  },
+  "version": {
+    "describe": "51102df-dirty",
+    "git_hash": "51102df59a0a55f7313066878794d9c30eee0a21"
+  }
+}

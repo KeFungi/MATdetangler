@@ -30,23 +30,39 @@ CONTIG_NAMES = ("contigs.fasta", "final_contigs.fasta", "before_rr.fasta")
 GFA_NAME = "assembly_graph_after_simplification.gfa"
 
 def spades_k_paths(spades_dir: str, k: str) -> tuple[str | None, str | None]:
+    """Resolve (contigs_fasta, gfa) for one k under `spades_dir`. The pipeline
+    no longer requires contigs.fasta — when only the GFA is present (archival
+    GFA-only bundles like `examples/<dataset>/`), this returns (None, gfa)
+    and the downstream caller is expected to be contigs-free."""
     knum = k.lstrip("kK")
     for d in (os.path.join(spades_dir, f"k{knum}"),
               os.path.join(spades_dir, f"K{knum}")):
         if not os.path.isdir(d):
             continue
         gfa = os.path.join(d, GFA_NAME)
+        gz  = gfa + ".gz"
+        if not os.path.exists(gfa) and os.path.exists(gz):
+            gfa = gz
         if not os.path.exists(gfa):
             continue
+        # GFA found. Optionally pair it with a contigs.fasta if one exists;
+        # otherwise return (None, gfa) — graph_paths + run_per_k only need
+        # the GFA, and the wrapper's cov estimator is GFA-based.
         for cf in CONTIG_NAMES:
             p = os.path.join(d, cf)
             if os.path.exists(p):
                 return p, gfa
-    # final-k-only fallback: top-level GFA + contigs (what `spades.py -k 21,33,55` leaves)
+        return None, gfa
+    # final-k-only fallback: top-level GFA + optional contigs (what
+    # `spades.py -k 21,33,55` leaves).
     top_gfa = os.path.join(spades_dir, GFA_NAME)
+    top_gz  = top_gfa + ".gz"
+    if not os.path.exists(top_gfa) and os.path.exists(top_gz):
+        top_gfa = top_gz
     if os.path.exists(top_gfa):
         for cf in CONTIG_NAMES:
             p = os.path.join(spades_dir, cf)
             if os.path.exists(p):
                 return p, top_gfa
+        return None, top_gfa
     return None, None

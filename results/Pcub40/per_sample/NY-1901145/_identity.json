@@ -1,1 +1,1 @@
-{"a1": "NY-1901145_k45_chimera1", "a2": "NY-1901145_k45_chimera2", "len_a1": 6053, "len_a2": 6930, "id_pct": 63.4, "aln_frac": 0.56, "distinct": true, "metric": "whole-allele"}
+{"a1": "NY-1901145_k45_chimera1", "a2": "NY-1901145_k45_chimera2", "len_a1": 6053, "len_a2": 6930, "id_pct": 60.8, "aln_frac": 0.92, "distinct": true, "metric": "whole-allele"}

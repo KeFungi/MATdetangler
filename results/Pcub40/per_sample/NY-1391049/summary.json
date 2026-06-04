@@ -1,0 +1,114 @@
+{
+  "args": {},
+  "sample": {
+    "all_k_tried": "k45,k53",
+    "allele1_complete": false,
+    "allele1_path_str": "23390051 (flankL) <-> 23681617 <-> 12107293#2 (NC_062999_HD1) <-> 12107293#1 (NC_062999_HD2) <-> 13225471 (flankR)",
+    "allele1_vs_allele2_aln_frac": 0.91,
+    "allele1_vs_allele2_id_pct": 51.6,
+    "allele2_complete": false,
+    "allele2_path_str": "23390051 (flankL) <-> 23681617 <-> 10583224 <-> 12575657 (NC_062999_HD1) <-> 22078235 <-> 13225471 (flankR)",
+    "allele_cov": [
+      32.7,
+      69.6
+    ],
+    "alleles": [
+      {
+        "allele": "allele1",
+        "cov": 32.7,
+        "from_contig": "-",
+        "has_both_flanks": false,
+        "is_degHD": false,
+        "k": "k45",
+        "len": 5580,
+        "n_variable_genes": "?/2",
+        "origin": "path",
+        "sample": "NY-1391049",
+        "segments": [
+          "13225471",
+          "12107293#1",
+          "12107293#2",
+          "23681617",
+          "23390051"
+        ],
+        "type": "partial"
+      },
+      {
+        "allele": "allele2",
+        "cov": 69.6,
+        "from_contig": "-",
+        "has_both_flanks": false,
+        "is_degHD": false,
+        "k": "k45",
+        "len": 6329,
+        "n_variable_genes": "?/2",
+        "origin": "path",
+        "sample": "NY-1391049",
+        "segments": [
+          "13225471",
+          "22078235",
+          "12575657",
+          "10583224",
+          "23681617",
+          "23390051"
+        ],
+        "type": "partial"
+      }
+    ],
+    "basepair": 11909,
+    "bubble_type": "closed_bubble",
+    "complete_locus": 2,
+    "complete_var": 1,
+    "components": "allele1,allele2",
+    "extend_bounds": "-:13225471;-:-",
+    "finished_nhop": 3,
+    "genome_cov": 67.17,
+    "k_chosen": "k45",
+    "locus_coverage": 1.0,
+    "n_cand": 2,
+    "n_dedup": 2,
+    "per_k_pick": {
+      "k45": {
+        "iter_id": "coff_h3",
+        "n_dedup": 2,
+        "net": "0",
+        "verdict": "closed_bubble"
+      },
+      "k53": {
+        "iter_id": "coff_h3",
+        "n_dedup": 2,
+        "net": "0",
+        "verdict": "closed_bubble"
+      }
+    },
+    "per_k_trace": {
+      "k45": [
+        {
+          "cls": "closed_bubble",
+          "cov_pass": "off",
+          "n_arms": 2,
+          "n_var": 3,
+          "nhood": 22,
+          "nhop": 3,
+          "seeds": "both"
+        }
+      ],
+      "k53": [
+        {
+          "cls": "closed_bubble",
+          "cov_pass": "off",
+          "n_arms": 2,
+          "n_var": 3,
+          "nhood": 23,
+          "nhop": 3,
+          "seeds": "both"
+        }
+      ]
+    },
+    "sample": "NY-1391049"
+  },
+  "version": {
+    "describe": "51102df-dirty",
+    "git_hash": "51102df59a0a55f7313066878794d9c30eee0a21"
+  }
+}

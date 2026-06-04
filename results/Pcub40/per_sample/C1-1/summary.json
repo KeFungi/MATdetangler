@@ -1,0 +1,289 @@
+{
+  "args": {},
+  "sample": {
+    "all_k_tried": "k45,k53",
+    "allele1_complete": true,
+    "allele1_path_str": "24597041#4 (flankL) <-> 24597041#3 (NC_062999_HD1) <-> 24597041#2 (NC_062999_HD2) <-> 24597041#1 (flankR)",
+    "allele1_vs_allele2_aln_frac": "None",
+    "allele1_vs_allele2_id_pct": "None",
+    "allele2_complete": "-",
+    "allele2_path_str": "-",
+    "allele_cov": [
+      78.6
+    ],
+    "alleles": [
+      {
+        "allele": "allele1",
+        "cov": 78.6,
+        "from_contig": "-",
+        "has_both_flanks": true,
+        "is_degHD": false,
+        "k": "k53",
+        "len": 4664,
+        "n_variable_genes": "2/2",
+        "origin": "path",
+        "sample": "C1-1",
+        "segments": [
+          "24597041#4",
+          "24597041#3",
+          "24597041#2",
+          "24597041#1"
+        ],
+        "type": "complete"
+      }
+    ],
+    "basepair": 4664,
+    "bubble_type": "single",
+    "complete_locus": 2,
+    "complete_var": 2,
+    "components": "allele1",
+    "extend_bounds": "24597041#4:24597041#1",
+    "finished_nhop": null,
+    "genome_cov": 80.98,
+    "k_chosen": "k53",
+    "locus_coverage": 1.0,
+    "n_cand": 1,
+    "n_dedup": 1,
+    "per_k_pick": {
+      "k45": {
+        "iter_id": "coff_h3",
+        "n_dedup": 1,
+        "net": "0",
+        "verdict": "single"
+      },
+      "k53": {
+        "iter_id": "coff_h3",
+        "n_dedup": 1,
+        "net": "0",
+        "verdict": "single"
+      }
+    },
+    "per_k_trace": {
+      "k45": [
+        {
+          "cls": "single",
+          "cov_pass": "off",
+          "n_arms": 1,
+          "n_var": 2,
+          "nhood": 19,
+          "nhop": 3,
+          "seeds": "both"
+        },
+        {
+          "cls": "single",
+          "cov_pass": "off",
+          "n_arms": 1,
+          "n_var": 2,
+          "nhood": 37,
+          "nhop": 4,
+          "seeds": "both"
+        },
+        {
+          "cls": "single",
+          "cov_pass": "off",
+          "n_arms": 1,
+          "n_var": 2,
+          "nhood": 62,
+          "nhop": 5,
+          "seeds": "both"
+        },
+        {
+          "cls": "single",
+          "cov_pass": "off",
+          "n_arms": 1,
+          "n_var": 2,
+          "nhood": 101,
+          "nhop": 6,
+          "seeds": "both"
+        },
+        {
+          "cls": "single",
+          "cov_pass": "off",
+          "n_arms": 1,
+          "n_var": 2,
+          "nhood": 164,
+          "nhop": 7,
+          "seeds": "both"
+        },
+        {
+          "cls": "single",
+          "cov_pass": "off",
+          "n_arms": 1,
+          "n_var": 2,
+          "nhood": 268,
+          "nhop": 8,
+          "seeds": "both"
+        },
+        {
+          "cls": "single",
+          "cov_pass": "on",
+          "n_arms": 1,
+          "n_var": 2,
+          "nhood": 9,
+          "nhop": 3,
+          "seeds": "both"
+        },
+        {
+          "cls": "single",
+          "cov_pass": "on",
+          "n_arms": 1,
+          "n_var": 2,
+          "nhood": 21,
+          "nhop": 4,
+          "seeds": "both"
+        },
+        {
+          "cls": "single",
+          "cov_pass": "on",
+          "n_arms": 1,
+          "n_var": 2,
+          "nhood": 32,
+          "nhop": 5,
+          "seeds": "both"
+        },
+        {
+          "cls": "single",
+          "cov_pass": "on",
+          "n_arms": 1,
+          "n_var": 2,
+          "nhood": 51,
+          "nhop": 6,
+          "seeds": "both"
+        },
+        {
+          "cls": "single",
+          "cov_pass": "on",
+          "n_arms": 1,
+          "n_var": 2,
+          "nhood": 84,
+          "nhop": 7,
+          "seeds": "both"
+        },
+        {
+          "cls": "single",
+          "cov_pass": "on",
+          "n_arms": 1,
+          "n_var": 2,
+          "nhood": 143,
+          "nhop": 8,
+          "seeds": "both"
+        }
+      ],
+      "k53": [
+        {
+          "cls": "single",
+          "cov_pass": "off",
+          "n_arms": 1,
+          "n_var": 2,
+          "nhood": 19,
+          "nhop": 3,
+          "seeds": "both"
+        },
+        {
+          "cls": "single",
+          "cov_pass": "off",
+          "n_arms": 1,
+          "n_var": 2,
+          "nhood": 36,
+          "nhop": 4,
+          "seeds": "both"
+        },
+        {
+          "cls": "single",
+          "cov_pass": "off",
+          "n_arms": 1,
+          "n_var": 2,
+          "nhood": 57,
+          "nhop": 5,
+          "seeds": "both"
+        },
+        {
+          "cls": "single",
+          "cov_pass": "off",
+          "n_arms": 1,
+          "n_var": 2,
+          "nhood": 89,
+          "nhop": 6,
+          "seeds": "both"
+        },
+        {
+          "cls": "single",
+          "cov_pass": "off",
+          "n_arms": 1,
+          "n_var": 2,
+          "nhood": 145,
+          "nhop": 7,
+          "seeds": "both"
+        },
+        {
+          "cls": "single",
+          "cov_pass": "off",
+          "n_arms": 1,
+          "n_var": 2,
+          "nhood": 229,
+          "nhop": 8,
+          "seeds": "both"
+        },
+        {
+          "cls": "single",
+          "cov_pass": "on",
+          "n_arms": 1,
+          "n_var": 2,
+          "nhood": 10,
+          "nhop": 3,
+          "seeds": "both"
+        },
+        {
+          "cls": "single",
+          "cov_pass": "on",
+          "n_arms": 1,
+          "n_var": 2,
+          "nhood": 20,
+          "nhop": 4,
+          "seeds": "both"
+        },
+        {
+          "cls": "single",
+          "cov_pass": "on",
+          "n_arms": 1,
+          "n_var": 2,
+          "nhood": 30,
+          "nhop": 5,
+          "seeds": "both"
+        },
+        {
+          "cls": "single",
+          "cov_pass": "on",
+          "n_arms": 1,
+          "n_var": 2,
+          "nhood": 43,
+          "nhop": 6,
+          "seeds": "both"
+        },
+        {
+          "cls": "single",
+          "cov_pass": "on",
+          "n_arms": 1,
+          "n_var": 2,
+          "nhood": 75,
+          "nhop": 7,
+          "seeds": "both"
+        },
+        {
+          "cls": "single",
+          "cov_pass": "on",
+          "n_arms": 1,
+          "n_var": 2,
+          "nhood": 119,
+          "nhop": 8,
+          "seeds": "both"
+        }
+      ]
+    },
+    "sample": "C1-1"
+  },
+  "version": {
+    "describe": "51102df-dirty",
+    "git_hash": "51102df59a0a55f7313066878794d9c30eee0a21"
+  }
+}

@@ -25,10 +25,11 @@ consensus path (stages 6 and 7) via `--make-consensus`.
    same-protein HSPs; the HD envelope is the union of gene spans padded by 500 bp
    each side. Flanks are auto-derived as the locus sequence outside the envelope
    (trimmed to `--max-flank-len` per side).
-2. **Per-K genome coverage** — per-k median of SPAdes `contigs.fasta` `cov_`
-   headers across contigs ≥ `--contig-depth-size-cut` bp (default 5000).
-   Bp-equivalent units; same scale as the GFA `DP:f:` segment depths used
-   downstream. Cached as `genome_cov_spades_k<K>.txt`.
+2. **Per-K genome coverage** — per-k median of the GFA's per-segment `DP:f:`
+   tag across segments ≥ `--contig-depth-size-cut` bp (default 5000). Bp-equivalent
+   units; same scale as the segment depths used downstream. Cached as
+   `genome_cov_spades_k<K>.txt`. Reads-free, contigs.fasta-free — works on .gfa
+   or .gfa.gz transparently.
 3. **Per-K allele caller (`matdetangler.run_per_k`)** — for each K:
    extract `S`-line segments from `gfa(K)` → BLAST DB → full outfmt-6 blastn
    flankL/flankR + tblastn HD proteins → labeler builds `seg_label_hits.tsv` →
@@ -252,7 +253,7 @@ layouts.
 | `<K>/subnode_seqs.fasta` | materialized sub-segment sequences for `{parent}#N` IDs (after P1 directional split — one sub-segment per unique-label run on the parent; see METHODS.md §3.3). Consumed by `graph_paths` to draw bubble outputs with coord-free IDs. |
 | `<K>/seg_label_hits.tsv` | labeler output for this K. |
 | `<K>/{flankL,flankR}_blastn.tsv`, `<K>/HD_tblastn.tsv` | full outfmt-6 BLAST caches. |
-| `genome_cov_spades_k<K>.txt` | per-k genome coverage (median of contigs.fasta `cov_` ≥ 5 kb). Bp-equivalent units. |
+| `genome_cov_spades_k<K>.txt` | per-k genome coverage (median of GFA `DP:f:` across segments ≥ 5 kb). Bp-equivalent units. Filename retained for backward compatibility — the value is now GFA-derived, not contigs.fasta-derived. |
 | `queries/` | auto-derived `variable_proteins.fasta`, `flankL.fasta`, `flankR.fasta`, `variable_nt.fasta`, `manifest.json`. |
 | `consensus_alleles.fasta` | `samtools consensus` per allele. Only written when `--make-consensus`. |
 | `reads.sam` | competitive end-to-end bowtie2 mapping reads → picks (`--make-consensus` only). The BAM is built as an internal intermediate for `samtools consensus` and `coverage_core.py`, then deleted — SAM is the human-readable artifact persisted. To re-derive the BAM: `samtools sort -o reads.sorted.bam reads.sam && samtools index reads.sorted.bam`. |

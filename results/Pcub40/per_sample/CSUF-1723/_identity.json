@@ -1,1 +1,1 @@
-{"a1": "CSUF-1723_k45_allele1", "a2": "CSUF-1723_k45_allele2", "len_a1": 5996, "len_a2": 6142, "id_pct": 66.6, "aln_frac": 0.9, "distinct": true, "metric": "whole-allele"}
+{"a1": "CSUF-1723_k45_allele1", "a2": "CSUF-1723_k45_allele2", "len_a1": 5996, "len_a2": 6142, "id_pct": 61.8, "aln_frac": 0.53, "distinct": true, "metric": "whole-allele"}

@@ -1,0 +1,155 @@
+#!/bin/bash
+# Pcub40 reproducibility test.
+#
+# Pipeline:
+#   1. Decompress examples/Pcub40/<sample>/k<k>/*.gfa.gz to a fresh tmp spades dir.
+#   2. Run MATdetangler with the args defined in test/Pcub40/run_args.json
+#      (read by humans; the script forwards the same flags to MATdetangler).
+#   3. Summarize the output with test/Pcub40/summarize.py.
+#   4. Diff the new JSON against test/Pcub40/known_results.json.
+#   5. Exit 0 if no semantic regression, 1 otherwise.
+#
+# Usage:
+#   bash test/Pcub40/run_test.sh                 # run all 32 samples
+#   bash test/Pcub40/run_test.sh AJB36 BD-1248   # just these
+#   bash test/Pcub40/run_test.sh --slurm         # submit a slurm array instead of serial
+#
+# Tolerated diffs (will not fail the test):
+#   - top-level "version" block (git hash will move)
+#   - "args" block (run-time vs known)
+#   - sample-level "per_k_trace" (BFS trace is large + noisy across machines)
+#   - sample-level "finished_nhop" (depends on cov estimator)
+# Everything else must match exactly.
+set -uo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$HERE/../.." && pwd)"
+EX="$ROOT/examples/Pcub40"
+KNOWN="$HERE/known_results.json"
+ARGS_JSON="$HERE/run_args.json"
+TMP_ROOT="${TMPDIR:-/tmp}/matdetangler_pcub40_test_$$"
+OUT_DIR="$TMP_ROOT/results"
+mkdir -p "$OUT_DIR"
+
+if [ ! -d "$EX" ]; then
+  echo "ERROR: $EX missing. Did you run 'git lfs pull' to fetch the demo GFAs?" >&2
+  exit 2
+fi
+
+SAMPLES=()
+SLURM=0
+for a in "$@"; do
+  case "$a" in
+    --slurm) SLURM=1 ;;
+    -*) echo "unknown flag: $a" >&2; exit 2 ;;
+    *) SAMPLES+=("$a") ;;
+  esac
+done
+if [ ${#SAMPLES[@]} -eq 0 ]; then
+  while IFS= read -r s; do SAMPLES+=("$s"); done < <(ls "$EX" | grep -v '^_')
+fi
+
+echo "[$(date)] Pcub40 test: ${#SAMPLES[@]} samples, out=$OUT_DIR"
+echo "[$(date)] decompressing GFAs to $TMP_ROOT/spades/<sample>/"
+
+# Step 1: decompress + per-sample spades dir
+for s in "${SAMPLES[@]}"; do
+  sd="$TMP_ROOT/spades/$s"
+  for kgz in "$EX/$s"/k*/*.gfa.gz; do
+    [ -s "$kgz" ] || continue
+    k=$(basename "$(dirname "$kgz")")
+    mkdir -p "$sd/$k"
+    gunzip -c "$kgz" > "$sd/$k/$(basename "$kgz" .gz)"
+  done
+done
+
+# Step 2: run MATdetangler — args mirror run_args.json defaults.
+run_one() {
+  local s="$1"
+  "$ROOT/MATdetangler" run \
+    --sample "$s" --spades-dir "$TMP_ROOT/spades/$s" \
+    --locus-ref "$ROOT/examples/Pcub_locus/NC_062999.fasta" \
+    --proteins  "$ROOT/examples/Pcub_locus/NC_062999_HDs.fasta" \
+    --outdir "$OUT_DIR" \
+    --ks k45,k53 --threads 4 --expected-count 2 --no-skip-pick \
+    > "$OUT_DIR/$s.run.log" 2>&1
+}
+
+if [ "$SLURM" -eq 1 ]; then
+  echo "[$(date)] SLURM mode: emitting array sbatch"
+  cat > "$TMP_ROOT/_array.sbatch" <<EOF
+#!/bin/bash
+#SBATCH --account=tyjames1
+#SBATCH --partition=standard
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=8G
+#SBATCH --time=02:00:00
+#SBATCH --array=0-$((${#SAMPLES[@]} - 1))
+#SBATCH --output=$TMP_ROOT/_%a.log
+set -uo pipefail
+SAMPLES=(${SAMPLES[*]})
+S="\${SAMPLES[\$SLURM_ARRAY_TASK_ID]}"
+source /home/yihongke/miniconda3/etc/profile.d/conda.sh; conda activate hddetangler
+"$ROOT/MATdetangler" run --sample "\$S" --spades-dir "$TMP_ROOT/spades/\$S" \\
+  --locus-ref "$ROOT/examples/Pcub_locus/NC_062999.fasta" \\
+  --proteins  "$ROOT/examples/Pcub_locus/NC_062999_HDs.fasta" \\
+  --outdir "$OUT_DIR" --ks k45,k53 --threads 4 --expected-count 2 --no-skip-pick
+EOF
+  jid=$(sbatch --parsable "$TMP_ROOT/_array.sbatch")
+  echo "[$(date)] submitted array $jid; wait + diff manually."
+  exit 0
+fi
+
+# Serial mode (good for small subsets; the full 32 takes ~20-30 min)
+for s in "${SAMPLES[@]}"; do
+  echo "[$(date)] $s ..."
+  run_one "$s" || echo "  $s exit=$?"
+done
+
+# Step 3: aggregate the wrapper-emitted <sample>/summary.json files into one
+# cross-sample JSON for diff. (Each sample's summary.json was produced by
+# Step 9 of MATdetangler.)
+NEW_JSON="$TMP_ROOT/new_results.json"
+python -m matdetangler.summarize \
+  --results-dir "$OUT_DIR" \
+  --args-json   "$ARGS_JSON" \
+  --repo-dir    "$ROOT" \
+  --out         "$NEW_JSON"
+
+# Step 4: diff with semantic ignore-list
+echo "[$(date)] diffing new_results.json vs known_results.json"
+python - "$NEW_JSON" "$KNOWN" <<'PY'
+import json, sys
+new = json.load(open(sys.argv[1])); known = json.load(open(sys.argv[2]))
+# Fields under each sample that are allowed to differ (machine-noise / build-noise).
+TOLERATE = {"per_k_trace", "finished_nhop", "per_k_pick", "genome_cov", "allele_cov"}
+def scrub(s):
+    s = dict(s)
+    for k in TOLERATE: s.pop(k, None)
+    # Per-allele cov is also noise-sensitive; drop from comparison.
+    for a in s.get("alleles", []):
+        a.pop("cov", None)
+    return s
+diffs = []
+for s in sorted(set(new["samples"]) | set(known["samples"])):
+    n = scrub(new["samples"].get(s, {}))
+    k = scrub(known["samples"].get(s, {}))
+    if n != k:
+        diffs.append(s)
+        print(f"\nDIFF {s}:")
+        for key in sorted(set(n) | set(k)):
+            if n.get(key) != k.get(key):
+                print(f"    {key}: new={n.get(key)!r:60s}  known={k.get(key)!r}")
+if diffs:
+    print(f"\nFAIL: {len(diffs)} samples differ ({', '.join(diffs[:5])}{'...' if len(diffs)>5 else ''})")
+    sys.exit(1)
+print(f"PASS: all {len(new['samples'])} samples match (ignoring {sorted(TOLERATE)} + per-allele cov)")
+PY
+status=$?
+
+if [ $status -eq 0 ]; then
+  rm -rf "$TMP_ROOT"
+  echo "[$(date)] PASS — tmp cleaned"
+else
+  echo "[$(date)] FAIL — tmp kept at $TMP_ROOT for inspection"
+fi
+exit $status

@@ -1,0 +1,121 @@
+{
+  "args": {},
+  "sample": {
+    "all_k_tried": "k45,k53",
+    "allele1_complete": true,
+    "allele1_path_str": "20297847 (flankL) <-> 7126749#4 (flankL) <-> 7126749#3 (NC_062999_HD1) <-> 7126749#2 (NC_062999_HD2) <-> 7126749#1 (flankR) <-> 12784011 (flankR)",
+    "allele1_vs_allele2_aln_frac": 0.55,
+    "allele1_vs_allele2_id_pct": 63.3,
+    "allele2_complete": true,
+    "allele2_path_str": "20297847 (flankL) <-> 6990633#1 (flankL) <-> 6990633#2 (NC_062999_HD1) <-> 6990605 <-> 6990611 <-> 13021155 <-> 1222084 <-> 6311815 <-> 6311809 <-> 10512699#1 (NC_062999_HD2) <-> 10512699#2 (flankR) <-> 12784011 (flankR)",
+    "allele_cov": [
+      26.6,
+      36.9
+    ],
+    "alleles": [
+      {
+        "allele": "allele1",
+        "cov": 26.6,
+        "from_contig": "-",
+        "has_both_flanks": true,
+        "is_degHD": false,
+        "k": "k53",
+        "len": 5844,
+        "n_variable_genes": "2/2",
+        "origin": "path",
+        "sample": "FLAS-59250",
+        "segments": [
+          "20297847",
+          "7126749#4",
+          "7126749#3",
+          "7126749#2",
+          "7126749#1",
+          "12784011"
+        ],
+        "type": "complete"
+      },
+      {
+        "allele": "allele2",
+        "cov": 36.9,
+        "from_contig": "-",
+        "has_both_flanks": true,
+        "is_degHD": false,
+        "k": "k53",
+        "len": 6849,
+        "n_variable_genes": "2/2",
+        "origin": "path",
+        "sample": "FLAS-59250",
+        "segments": [
+          "12784011",
+          "10512699#2",
+          "10512699#1",
+          "6311809",
+          "6311815",
+          "1222084",
+          "13021155",
+          "6990611",
+          "6990605",
+          "6990633#2",
+          "6990633#1",
+          "20297847"
+        ],
+        "type": "complete"
+      }
+    ],
+    "basepair": 12693,
+    "bubble_type": "closed_bubble",
+    "complete_locus": 2,
+    "complete_var": 2,
+    "components": "allele1,allele2",
+    "extend_bounds": "7126749#4:7126749#1;6990633#1:10512699#2",
+    "finished_nhop": 3,
+    "genome_cov": 52.05,
+    "k_chosen": "k53",
+    "locus_coverage": 1.0,
+    "n_cand": 2,
+    "n_dedup": 2,
+    "per_k_pick": {
+      "k45": {
+        "iter_id": "coff_h3",
+        "n_dedup": 2,
+        "net": "0",
+        "verdict": "closed_bubble"
+      },
+      "k53": {
+        "iter_id": "coff_h3",
+        "n_dedup": 2,
+        "net": "0",
+        "verdict": "closed_bubble"
+      }
+    },
+    "per_k_trace": {
+      "k45": [
+        {
+          "cls": "closed_bubble",
+          "cov_pass": "off",
+          "n_arms": 2,
+          "n_var": 4,
+          "nhood": 42,
+          "nhop": 3,
+          "seeds": "both"
+        }
+      ],
+      "k53": [
+        {
+          "cls": "closed_bubble",
+          "cov_pass": "off",
+          "n_arms": 2,
+          "n_var": 4,
+          "nhood": 42,
+          "nhop": 3,
+          "seeds": "both"
+        }
+      ]
+    },
+    "sample": "FLAS-59250"
+  },
+  "version": {
+    "describe": "51102df-dirty",
+    "git_hash": "51102df59a0a55f7313066878794d9c30eee0a21"
+  }
+}

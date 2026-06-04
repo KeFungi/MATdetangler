@@ -1,0 +1,252 @@
+{
+  "args": {},
+  "sample": {
+    "all_k_tried": "k45,k53",
+    "allele1_complete": false,
+    "allele1_path_str": "25112889 (flankL) <-> 6379650#1 (flankL) <-> 6379650#2 (NC_062999_HD1) <-> 16815708 <-> 16815702 <-> 25974948 <-> 32614825 <-> 22454038 <-> 27075157 <-> 214693 <-> 214687 <-> 11519633 <-> 32969171 <-> 25820398 <-> 7577624 <-> 19337768#1 (NC_062999_HD2) <-> 19337768#2 (flankR) <-> 26008282 (flankR)",
+    "allele1_vs_allele2_aln_frac": 0.94,
+    "allele1_vs_allele2_id_pct": 57.4,
+    "allele2_complete": false,
+    "allele2_path_str": "25112889 (flankL) <-> 1658849 (flankL) <-> 6549982 (NC_062999_HD1) <-> 791121 (flankR) <-> 26008282 (flankR)",
+    "allele_cov": [
+      26.6,
+      36.6
+    ],
+    "alleles": [
+      {
+        "allele": "allele1",
+        "cov": 26.6,
+        "from_contig": "-",
+        "has_both_flanks": true,
+        "is_degHD": false,
+        "k": "k53",
+        "len": 7831,
+        "n_variable_genes": "?/2",
+        "origin": "path",
+        "sample": "CSUF-01760",
+        "segments": [
+          "25112889",
+          "6379650#1",
+          "6379650#2",
+          "16815708",
+          "16815702",
+          "25974948",
+          "32614825",
+          "22454038",
+          "27075157",
+          "214693",
+          "214687",
+          "11519633",
+          "32969171",
+          "25820398",
+          "7577624",
+          "19337768#1",
+          "19337768#2",
+          "26008282"
+        ],
+        "type": "partial"
+      },
+      {
+        "allele": "allele2",
+        "cov": 36.6,
+        "from_contig": "-",
+        "has_both_flanks": true,
+        "is_degHD": false,
+        "k": "k53",
+        "len": 5906,
+        "n_variable_genes": "?/2",
+        "origin": "path",
+        "sample": "CSUF-01760",
+        "segments": [
+          "25112889",
+          "1658849",
+          "6549982",
+          "791121",
+          "26008282"
+        ],
+        "type": "partial"
+      }
+    ],
+    "basepair": 13737,
+    "bubble_type": "closed_bubble",
+    "complete_locus": 2,
+    "complete_var": 1,
+    "components": "allele1,allele2",
+    "extend_bounds": "6379650#1:19337768#2;1658849:791121",
+    "finished_nhop": 6,
+    "genome_cov": 35.69,
+    "k_chosen": "k53",
+    "locus_coverage": 1.0,
+    "n_cand": 2,
+    "n_dedup": 2,
+    "per_k_pick": {
+      "k45": {
+        "iter_id": "coff_h5",
+        "n_dedup": 3,
+        "net": "0",
+        "verdict": "complexed"
+      },
+      "k53": {
+        "iter_id": "coff_h6",
+        "n_dedup": 2,
+        "net": "0",
+        "verdict": "closed_bubble"
+      }
+    },
+    "per_k_trace": {
+      "k45": [
+        {
+          "cls": "complexed",
+          "cov_pass": "off",
+          "n_arms": 12,
+          "n_var": 3,
+          "nhood": 44,
+          "nhop": 3,
+          "seeds": "both"
+        },
+        {
+          "cls": "complexed",
+          "cov_pass": "off",
+          "n_arms": 28,
+          "n_var": 3,
+          "nhood": 75,
+          "nhop": 4,
+          "seeds": "both"
+        },
+        {
+          "cls": "complexed",
+          "cov_pass": "off",
+          "n_arms": 4,
+          "n_var": 3,
+          "nhood": 118,
+          "nhop": 5,
+          "seeds": "both"
+        },
+        {
+          "cls": "complexed",
+          "cov_pass": "off",
+          "n_arms": 4,
+          "n_var": 3,
+          "nhood": 194,
+          "nhop": 6,
+          "seeds": "both"
+        },
+        {
+          "cls": "complexed",
+          "cov_pass": "off",
+          "n_arms": 13,
+          "n_var": 3,
+          "nhood": 296,
+          "nhop": 7,
+          "seeds": "both"
+        },
+        {
+          "cls": "complexed",
+          "cov_pass": "off",
+          "n_arms": 18,
+          "n_var": 3,
+          "nhood": 449,
+          "nhop": 8,
+          "seeds": "both"
+        },
+        {
+          "cls": "open_bubble",
+          "cov_pass": "on",
+          "n_arms": 2,
+          "n_var": 3,
+          "nhood": 38,
+          "nhop": 3,
+          "seeds": "both"
+        },
+        {
+          "cls": "complexed",
+          "cov_pass": "on",
+          "n_arms": 4,
+          "n_var": 3,
+          "nhood": 64,
+          "nhop": 4,
+          "seeds": "both"
+        },
+        {
+          "cls": "complexed",
+          "cov_pass": "on",
+          "n_arms": 4,
+          "n_var": 3,
+          "nhood": 99,
+          "nhop": 5,
+          "seeds": "both"
+        },
+        {
+          "cls": "complexed",
+          "cov_pass": "on",
+          "n_arms": 12,
+          "n_var": 3,
+          "nhood": 165,
+          "nhop": 6,
+          "seeds": "both"
+        },
+        {
+          "cls": "complexed",
+          "cov_pass": "on",
+          "n_arms": 18,
+          "n_var": 3,
+          "nhood": 251,
+          "nhop": 7,
+          "seeds": "both"
+        },
+        {
+          "cls": "complexed",
+          "cov_pass": "on",
+          "n_arms": 78,
+          "n_var": 3,
+          "nhood": 371,
+          "nhop": 8,
+          "seeds": "both"
+        }
+      ],
+      "k53": [
+        {
+          "cls": "complexed",
+          "cov_pass": "off",
+          "n_arms": 12,
+          "n_var": 3,
+          "nhood": 48,
+          "nhop": 3,
+          "seeds": "both"
+        },
+        {
+          "cls": "complexed",
+          "cov_pass": "off",
+          "n_arms": 22,
+          "n_var": 3,
+          "nhood": 80,
+          "nhop": 4,
+          "seeds": "both"
+        },
+        {
+          "cls": "complexed",
+          "cov_pass": "off",
+          "n_arms": 33,
+          "n_var": 3,
+          "nhood": 130,
+          "nhop": 5,
+          "seeds": "both"
+        },
+        {
+          "cls": "closed_bubble",
+          "cov_pass": "off",
+          "n_arms": 2,
+          "n_var": 3,
+          "nhood": 217,
+          "nhop": 6,
+          "seeds": "both"
+        }
+      ]
+    },
+    "sample": "CSUF-01760"
+  },
+  "version": {
+    "describe": "51102df-dirty",
+    "git_hash": "51102df59a0a55f7313066878794d9c30eee0a21"
+  }
+}

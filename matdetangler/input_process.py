@@ -63,6 +63,40 @@ def estimate_genome_cov_from_contigs(contigs_fa: str, min_len: int = 5000) -> fl
     if not covs: return 0.0
     return statistics.median(covs)
 
+
+def estimate_genome_cov_from_gfa(gfa_path: str, min_len: int = 5000) -> float:
+    """Median of `DP:f:` (or KC:i:/RC:i: → depth = count / seg_length) across
+    S-line segments >= min_len bp. Drop-in replacement for
+    `estimate_genome_cov_from_contigs` when only the GFA is on disk (e.g.
+    archival demo bundles in `examples/<dataset>/`).
+
+    Same units (bp-equivalent k-mer coverage) and same robustness reasoning
+    (median over long segments → repeat-tail-resistant). Returns 0.0 if no
+    segment is >= min_len."""
+    import gzip
+    opener = gzip.open if gfa_path.endswith(".gz") else open
+    depths: list[float] = []
+    with opener(gfa_path, "rt") as fh:
+        for ln in fh:
+            if not ln.startswith("S\t"): continue
+            f = ln.rstrip("\n").split("\t")
+            if len(f) < 3: continue
+            seq_len = len(f[2])
+            if seq_len < min_len: continue
+            d = None
+            for tag in f[3:]:
+                if tag.startswith("dp:f:") or tag.startswith("DP:f:"):
+                    d = float(tag[5:]); break
+                if tag.startswith("KC:i:"):
+                    d = int(tag[5:]) / max(1, seq_len); break
+                if tag.startswith("RC:i:"):
+                    d = int(tag[5:]) / max(1, seq_len); break
+            if d is not None:
+                depths.append(d)
+    if not depths: return 0.0
+    return statistics.median(depths)
+
+
 def rc(s: str) -> str:
     return s.translate(str.maketrans("ACGTNacgtn", "TGCANtgcan"))[::-1]
 

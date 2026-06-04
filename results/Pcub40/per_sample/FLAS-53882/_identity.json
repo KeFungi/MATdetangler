@@ -1,1 +1,1 @@
-{"a1": "FLAS-53882_k53_allele1", "a2": "FLAS-53882_k53_allele2", "len_a1": 5903, "len_a2": 5915, "id_pct": 65.1, "aln_frac": 0.41, "distinct": true, "metric": "whole-allele"}
+{"a1": "FLAS-53882_k53_allele1", "a2": "FLAS-53882_k53_allele2", "len_a1": 5903, "len_a2": 5915, "id_pct": 63.8, "aln_frac": 0.45, "distinct": true, "metric": "whole-allele"}

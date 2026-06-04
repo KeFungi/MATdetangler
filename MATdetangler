@@ -32,7 +32,8 @@ Usage:
                                  when --make-consensus is set; the pipeline
                                  is reads-free through step 5 by default)
   --reads-r2 FILE                trimmed R2 fastq.gz (OPTIONAL — see --reads-r1)
-  --spades-dir DIR               directory containing kXX/{contigs.fasta,assembly_graph_after_simplification.gfa}
+  --spades-dir DIR               directory containing kXX/assembly_graph_after_simplification.gfa
+                                 (.gfa or .gfa.gz). contigs.fasta is no longer required.
   --locus-ref FASTA              locus DNA reference (HD region + both flanks; single record)
   --proteins FASTA               curated protein fasta (HD1, HD2, ...) — flanks are auto-derived
                                  as everything outside the tblastn HD-hit envelope on locus-ref
@@ -40,9 +41,9 @@ Usage:
 
 Optional inputs:
   --genome-coverage FLOAT        genome mean depth (bp-equivalent units); if omitted,
-                                 estimated per-k from SPAdes contigs.fasta cov_ headers
+                                 estimated per-k from the GFA's DP:f: segment tags
                                  (median across contigs >= --contig-depth-size-cut bp).
-  --ks LIST                      k subdirs to consider (default: k45)
+  --ks LIST                      k subdirs to consider (default: k45,k53)
   --threads N                    threads for blast/bowtie2/mafft (default: 4)
   --expected-count {1,2}         1=haploid, 2=dikaryon (default: 2)
   --debug                        trace every shell command (set -x with timestamps),
@@ -97,12 +98,12 @@ Thresholds (override the defaults at your own risk):
      Pcub at --max-flank-len 2000). Tighter budget -> step 4 pairwise MAFFT is much
      faster because raw whole-contig anchors get tblastn-trimmed before scoring.
      Pass `--max-locus-len 0` to disable the cap (historical no-trim behavior).
-  --ks k45                      (single k; was k21,k33,k55 before)
-  --contig-depth-size-cut 5000  min contig length (bp) used by the per-k
-                                genome-cov estimator (median cov_ from SPAdes
-                                contigs.fasta). Lower -> more contigs but more
-                                short-tip noise. Bp-equivalent units (matches
-                                GFA DP:f: segment depths used downstream).
+  --ks k45,k53                  (default; was k45 / k21,k33,k55 in earlier versions)
+  --contig-depth-size-cut 5000  min segment length (bp) used by the per-k
+                                genome-cov estimator (median DP:f: across GFA
+                                segments >= this length). Lower -> more segments
+                                but more short-tip noise. Bp-equivalent units
+                                (matches GFA DP:f: segment depths used downstream).
 
 Per-K caller pass-through (forwarded to matdetangler.run_per_k; defaults applied
 there if a flag is omitted):
@@ -145,7 +146,7 @@ esac
 
 # ----- arg parsing (shared) -----
 SAMPLE=""; R1=""; R2=""; SPADES_DIR=""; LOCUS_REF=""; PROTEINS=""; OUTDIR=""
-REPEATS=""; GENOMECOV=""; KS="k45"
+REPEATS=""; GENOMECOV=""; KS="k45,k53"
 INIT_HOPS=""; MAX_HOPS=""    # blank = use graph_path_search defaults (5, 10)
 # KNOWN_DEGHD removed 2026-05-30 — degHD detection is no longer plumbed by the wrapper.
 # Python modules still accept --known-degHD if invoked manually.
@@ -171,10 +172,10 @@ MAX_WALK_BP="0"      # DFS walk-bp cap (graph_path_search step 3, independent of
 # MAX_WALK_BP sentinel:
 #   "0" (default)          = no DFS walk-bp cap
 #   <integer>              = explicit cap (rarely needed)
-CONTIG_DEPTH_CUT=5000   # --contig-depth-size-cut : min contig length (bp) used by
-                        #   the per-k genome-cov estimator (median cov_ from
-                        #   SPAdes contigs.fasta). Lower -> more contigs, more
-                        #   short-tip noise. 5000 is the default that matched
+CONTIG_DEPTH_CUT=5000   # --contig-depth-size-cut : min segment length (bp) used by
+                        #   the per-k genome-cov estimator (median DP:f: across
+                        #   GFA segments >= this length). Lower -> more segments,
+                        #   more short-tip noise. 5000 is the default that matched
                         #   bp-equivalent units on the vietnam_BD1394 test set.
 SKIP_CONSENSUS=1        # --skip-consensus / --make-consensus : skip step 6
                         #   (map_consensus.sh) and the consensus-derived parts
@@ -424,13 +425,14 @@ else
   echo "  max_walk_bp   = $MAX_WALK_BP bp (user-supplied)"
 fi
 
-echo "=== [$SAMPLE] 2) candidate contigs (from SPAdes contigs.fasta) ==="
+echo "=== [$SAMPLE] 2) per-k genome coverage ==="
 # Step 2.05 (bowtie2-based genome coverage from locus-flank windows) has been
 # REMOVED — it required reads, which steps 1-6 are now reads-free of. Genome
-# coverage is now derived per-k from SPAdes contigs.fasta `cov_` headers
-# (median across contigs >= 5000 bp; bp-equivalent units; same scale as the
-# GFA DP:f: segment depths used in repeat detection). Per-k value is cached
+# coverage is now derived per-k from the GFA's per-segment DP:f: tag
+# (median across segments >= 5000 bp; bp-equivalent units; same scale as the
+# segment depths used in repeat detection downstream). Per-k value is cached
 # to genome_cov_spades_k<K>.txt and computed inside the per-k loop below.
+# contigs.fasta is no longer required by this pipeline.
 if [ -n "$GENOMECOV" ]; then
   echo "[genome_cov] user-supplied = ${GENOMECOV} (--genome-coverage), used for ALL k's"
 fi
@@ -456,7 +458,7 @@ for K_ONE in ${KS//,/ }; do
     continue
   fi
 
-  # --- 2.05: per-k genome coverage from SPAdes contigs.fasta ---
+  # --- 2.05: per-k genome coverage from the GFA's DP:f: segment tags ---
   # Median cov_ across contigs >= 5000 bp (bp-equivalent units, matches GFA DP:f:).
   # User --genome-coverage overrides for all k's. Cached as genome_cov_spades_k<K>.txt.
   K_COV_FILE="$SDIR/genome_cov_spades_${K_ONE}.txt"
@@ -466,20 +468,27 @@ for K_ONE in ${KS//,/ }; do
     K_GENOMECOV=$(cat "$K_COV_FILE")
     echo "  [$K_ONE] --continue: reusing cached genome_cov = ${K_GENOMECOV} (from $K_COV_FILE)"
   else
-    K_CONTIGS="$SPADES_DIR/$K_ONE/contigs.fasta"
-    if [ ! -s "$K_CONTIGS" ]; then
-      echo "  [$K_ONE] WARN: $K_CONTIGS missing/empty; genome_cov = 0 (repeat detection disabled this k)"
-      K_GENOMECOV="0"
-    else
+    # Estimate from the GFA's per-segment depth (DP:f: / KC:i: / RC:i:).
+    # Same scale + same median-over-long-segments robustness as the legacy
+    # contigs.fasta `cov_` approach; works on .gfa or .gfa.gz transparently.
+    K_GFA="$SPADES_DIR/$K_ONE/assembly_graph_after_simplification.gfa"
+    [ -s "$K_GFA" ] || K_GFA="$SPADES_DIR/$K_ONE/assembly_graph_after_simplification.gfa.gz"
+    if [ -s "$K_GFA" ]; then
       K_GENOMECOV=$( "$PY" -c "
-from matdetangler.input_process import estimate_genome_cov_from_contigs
-v = estimate_genome_cov_from_contigs('$K_CONTIGS', min_len=$CONTIG_DEPTH_CUT)
+from matdetangler.input_process import estimate_genome_cov_from_gfa
+v = estimate_genome_cov_from_gfa('$K_GFA', min_len=$CONTIG_DEPTH_CUT)
 print(f'{v:.4f}')
 " )
-      echo "  [$K_ONE] genome_cov = ${K_GENOMECOV} (median cov_ across contigs >= ${CONTIG_DEPTH_CUT} bp in $K_CONTIGS)"
+      echo "  [$K_ONE] genome_cov = ${K_GENOMECOV} (median DP across GFA segments >= ${CONTIG_DEPTH_CUT} bp in $K_GFA)"
+    else
+      echo "  [$K_ONE] WARN: $K_GFA missing/empty; genome_cov = 0 (repeat detection disabled this k)"
+      K_GENOMECOV="0"
     fi
-    echo "$K_GENOMECOV" > "$K_COV_FILE"
   fi
+  # Always cache K_GENOMECOV to disk — run_per_k expects --cov-file to exist
+  # regardless of how the value was sourced (user --genome-coverage, --continue
+  # cache, or fresh per-k estimate).
+  echo "$K_GENOMECOV" > "$K_COV_FILE"
 
   # --- 3: per-K allele caller (replaces graph_path_search + pick_alleles) ---
   # The legacy step-2 anchor_search (contigs + segment-fallback) was a
@@ -745,6 +754,15 @@ json.dump(id_run('$SDIR/_consensus_pair.fasta', queries_dir='$QDIR', locus_ref_f
   "$PY" -m matdetangler.summary_table "${SUM_ARGS[@]}" \
         --out-tsv "$OUTDIR/summary.tsv"               2>&1 | tee -a "$LDIR/08_summary.log"
 
+  # Step 9: comprehensive cross-run-comparable JSON.
+  # Drops summary.json alongside summary.tsv. Captures per-allele content,
+  # per-k BFS trace, finished_nhop, args block, git hash — everything needed
+  # for a deterministic diff against test/<dataset>/known_results.json.
+  echo "=== [$SAMPLE] 9) cross-run JSON summary ==="
+  "$PY" -m matdetangler.summarize \
+        --sample-dir "$SDIR" --out "$SDIR/summary.json" \
+        --repo-dir "$HERE" 2>&1 | tee "$LDIR/09_summary_json.log" || true
+
   _prefix_key_outputs
-  echo "[$SAMPLE] done -> $SDIR/  (per-sample summary in $SDIR/summary.tsv; aggregate row appended to $OUTDIR/summary.tsv)"
+  echo "[$SAMPLE] done -> $SDIR/  (per-sample summary.tsv + summary.json; aggregate row appended to $OUTDIR/summary.tsv)"
 fi
