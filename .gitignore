@@ -51,6 +51,14 @@ clusters/
 _*/
 *_out/
 
+# Example assets stored via git-lfs — explicitly UN-ignored so the
+# bundled-with-the-repo demo data is committed (overrides the
+# `**/k[0-9][0-9]*/`, `**/assembly_graph_after_simplification.gfa`,
+# and `**/spades*/` rules above for content under examples/).
+!examples/
+!examples/**
+!examples/**/*.gfa.gz
+
 # Editor / OS
 .DS_Store
 *.bak
