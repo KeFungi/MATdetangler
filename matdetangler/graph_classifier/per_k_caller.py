@@ -55,7 +55,7 @@ below `1 - divergence_threshold`. The default threshold is 0.05 (i.e.
 arms must differ by ≥5% to count as distinct alleles).
 """
 from __future__ import annotations
-from collections import deque
+from collections import Counter, deque
 from .seg_processor import directional_split
 from .bubble_classifier import classify
 from .bubble_bfs import build_adj
@@ -308,7 +308,7 @@ def find_alleles(
         gfa_path: str,
         genome_cov: float | None = None,
         init_nhop: int = 3,
-        max_nhop: int = 10,
+        max_nhop: int = 8,
         divergence_threshold: float = 0.01,
         lo_mult: float = 0.2,
         hi_mult: float = 2.0,
@@ -320,7 +320,10 @@ def find_alleles(
         queries_dir: str | None = None,
         out_candidate_fa: str | None = None,
         seeds_mode: str = "both",            # "flank" | "var" | "both"
-        cov_filter: bool = True,             # cov filter ON by default
+        cov_filter: bool = True,             # True (default): cov-off main pass +
+                                             #   cov-on fallback if no complete
+                                             #   closed_bubble was accepted.
+                                             # False: cov-off only — fallback disabled.
         max_paths: int = 1000,
         max_path_length: int = 50,
         max_bp_since_var: int = 5000,        # bp-aware path enumeration cap
@@ -369,7 +372,24 @@ def find_alleles(
     else:  # "both"
         seeds = var_seg_set | flank_seg_set | contig_seeds
 
-    def _log(nhop: int, res: dict) -> None:
+    print(f"  [seeds] mode={seeds_mode}  |var|={len(var_seg_set)} "
+          f"|flank|={len(flank_seg_set)} |contig|={len(contig_seeds)} "
+          f"|active_seeds|={len(seeds)}", flush=True)
+
+    def _separate_info(res: dict) -> str:
+        """For `separate` verdicts: per-network sub-verdicts + var-node counts.
+        Helps explain why a sample stays `arms=0` (e.g., 17 vars splattered
+        into 14 tiny components vs 2 substantial sub-bubbles)."""
+        subs = res.get("sub_results") or []
+        if not subs: return ""
+        verdicts = Counter(s.get("class", "?") for s in subs)
+        vcounts = sorted([s.get("n_var", 0) for s in subs], reverse=True)
+        vshow = vcounts[:8] + (["..."] if len(vcounts) > 8 else [])
+        vs = ",".join(str(x) for x in vshow)
+        verdict_summary = ",".join(f"{k}:{v}" for k, v in verdicts.most_common())
+        return f"  [nets={len(subs)} sub-verdicts={{{verdict_summary}}} var-per-net=[{vs}]]"
+
+    def _log(nhop: int, cov_pass: bool, res: dict) -> None:
         n_arms = res.get("n_arms", 0)
         n_var  = res.get("n_var", 0)
         nhood  = len(res.get("_nhood", ()))
@@ -380,96 +400,127 @@ def find_alleles(
             lim_str = (f"  ⚠ limits: max_paths_hit={limits.get('max_paths_hit',0)}"
                        f" max_path_length_hit={limits.get('max_path_length_hit',0)}"
                        f" max_bp_hit={limits.get('max_bp_hit',0)}")
-        print(f"  [nhop={nhop} seeds={seeds_mode} cov={'on' if cov_filter else 'off'}] "
-              f"|nhood|={nhood:<6} var={n_var:<3} cls={res['class']:<14} arms={n_arms}{lim_str}",
+        sep_str = _separate_info(res) if res.get("class") == "separate" else ""
+        print(f"  [nhop={nhop} seeds={seeds_mode} cov={'on' if cov_pass else 'off'}] "
+              f"|nhood|={nhood:<6} var={n_var:<3} cls={res['class']:<14} arms={n_arms}{lim_str}{sep_str}",
               flush=True)
 
-    # New design (loop simplified per user spec):
-    #   - drop phase 2 (flank_fallback was a no-op in 144/144 picks)
-    #   - drop cov-off pass (cov-on won 144/144 picks; cov-off only added noise)
-    #   - seeds + cov_filter are configuration, not loop axes
-    # The loop is just `for nhop in init_nhop..max_nhop`, with a single
-    # variant per nhop. Hard short-circuit on the first complete closed_bubble.
-    # All emitted candidates ranked at the end by the unified 4-tier key.
+    def _log_pools(iter_id: str, pools: list[dict]) -> None:
+        """One line per emitted pool with the completeness/dedup stats that
+        feed the picker. Lets you see at a glance how close each iteration
+        came to short-circuit (closed_bubble + n>=2 + cl=2)."""
+        for net_i, pool in enumerate(pools, start=1):
+            n_dedup = pool.get("n_dedup", 0)
+            n_raw   = pool.get("n_raw", 0)
+            verdict = pool.get("verdict") or "?"
+            cv = pool.get("complete_var", 0)
+            cl = pool.get("complete_locus", 0)
+            bp = pool.get("basepair", 0)
+            net_tag = f"net={net_i}" if len(pools) > 1 else "net=0"
+            print(f"    [{iter_id} {net_tag}] verdict={verdict:<14} n_raw={n_raw:<3} "
+                  f"n_dedup={n_dedup:<2} cl={cl} cv={cv} bp={bp}", flush=True)
+
+    # Loop design:
+    #   - inner: nhop = init_nhop..max_nhop with cov-filter OFF (broad pass)
+    #   - if no fully complete closed_bubble was accepted AND the
+    #     `cov_filter` arg is True (the default), do a FALLBACK pass
+    #     with cov-filter ON across the same nhop range — to rescue
+    #     samples where cov-off picked up too many off-depth segments
+    #     and cov-on yields a cleaner subgraph.
+    #   - `--cov-filter off` disables the fallback entirely (cov-off only).
+    # Hard short-circuit fires only on a complete closed_bubble (cov-off
+    # OR cov-on); subsequent passes are skipped.
+
+    cov_passes = [False, True] if cov_filter else [False]
 
     candidates: list[dict] = []
     iter_metadata: dict[str, dict] = {}
     short_circuit = False
 
-    for nhop in range(init_nhop, max_nhop + 1):
+    for cov_pass in cov_passes:
         if short_circuit: break
-        iter_id = f"h{nhop}"
-        res = _try_one_pass(
-            seeds, all_edges, endpoints, adj_und, nhop,
-            seg_labels, seg_length, depths, gfa_seqs,
-            genome_cov, divergence_threshold,
-            apply_cov_filter=cov_filter,
-            lo_mult=lo_mult, hi_mult=hi_mult,
-            max_paths=max_paths, max_path_length=max_path_length,
-            max_bp_since_var=max_bp_since_var,
-        )
-        res["_phase"]      = seeds_mode
-        res["_n_hops"]     = nhop
-        res["_cov_filter"] = cov_filter
-        _log(nhop, res)
+        for nhop in range(init_nhop, max_nhop + 1):
+            if short_circuit: break
+            iter_id = f"{'con' if cov_pass else 'coff'}_h{nhop}"
+            res = _try_one_pass(
+                seeds, all_edges, endpoints, adj_und, nhop,
+                seg_labels, seg_length, depths, gfa_seqs,
+                genome_cov, divergence_threshold,
+                apply_cov_filter=cov_pass,
+                lo_mult=lo_mult, hi_mult=hi_mult,
+                max_paths=max_paths, max_path_length=max_path_length,
+                max_bp_since_var=max_bp_since_var,
+            )
+            res["_phase"]      = seeds_mode
+            res["_n_hops"]     = nhop
+            res["_cov_filter"] = cov_pass
+            _log(nhop, cov_pass, res)
 
-        if res.get("n_var", 0) == 0 or res["class"] == "no_var":
-            continue
+            if res.get("n_var", 0) == 0 or res["class"] == "no_var":
+                continue
 
-        pools_out = _emit_result(
-            res, gfa_seqs, depths=depths,
-            divergence_threshold=divergence_threshold,
-            var_proteins_ref=var_proteins_ref,
-            locus_padding=locus_padding,
-            expected_var_tags=expected_var_tags,
-            genome_cov=genome_cov,
-            lo_mult=lo_mult, hi_mult=hi_mult,
-            queries_dir=queries_dir,
-            return_pools=True,
-            min_allele_bp=min_allele_bp,
-        )
-        pools = pools_out["pools"]
-        iter_metadata[iter_id] = {
-            "res": res, "pools_out": pools_out,
-            "phase": seeds_mode, "nhop": nhop, "cov": cov_filter,
-        }
-
-        for net_i, pool in enumerate(pools, start=1):
-            if not pool["alleles"]: continue
-            net_in_iter = net_i if len(pools) > 1 else 0
-            cand = {
-                "iter_id":   iter_id,
-                "net_in_iter": net_in_iter,
-                "phase":     seeds_mode,
-                "nhop":      nhop,
-                "cov":       cov_filter,
-                "verdict":   pool.get("verdict") or res["class"],
-                "alleles":   pool["alleles"],
-                "allele_cov": pool["allele_cov"],
-                "extend_bounds": pool["extend_bounds"],
-                "allele_segments": pool["allele_segments"],
-                "n_dedup":   pool["n_dedup"],
-                "n_raw":     pool["n_raw"],
-                # Tri-state at the NETWORK level: 0=none, 1=some, 2=all
-                "complete_var":   int(pool.get("complete_var") or 0),
-                "complete_locus": int(pool.get("complete_locus") or 0),
-                "basepair":  pool["basepair"],
-                "diploid_dist": pool["diploid_dist"],
-                "found_tags": pool["found_tags_surviving"],
+            pools_out = _emit_result(
+                res, gfa_seqs, depths=depths,
+                divergence_threshold=divergence_threshold,
+                var_proteins_ref=var_proteins_ref,
+                locus_padding=locus_padding,
+                expected_var_tags=expected_var_tags,
+                genome_cov=genome_cov,
+                lo_mult=lo_mult, hi_mult=hi_mult,
+                queries_dir=queries_dir,
+                return_pools=True,
+                min_allele_bp=min_allele_bp,
+            )
+            pools = pools_out["pools"]
+            _log_pools(iter_id, pools)
+            iter_metadata[iter_id] = {
+                "res": res, "pools_out": pools_out,
+                "phase": seeds_mode, "nhop": nhop, "cov": cov_pass,
             }
-            candidates.append(cand)
 
-            # Acceptance: closed_bubble n≥2 with FULLY complete locus + var
-            # (both tri-states at level 2).
-            if (cand["verdict"] == "closed_bubble"
-                    and cand["n_dedup"] >= 2
-                    and cand["complete_locus"] >= 2
-                    and cand["complete_var"] >= 2):
-                print(f"  [accept] {iter_id} net={net_in_iter}: "
-                      f"closed_bubble n={cand['n_dedup']} complete — short-circuiting",
-                      flush=True)
-                short_circuit = True
-                break
+            for net_i, pool in enumerate(pools, start=1):
+                if not pool["alleles"]: continue
+                net_in_iter = net_i if len(pools) > 1 else 0
+                cand = {
+                    "iter_id":   iter_id,
+                    "net_in_iter": net_in_iter,
+                    "phase":     seeds_mode,
+                    "nhop":      nhop,
+                    "cov":       cov_pass,
+                    "verdict":   pool.get("verdict") or res["class"],
+                    "alleles":   pool["alleles"],
+                    "allele_cov": pool["allele_cov"],
+                    "extend_bounds": pool["extend_bounds"],
+                    "allele_segments": pool["allele_segments"],
+                    "n_dedup":   pool["n_dedup"],
+                    "n_raw":     pool["n_raw"],
+                    # Tri-state at the NETWORK level: 0=none, 1=some, 2=all
+                    "complete_var":   int(pool.get("complete_var") or 0),
+                    "complete_locus": int(pool.get("complete_locus") or 0),
+                    "basepair":  pool["basepair"],
+                    "diploid_dist": pool["diploid_dist"],
+                    "found_tags": pool["found_tags_surviving"],
+                }
+                candidates.append(cand)
+
+                # Acceptance: closed_bubble n≥2 with both flanks covered
+                # across all alleles (complete_locus tri-state = 2).
+                # complete_locus and complete_var are independent axes —
+                # complete_locus measures FLANK presence only, complete_var
+                # measures HD-tag presence. Requiring only complete_locus
+                # accepts diploid 2-allele answers where one allele is
+                # truncated in its var content (cv=1) but both flanks are
+                # anchored. Avoids collapsing to a homozygote-looking n=1
+                # single just because that single allele happens to carry
+                # all HDs.
+                if (cand["verdict"] == "closed_bubble"
+                        and cand["n_dedup"] >= 2
+                        and cand["complete_locus"] >= 2):
+                    print(f"  [accept] {iter_id} net={net_in_iter}: "
+                          f"closed_bubble n={cand['n_dedup']} complete_locus=2 — short-circuiting",
+                          flush=True)
+                    short_circuit = True
+                    break
 
     # Write candidate_allele.fasta if requested — every emitted sequence
     # across every (iter, network), tagged with its provenance in the header.
@@ -1075,44 +1126,7 @@ def _emit_result(res: dict, gfa_seqs: dict[str, str],
         if not var_idx: return p
         return p[var_idx[0]:var_idx[-1] + 1]
 
-    def _trim_component_to_var(c: list[str]) -> list[str]:
-        """Node-level trim: unordered component → only var nodes."""
-        return [n for n in c if n in var_nodes]
-
     var_per_node = res.get("_var_per_node", {})
-
-    # The component cov-band check is GATED by the same `cov_filter` state
-    # the BFS iteration used (res["_cov_filter"]). When the BFS ran with
-    # cov-filter on, we apply it to var_components too; when the BFS ran
-    # with cov-filter off (the lenient fallback), we don't.
-    cov_filter_active = bool(res.get("_cov_filter", False))
-
-    def _component_passes_filter(comp_nodes: list[str]) -> bool:
-        """Filter for raw `var_components` emission (rarely used now that
-        we recurse classify per network).
-        (a) ≥ 2 DISTINCT var tags — always applies (the orphan-fragment guard).
-        (b) mean depth in cov-filter band — applied only when the BFS this
-            iteration also ran with the cov filter on (consistent state)."""
-        tags: set[str] = set()
-        for n in comp_nodes:
-            t = var_per_node.get(n)
-            if t: tags |= set(t)
-        if len(tags) < 2:
-            return False
-        if cov_filter_active and genome_cov and depths:
-            lo, hi = lo_mult * genome_cov, hi_mult * genome_cov
-            total_bp = 0; weighted = 0.0
-            for n in comp_nodes:
-                if n not in prov: continue
-                seg, s, e, _ = prov[n]
-                L = e - s
-                d = depths.get(seg)
-                if d is None or L <= 0: continue
-                total_bp += L; weighted += L * d
-            mean_dp = (weighted / total_bp) if total_bp else 0.0
-            if mean_dp and not (lo <= mean_dp <= hi):
-                return False
-        return True
 
     # ---- Per-network pool builder -------------------------------------------
     #
@@ -1145,7 +1159,7 @@ def _emit_result(res: dict, gfa_seqs: dict[str, str],
                         return True
         return False
 
-    def _process_pool(closed_arms, dangling_arms, var_components, prefix,
+    def _process_pool(closed_arms, dangling_arms, prefix,
                        pool_verdict: str = None):
         """Build raw candidates → locus-trim → dedup → emit names.
         Returns dict with keys: alleles, allele_cov, allele_segments,
@@ -1168,13 +1182,6 @@ def _emit_result(res: dict, gfa_seqs: dict[str, str],
             nm = f"{prefix}da{j}"
             local_raw.append((nm, _seq_full(tp))); local_path[nm] = tp
             local_path_pre[nm] = list(p)
-        for j, c in enumerate(var_components or []):
-            tc = _trim_component_to_var(list(c))
-            if not _component_passes_filter(tc): continue
-            nm = f"{prefix}vc{j}"
-            local_raw.append((nm, _arm_sequence_for(tc, prov, gfa_seqs)))
-            local_path[nm] = tc
-            local_path_pre[nm] = list(c)
 
         n_raw_pool = len(local_raw)
 
@@ -1203,9 +1210,12 @@ def _emit_result(res: dict, gfa_seqs: dict[str, str],
         _cov  = lambda rn: _path_mean_cov(local_path.get(rn, []), prov, depths_d)
         _bnds = lambda rn: _innermost_flank_bounds(local_path.get(rn, []))
 
-        # Completeness ranking for dedup. Per candidate, compute:
+        # Completeness ranking for dedup. Per candidate, compute (independent
+        # axes — neither implies the other):
         #   complete_var   = expected_var_tags ⊆ found_var_tags(this candidate)
-        #   complete_locus = complete_var AND has_flankL AND has_flankR
+        #                    [HD-tag coverage]
+        #   complete_locus = has_flankL AND has_flankR
+        #                    [pure flank presence — does NOT require complete_var]
         # Flank presence comes from the path's GRAPH-LEVEL labels (the
         # pre-trim arm carries flank-labeled nodes as endpoints/anchors),
         # NOT from a blastn over the locus-trimmed sequence — the trim
@@ -1697,7 +1707,6 @@ def _emit_result(res: dict, gfa_seqs: dict[str, str],
             pools.append(_process_pool(
                 sub.get("closed_arms", []) or [],
                 sub.get("dangling_arms", []) or [],
-                sub.get("var_components", []) or [],
                 prefix=f"n{i+1}_",
                 pool_verdict=sub.get("class"),
             ))
@@ -1705,7 +1714,6 @@ def _emit_result(res: dict, gfa_seqs: dict[str, str],
         pools = [_process_pool(
             res.get("closed_arms", []) or [],
             res.get("dangling_arms", []) or [],
-            res.get("var_components", []) or [],
             prefix="",
             pool_verdict=cls,
         )]

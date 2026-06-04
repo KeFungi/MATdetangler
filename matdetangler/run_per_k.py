@@ -78,7 +78,12 @@ def main(argv: list[str] | None = None) -> int:
                      help="per-sample output root; writes outdir/<k>/...")
     ap.add_argument("--threads", type=int, default=4)
     ap.add_argument("--init-nhop", type=int, default=3)
-    ap.add_argument("--max-nhop",  type=int, default=10)
+    ap.add_argument("--max-nhop",  type=int, default=8,
+                    help="Upper bound on BFS hop count per iteration. "
+                         "Empirically all useful short-circuits on Pcub40 "
+                         "happen by nhop=6; cap at 8 leaves a margin while "
+                         "preventing the exponential blow-up at nhop 9-10 "
+                         "for hard samples like NY-1901145.")
     ap.add_argument("--lo-mult",   type=float, default=0.2)
     ap.add_argument("--hi-mult",   type=float, default=2.0)
     ap.add_argument("--locus-padding", type=int, default=4000)
@@ -86,7 +91,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--seeds", choices=("var","flank","both"), default="both",
                     help="BFS seed source (var-labeled, flank-labeled, or both). Default: both.")
     ap.add_argument("--cov-filter", choices=("on","off"), default="on",
-                    help="Depth filter on the BFS neighborhood. Default: on.")
+                    help="Depth filter on the BFS neighborhood. 'on' (default): "
+                         "run the cov-OFF pass first; if no complete closed_bubble "
+                         "is found, fall back to a cov-ON pass over the same nhop "
+                         "range. 'off': cov-off only — fallback never runs.")
     ap.add_argument("--max-paths", type=int, default=1000,
                     help="Hard cap on simple paths per anchor in classifier. Default: 1000.")
     ap.add_argument("--max-path-length", type=int, default=50,

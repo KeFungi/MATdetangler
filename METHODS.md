@@ -193,8 +193,8 @@ for each K in --ks:
     # 3.1.4 Caller — full algorithm in §3.3 onward
     res = find_alleles(seg_label_hits.tsv, gfa(K),
                        genome_cov=D_k,
-                       init_nhop=3, max_nhop=10,
-                       lo_mult=0.25, hi_mult=2.0,
+                       init_nhop=3, max_nhop=8,
+                       lo_mult=0.2, hi_mult=2.0,
                        var_proteins_ref=HDs.fasta,
                        expected_var_tags={HD1, HD2, ...},
                        locus_padding=1500,
@@ -412,13 +412,18 @@ the rest is a single counting step.
 
 ### 3.7 `find_alleles` BFS loop
 
-`find_alleles(seg_label_hits_tsv, gfa_path, genome_cov, init_nhop=3, max_nhop=10, var_proteins_ref=…, expected_var_tags=…, locus_padding=4000, lo_mult=0.2, hi_mult=2.0, divergence_threshold=0.01, queries_dir=…, out_candidate_fa=…, seeds_mode="both", cov_filter=True, max_paths=1000, max_path_length=50, max_bp_since_var=5000, min_allele_bp=0)`
+`find_alleles(seg_label_hits_tsv, gfa_path, genome_cov, init_nhop=3, max_nhop=8, var_proteins_ref=…, expected_var_tags=…, locus_padding=4000, lo_mult=0.2, hi_mult=2.0, divergence_threshold=0.01, queries_dir=…, out_candidate_fa=…, seeds_mode="both", cov_filter=True, max_paths=1000, max_path_length=50, max_bp_since_var=5000, min_allele_bp=0)`
 
 The orchestrator runs the BFS at increasing hop counts, collects per-network
 candidates from every iteration, optionally short-circuits when a fully
-complete candidate appears, then picks across the pool. Loop axes
-**seeds_mode** and **cov_filter** are caller-time configuration (not loop
-variants), so the loop is just over `nhop`.
+complete-LOCUS candidate appears, then picks across the pool. Two axes:
+the outer cov-filter pass and the inner nhop range.
+
+**Cov-filter as a fallback**: `cov_filter=True` (default) means "cov-OFF
+main pass + cov-ON fallback if no short-circuit". `cov_filter=False`
+disables the fallback (cov-OFF only). Empirically cov-OFF rescues
+fragmented-flank samples that the depth band drops; cov-ON is held in
+reserve as a tightening pass.
 
 ```python
 # Seeds — set ONCE from seeds_mode
@@ -426,39 +431,44 @@ seeds = var_segs              if seeds_mode == "var"
       | flank_segs            if seeds_mode == "flank"
       | (var_segs|flank_segs) if seeds_mode == "both"          # default
 
+cov_passes = [False, True] if cov_filter else [False]
+
 candidates = []
 short_circuit = False
 
-for nhop in init_nhop..max_nhop:                  # default 3..10
-    res = _try_one_pass(seeds, nhop, cov_filter,  # cov_filter = True by default
-                        max_paths, max_path_length)
-    log(nhop, |nhood|, n_var, class, n_arms,
-        bfs_limits_hit)                            # logs cap hits when fired
-
-    if res.class == "no_var" or res.n_var == 0:
-        continue
-
-    pools = _emit_result(res, ..., return_pools=True)
-    for i, pool in enumerate(pools):
-        if not pool.alleles: continue
-        c = {
-            iter_id, net_in_iter=(i+1 if N>1 else 0),
-            verdict=pool.sub_verdict,             # NEVER 'separate' at pool level
-            complete_var,                          # tri-state 0/1/2 — per-allele MIN
-            complete_locus,                        # tri-state 0/1/2 — per-allele MIN
-            alleles, allele_cov, basepair, diploid_dist,
-            ...
-        }
-        candidates.append(c)
-
-        # Acceptance gate (α — hard short-circuit): tri-state == 2 required
-        if (c.verdict == "closed_bubble"
-                and c.n_dedup >= 2
-                and c.complete_locus >= 2
-                and c.complete_var >= 2):
-            short_circuit = True
-
+for cov_pass in cov_passes:                       # cov-OFF first, cov-ON fallback
     if short_circuit: break
+    for nhop in init_nhop..max_nhop:              # default 3..8
+        if short_circuit: break
+        res = _try_one_pass(seeds, nhop, apply_cov_filter=cov_pass,
+                            max_paths, max_path_length)
+        log(nhop, cov_pass, |nhood|, n_var, class, n_arms,
+            bfs_limits_hit)                       # logs cap hits when fired
+
+        if res.class == "no_var" or res.n_var == 0:
+            continue
+
+        pools = _emit_result(res, ..., return_pools=True)
+        for i, pool in enumerate(pools):
+            if not pool.alleles: continue
+            c = {
+                iter_id, net_in_iter=(i+1 if N>1 else 0),
+                verdict=pool.sub_verdict,         # NEVER 'separate' at pool level
+                complete_var,                      # tri-state 0/1/2 — per-allele MIN
+                complete_locus,                    # tri-state 0/1/2 — per-allele MIN
+                alleles, allele_cov, basepair, diploid_dist,
+                ...
+            }
+            candidates.append(c)
+
+            # Acceptance gate (α — hard short-circuit): complete_locus tri-state
+            # == 2 required. complete_var is NOT required — preserves diploid
+            # n=2 topology over single-allele collapses (see "Why drop cv from
+            # acceptance" below).
+            if (c.verdict == "closed_bubble"
+                    and c.n_dedup >= 2
+                    and c.complete_locus >= 2):
+                short_circuit = True
 
 write_candidate_fasta(candidates, out_candidate_fa)
 
@@ -487,26 +497,51 @@ sample_verdict = ("separate" if len(surviving_nets) >= 2
                   else siblings[0].verdict)
 ```
 
-#### Loop axes that were dropped
+#### Loop history
 
-Earlier the loop had `phase × nhop × cov_filter` = 24 iterations. Empirical
-results on a 148-sample whitelist showed:
+Earlier the loop had `phase × nhop × cov_filter` = 24 iterations.
+Successive empirical sweeps on the 148-sample Suilu whitelist and
+Pcub40 reshaped it:
 
 | Loop axis | Wins on which samples | Decision |
 |---|---|---|
 | Phase 2 (`flank_fallback`) | 0 / 144 picks | dropped — moved to `seeds_mode` config |
-| `cov_filter=False` pass | 1 / 292 per-k results, never wins K-pick | dropped — moved to `cov_filter` config |
+| `cov_filter=False` (later run as MAIN pass on Pcub40) | rescues fragmented-flank samples (e.g. FLAS-59250: `open_bubble` under cov-ON → `closed_bubble` under cov-OFF) | restored as the cov-filter MAIN pass; cov-ON kept as a fallback |
+| `max_nhop = 10` (legacy) | 0 short-circuits at nhop 7-10 on Pcub40 | cap reduced to 8 — empirically 53/53 short-circuits happen by nhop=6; nhops 9-10 just compounded ~1.5× neighborhood growth on samples like NY-1901145 that never short-circuit |
 
-Iteration count is now `max_nhop − init_nhop + 1` = up to 8 (default 3..10).
+Iteration count is now `(max_nhop − init_nhop + 1)` per cov pass × at
+most 2 cov passes = up to 12 (default `3..8` × `{cov-OFF, cov-ON}`).
+The cov-ON pass only runs when the cov-OFF pass exhausts without
+short-circuit.
+
+#### Why complete_var is NOT required at acceptance
+
+`complete_locus` and `complete_var` are **independent axes**, not nested:
+- `complete_locus` = both `flankL` and `flankR` BLAST hits present in the
+  allele (graph-label based, MIN across alleles for the pool tri-state).
+- `complete_var` = all expected HD-tag hits present in the allele
+  (also MIN-aggregated to the pool tri-state).
+
+A diploid sample can have **both flanks anchored on both alleles** (`cl=2`)
+while **one allele has a truncated HD tail** (`cv=1` after MIN aggregation).
+Requiring `cv == 2` at the short-circuit would force the picker to
+continue into the cov-ON fallback or higher nhops, where the next
+candidate it finds may be a `single n=1 cv=2` — a homozygote-collapsed
+answer that hides the second allele.
+
+Concrete case: NY-1593938 picks `closed_bubble n=2 cv=1 cl=2` (correct
+diploid) when complete_var is dropped from the gate, vs the prior
+`single n=1 cv=2 cl=2` (collapsed) when it was required. Preserving
+the 2-allele topology is the right call for diploid samples.
 
 #### Key invariants
 
 - **Acceptance (α) is a hard short-circuit**, not a fallback. Fires the
-  moment ANY candidate is `closed_bubble`, `n_dedup ≥ 2`, AND both tri-state
-  completeness scores at level 2 (all expected var tags AND both flanks
-  present in EVERY emitted allele of the candidate's pool — the per-allele
-  MIN aggregation prevents the "two single-HD fragments union to look
-  complete" pathology).
+  moment ANY candidate is `closed_bubble`, `n_dedup ≥ 2`, AND
+  `complete_locus = 2` (both flanks present in every emitted allele of
+  the candidate's pool — the per-allele MIN aggregation prevents the
+  "two single-HD fragments union to look complete" pathology). The
+  candidate's `complete_var` can be 1 — see the note above.
 - **No candidate ever carries `verdict="separate"`.** When the classifier
   returns `class="separate"`, each network's sub-classification
   (`closed_bubble`/`open_bubble`/`single`/`complexed`) becomes its
@@ -847,10 +882,13 @@ The output dict:
 
     # Completeness (post-trim tblastn over surviving candidates,
     #               graph-level flank-presence check — §3.7)
-    "complete_var":    bool | None,   # all expected_var_tags hit?
-    "complete_locus":  bool | None,   # at sample level: aliases complete_var
-                                       # (per-candidate level: complete_var AND
-                                       #  has_flankL AND has_flankR)
+    "complete_var":    bool | None,   # all expected_var_tags hit? [HD coverage]
+    "complete_locus":  bool | None,   # both flankL AND flankR hit?
+                                       # [pure flank presence — INDEPENDENT
+                                       # of complete_var, NOT nested. A
+                                       # candidate can be cl=2 cv=1
+                                       # (both flanks, missing one HD) or
+                                       # cl=1 cv=2 (one flank, all HDs).]
     "locus_coverage":  float | None,  # fraction of expected_var_tags found
     "found_var_tags":  sorted list[str],
 
@@ -1164,7 +1202,7 @@ phase B is cheap (single-linkage cut on the saved matrix) and re-runnable at any
 | Flank too short for downstream anchoring | `--max-flank-len` (default 2000) | also raises `derived_max_locus_len` |
 | Near-identical paths surviving as distinct emitted candidates | `divergence_threshold` (default 0.05, edlib HW edit-distance in `find_alleles`) | raise → keep more variants as distinct; lower → merge more |
 | BFS blowing up the bubble at a high-copy hub | `lo_mult` / `hi_mult` (defaults 0.25 / 2.0 in `find_alleles`) | per-pass coverage filter band `[lo × D_k, hi × D_k]`; tighter band → fewer noisy segments enter the bubble |
-| Caller wall-time blowing up on tangled k=33 graphs | `max_nhop` (default 10 in `find_alleles`) | tighter cap; BPL1195-shape combinatorial blow-ups still possible — see TODO `_enum_paths` node-visit budget |
+| Caller wall-time blowing up on tangled k=33 graphs | `max_nhop` (default 8 in `find_alleles`, reduced from 10 in 2026-06 after Pcub40 sweep) | tighter cap; BPL1195-shape combinatorial blow-ups still possible — see TODO `_enum_paths` node-visit budget |
 | Locus-trim too aggressive or too loose | `locus_padding` (default 1500 bp in `find_alleles`) | bp pad each side of the tblastn HD-hit envelope before sequence emission |
 | Cross-K picks the wrong K | `pick_k` priority order + tie-break vector | adjustable (see §4); typically k53 wins for Suilu, k77 for Pcub |
 | BLAST wall-time on iterative dev | per-K cached BLAST TSVs in `<outdir>/<K>/` | first run blasts; downstream stages re-read; wipe the per-K dir to force re-blast |
