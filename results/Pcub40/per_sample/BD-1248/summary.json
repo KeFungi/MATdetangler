@@ -5,7 +5,7 @@
     "allele1_complete": true,
     "allele1_path_str": "32412092 <-> 21525322#4 (flankL) <-> 21525322#3 (NC_062999_HD1) <-> 21525322#2 (NC_062999_HD2) <-> 21525322#1 (flankR) <-> 1749 (flankR)",
     "allele1_vs_allele2_aln_frac": 0.94,
-    "allele1_vs_allele2_id_pct": 61.8,
+    "allele1_vs_allele2_id_pct": 62.3,
     "allele2_complete": true,
     "allele2_path_str": "32412092 <-> 529781#4 (flankL) <-> 529781#3 (NC_062999_HD1) <-> 529781#2 (NC_062999_HD2) <-> 529781#1 (flankR) <-> 1749 (flankR)",
     "allele_cov": [
@@ -25,12 +25,12 @@
         "origin": "path",
         "sample": "BD-1248",
         "segments": [
-          "32412092",
-          "21525322#4",
-          "21525322#3",
-          "21525322#2",
+          "1749",
           "21525322#1",
-          "1749"
+          "21525322#2",
+          "21525322#3",
+          "21525322#4",
+          "32412092"
         ],
         "type": "complete"
       },
@@ -46,12 +46,12 @@
         "origin": "path",
         "sample": "BD-1248",
         "segments": [
-          "32412092",
-          "529781#4",
-          "529781#3",
-          "529781#2",
+          "1749",
           "529781#1",
-          "1749"
+          "529781#2",
+          "529781#3",
+          "529781#4",
+          "32412092"
         ],
         "type": "complete"
       }
@@ -109,7 +109,7 @@
     "sample": "BD-1248"
   },
   "version": {
-    "describe": "51102df-dirty",
-    "git_hash": "51102df59a0a55f7313066878794d9c30eee0a21"
+    "describe": "dee7d85-dirty",
+    "git_hash": "dee7d8596e18f4442e2a4dcdf28baf6e10b039d9"
   }
 }

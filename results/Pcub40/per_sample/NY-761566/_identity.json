@@ -1,1 +1,1 @@
-{"a1": "NY-761566_k45_allele1", "a2": "NY-761566_k45_allele2", "len_a1": 5646, "len_a2": 6034, "id_pct": 49.8, "aln_frac": 0.86, "distinct": true, "metric": "whole-allele"}
+{"a1": "NY-761566_k45_allele1", "a2": "NY-761566_k45_allele2", "len_a1": 5646, "len_a2": 6034, "id_pct": 60.7, "aln_frac": 0.93, "distinct": true, "metric": "whole-allele"}

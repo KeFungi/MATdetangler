@@ -3,11 +3,11 @@
   "sample": {
     "all_k_tried": "k45,k53",
     "allele1_complete": true,
-    "allele1_path_str": "15471940 (flankL) <-> 16948582#3 (NC_062999_HD1) <-> 16948582#2 (NC_062999_HD2) <-> 16948582#1 (flankR) <-> 16942314 (flankR)",
-    "allele1_vs_allele2_aln_frac": 0.55,
-    "allele1_vs_allele2_id_pct": 62.3,
+    "allele1_path_str": "16914612#1 (flankL) <-> 15471940 (flankL) <-> 16948582#3 (NC_062999_HD1) <-> 16948582#2 (NC_062999_HD2) <-> 16948582#1 (flankR) <-> 16942314 (flankR)",
+    "allele1_vs_allele2_aln_frac": 0.94,
+    "allele1_vs_allele2_id_pct": 61.3,
     "allele2_complete": true,
-    "allele2_path_str": "15471940 (flankL) <-> 16914612#1 (flankL) <-> 16914612#2 (NC_062999_HD1) <-> 16914612#3 (NC_062999_HD2) <-> 16914612#4 (flankR) <-> 16942314 (flankR)",
+    "allele2_path_str": "16914612#1 (flankL) <-> 16914612#2 (NC_062999_HD1) <-> 16914612#3 (NC_062999_HD2) <-> 16914612#4 (flankR) <-> 16942314 (flankR)",
     "allele_cov": [
       34.3,
       34.9
@@ -20,16 +20,17 @@
         "has_both_flanks": true,
         "is_degHD": false,
         "k": "k45",
-        "len": 5755,
+        "len": 6163,
         "n_variable_genes": "2/2",
         "origin": "path",
         "sample": "vietnam_BD1417",
         "segments": [
-          "16942314",
-          "16948582#1",
-          "16948582#2",
+          "16914612#1",
+          "15471940",
           "16948582#3",
-          "15471940"
+          "16948582#2",
+          "16948582#1",
+          "16942314"
         ],
         "type": "complete"
       },
@@ -40,12 +41,11 @@
         "has_both_flanks": true,
         "is_degHD": false,
         "k": "k45",
-        "len": 5758,
+        "len": 5018,
         "n_variable_genes": "2/2",
         "origin": "path",
         "sample": "vietnam_BD1417",
         "segments": [
-          "15471940",
           "16914612#1",
           "16914612#2",
           "16914612#3",
@@ -55,7 +55,7 @@
         "type": "complete"
       }
     ],
-    "basepair": 11513,
+    "basepair": 11181,
     "bubble_type": "closed_bubble",
     "complete_locus": 2,
     "complete_var": 2,
@@ -108,7 +108,7 @@
     "sample": "vietnam_BD1417"
   },
   "version": {
-    "describe": "51102df-dirty",
-    "git_hash": "51102df59a0a55f7313066878794d9c30eee0a21"
+    "describe": "dee7d85-dirty",
+    "git_hash": "dee7d8596e18f4442e2a4dcdf28baf6e10b039d9"
   }
 }

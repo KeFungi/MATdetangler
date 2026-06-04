@@ -1175,7 +1175,7 @@ Both numbers land in `summary.tsv` alongside the pick-level versions:
 
 ---
 
-## 8. Cross-sample mating-type clustering  (`MATdetangler cluster`)
+## 8. Cross-sample mating-type clustering  (`MATdetangler-cli cluster`)
 
 Run after `batch`. Phase A is expensive (one MAFFT alignment of all picked alleles);
 phase B is cheap (single-linkage cut on the saved matrix) and re-runnable at any threshold.

@@ -4,8 +4,8 @@
     "all_k_tried": "k45,k53",
     "allele1_complete": true,
     "allele1_path_str": "18411 (flankL) <-> 37630272 <-> 37594883#3 (NC_062999_HD1) <-> 37594883#2 (NC_062999_HD2) <-> 37594883#1 (flankR) <-> 39109504 (flankR)",
-    "allele1_vs_allele2_aln_frac": 0.92,
-    "allele1_vs_allele2_id_pct": 60.8,
+    "allele1_vs_allele2_aln_frac": 0.56,
+    "allele1_vs_allele2_id_pct": 63.4,
     "allele2_complete": true,
     "allele2_path_str": "18411 (flankL) <-> 37630270 (flankL) <-> 38196809 (NC_062999_HD1) <-> 39082284 <-> 38196799 <-> 17733193 <-> 39116708 <-> 3199271 <-> 14290026 (NC_062999_HD2) <-> 37594881 <-> 1110024 <-> 39109504 (flankR)",
     "allele_cov": [
@@ -27,12 +27,12 @@
         "origin": "graph",
         "sample": "NY-1901145",
         "segments": [
-          "18411",
-          "37630272",
-          "37594883#3",
-          "37594883#2",
+          "39109504",
           "37594883#1",
-          "39109504"
+          "37594883#2",
+          "37594883#3",
+          "37630272",
+          "18411"
         ],
         "type": "complete"
       },
@@ -371,7 +371,7 @@
     "sample": "NY-1901145"
   },
   "version": {
-    "describe": "51102df-dirty",
-    "git_hash": "51102df59a0a55f7313066878794d9c30eee0a21"
+    "describe": "dee7d85-dirty",
+    "git_hash": "dee7d8596e18f4442e2a4dcdf28baf6e10b039d9"
   }
 }

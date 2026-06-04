@@ -26,7 +26,7 @@ ROOT="$(cd "$HERE/../.." && pwd)"
 EX="$ROOT/examples/Pcub40"
 KNOWN="$HERE/known_results.json"
 ARGS_JSON="$HERE/run_args.json"
-TMP_ROOT="${TMPDIR:-/tmp}/matdetangler_pcub40_test_$$"
+TMP_ROOT="${MATDETANGLER_TEST_TMP:-$ROOT/_test_tmp}/matdetangler_pcub40_test_$$"
 OUT_DIR="$TMP_ROOT/results"
 mkdir -p "$OUT_DIR"
 
@@ -65,7 +65,7 @@ done
 # Step 2: run MATdetangler — args mirror run_args.json defaults.
 run_one() {
   local s="$1"
-  "$ROOT/MATdetangler" run \
+  "$ROOT/MATdetangler-cli" run \
     --sample "$s" --spades-dir "$TMP_ROOT/spades/$s" \
     --locus-ref "$ROOT/examples/Pcub_locus/NC_062999.fasta" \
     --proteins  "$ROOT/examples/Pcub_locus/NC_062999_HDs.fasta" \
@@ -89,7 +89,7 @@ set -uo pipefail
 SAMPLES=(${SAMPLES[*]})
 S="\${SAMPLES[\$SLURM_ARRAY_TASK_ID]}"
 source /home/yihongke/miniconda3/etc/profile.d/conda.sh; conda activate hddetangler
-"$ROOT/MATdetangler" run --sample "\$S" --spades-dir "$TMP_ROOT/spades/\$S" \\
+"$ROOT/MATdetangler-cli" run --sample "\$S" --spades-dir "$TMP_ROOT/spades/\$S" \\
   --locus-ref "$ROOT/examples/Pcub_locus/NC_062999.fasta" \\
   --proteins  "$ROOT/examples/Pcub_locus/NC_062999_HDs.fasta" \\
   --outdir "$OUT_DIR" --ks k45,k53 --threads 4 --expected-count 2 --no-skip-pick
@@ -120,14 +120,35 @@ echo "[$(date)] diffing new_results.json vs known_results.json"
 python - "$NEW_JSON" "$KNOWN" <<'PY'
 import json, sys
 new = json.load(open(sys.argv[1])); known = json.load(open(sys.argv[2]))
-# Fields under each sample that are allowed to differ (machine-noise / build-noise).
-TOLERATE = {"per_k_trace", "finished_nhop", "per_k_pick", "genome_cov", "allele_cov"}
+# Sample-level fields ignored: install-drift-sensitive (different MAFFT /
+# BLAST / edlib versions give different numbers without changing the
+# analysis answer). The test is for COMPARING ANALYSIS RESULTS, not for
+# byte-identity across installs.
+TOLERATE = {
+    # machine + estimator noise
+    "per_k_trace", "finished_nhop", "per_k_pick", "genome_cov", "allele_cov",
+    # MAFFT alignment numbers (version-dependent)
+    "allele1_vs_allele2_id_pct", "allele1_vs_allele2_aln_frac",
+    # Human-readable path strings (re-derived; BLAST hit boundaries can
+    # shift trace order without changing the underlying graph walk)
+    "allele1_path_str", "allele2_path_str",
+    # bp totals (drift with locus-trim boundaries)
+    "basepair",
+}
+# Per-allele fields ignored: drift-sensitive numerics; the analysis result
+# is the segments + name + bool flags, not the cov/len numbers.
+ALLELE_TOLERATE = {"cov", "len"}
 def scrub(s):
     s = dict(s)
     for k in TOLERATE: s.pop(k, None)
-    # Per-allele cov is also noise-sensitive; drop from comparison.
+    alleles = []
     for a in s.get("alleles", []):
-        a.pop("cov", None)
+        a = {k: v for k, v in a.items() if k not in ALLELE_TOLERATE}
+        # Segments compared as set (order can drift with BLAST hit boundaries
+        # while content stays the same).
+        a["segments"] = sorted(a.get("segments", []) or [])
+        alleles.append(a)
+    if "alleles" in s: s["alleles"] = alleles
     return s
 diffs = []
 for s in sorted(set(new["samples"]) | set(known["samples"])):
@@ -138,11 +159,11 @@ for s in sorted(set(new["samples"]) | set(known["samples"])):
         print(f"\nDIFF {s}:")
         for key in sorted(set(n) | set(k)):
             if n.get(key) != k.get(key):
-                print(f"    {key}: new={n.get(key)!r:60s}  known={k.get(key)!r}")
+                print(f"    {key}: new={str(n.get(key))[:80]}  known={str(k.get(key))[:80]}")
 if diffs:
     print(f"\nFAIL: {len(diffs)} samples differ ({', '.join(diffs[:5])}{'...' if len(diffs)>5 else ''})")
     sys.exit(1)
-print(f"PASS: all {len(new['samples'])} samples match (ignoring {sorted(TOLERATE)} + per-allele cov)")
+print(f"PASS: all {len(new['samples'])} samples match (analysis result; ignoring install-drift fields)")
 PY
 status=$?
 

@@ -3,11 +3,11 @@
   "sample": {
     "all_k_tried": "k45,k53",
     "allele1_complete": true,
-    "allele1_path_str": "20297847 (flankL) <-> 7126749#4 (flankL) <-> 7126749#3 (NC_062999_HD1) <-> 7126749#2 (NC_062999_HD2) <-> 7126749#1 (flankR) <-> 12784011 (flankR)",
+    "allele1_path_str": "20848525 (flankL) <-> 7126749#4 (flankL) <-> 7126749#3 (NC_062999_HD1) <-> 7126749#2 (NC_062999_HD2) <-> 7126749#1 (flankR) <-> 12784011 (flankR)",
     "allele1_vs_allele2_aln_frac": 0.55,
     "allele1_vs_allele2_id_pct": 63.3,
     "allele2_complete": true,
-    "allele2_path_str": "20297847 (flankL) <-> 6990633#1 (flankL) <-> 6990633#2 (NC_062999_HD1) <-> 6990605 <-> 6990611 <-> 13021155 <-> 1222084 <-> 6311815 <-> 6311809 <-> 10512699#1 (NC_062999_HD2) <-> 10512699#2 (flankR) <-> 12784011 (flankR)",
+    "allele2_path_str": "20848525 (flankL) <-> 6990633#1 (flankL) <-> 6990633#2 (NC_062999_HD1) <-> 6990605 <-> 6990611 <-> 13021155 <-> 1222084 <-> 6311815 <-> 6311809 <-> 10512699#1 (NC_062999_HD2) <-> 10512699#2 (flankR) <-> 12784011 (flankR)",
     "allele_cov": [
       26.6,
       36.9
@@ -25,7 +25,7 @@
         "origin": "path",
         "sample": "FLAS-59250",
         "segments": [
-          "20297847",
+          "20848525",
           "7126749#4",
           "7126749#3",
           "7126749#2",
@@ -57,7 +57,7 @@
           "6990605",
           "6990633#2",
           "6990633#1",
-          "20297847"
+          "20848525"
         ],
         "type": "complete"
       }
@@ -115,7 +115,7 @@
     "sample": "FLAS-59250"
   },
   "version": {
-    "describe": "51102df-dirty",
-    "git_hash": "51102df59a0a55f7313066878794d9c30eee0a21"
+    "describe": "dee7d85-dirty",
+    "git_hash": "dee7d8596e18f4442e2a4dcdf28baf6e10b039d9"
   }
 }

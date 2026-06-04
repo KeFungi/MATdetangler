@@ -1,2 +1,2 @@
 a1	a2	len_a1	len_a2	id_pct	aln_frac	distinct	metric
-CSUF-1723_k45_allele1	CSUF-1723_k45_allele2	5996	6142	61.8	0.53	True	whole-allele
+CSUF-1723_k45_allele1	CSUF-1723_k45_allele2	5996	6142	63.8	0.51	True	whole-allele

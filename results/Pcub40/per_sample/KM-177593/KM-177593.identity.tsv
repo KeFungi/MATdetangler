@@ -1,2 +1,2 @@
 a1	a2	len_a1	len_a2	id_pct	aln_frac	distinct	metric
-KM-177593_k45_allele1	KM-177593_k45_allele2	5787	5041	60.1	0.61	True	whole-allele
+KM-177593_k45_allele1	KM-177593_k45_allele2	5787	5041	58.9	0.93	True	whole-allele

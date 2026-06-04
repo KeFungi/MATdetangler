@@ -51,7 +51,7 @@ consensus path (stages 6 and 7) via `--make-consensus`.
    opts in. tblastn / blastn re-check completeness on the consensus; MAFFT divergence
    re-run on the consensus pair. Keep both pick-level AND consensus-level numbers
    side-by-side in `summary.tsv`.
-8. **Cross-sample mating-type clustering (`MATdetangler cluster`)** — separate
+8. **Cross-sample mating-type clustering (`MATdetangler-cli cluster`)** — separate
    post-batch command. `align` extracts each picked allele's HD-core (variable-gene
    span ±50 bp), runs ONE MAFFT, and emits the pairwise similarity matrix; `cut`
    does single-linkage on the cached matrix at `--thresh` (default 0.90) and writes
@@ -89,7 +89,7 @@ MATdetangler-spades \
   --ks 33,45
 
 # Stages 1-5 (reads-free, default) — recover the two alleles
-MATdetangler run \
+MATdetangler-cli run \
   --sample Tu127439 \
   --spades-dir examples/Tu127439_spades/ \
   --locus-ref examples/Suilu_locus/Suilu4_MATA.fasta \
@@ -99,7 +99,7 @@ MATdetangler run \
   --no-skip-pick
 
 # Stages 1-8 with read-derived consensus + QC (opt in)
-MATdetangler run \
+MATdetangler-cli run \
   --sample Tu127439 \
   --reads-r1 reads/R1.fq.gz  --reads-r2 reads/R2.fq.gz \
   --spades-dir examples/Tu127439_spades/ \
@@ -111,33 +111,33 @@ MATdetangler run \
   --make-consensus
 
 # Batch (4-col TSV: sample r1 r2 spades_dir; r1/r2 may be "-" when --make-consensus is off)
-MATdetangler batch --samplesheet samples.tsv \
+MATdetangler-cli batch --samplesheet samples.tsv \
   --locus-ref examples/Suilu_locus/Suilu4_MATA.fasta \
   --proteins  examples/Suilu_locus/Suilu4_HDs.fasta \
   --outdir results/ --threads 8 --ks k33,k45 \
   --no-skip-pick
 
 # Only steps 6+7 on a sample already processed (primary_alleles.fasta on disk)
-MATdetangler consensus \
+MATdetangler-cli consensus \
   --sample Tu127439 \
   --reads-r1 reads/R1.fq.gz --reads-r2 reads/R2.fq.gz \
   --outdir results/ \
   --locus-ref examples/Suilu_locus/Suilu4_MATA.fasta
 
 # Cross-sample mating-type clustering (step 8): one `align` pass + as many `cut`s as you want
-MATdetangler cluster align \
+MATdetangler-cli cluster align \
   --results-dir results/ \
   --queries-dir results/Tu127439/queries \
   --out-dir results/clusters/
 
-MATdetangler cluster cut \
+MATdetangler-cli cluster cut \
   --align-dir results/clusters/ \
   --results-dir results/ \
   --out-dir results/clusters/ \
   --thresh 0.90
 ```
 
-`MATdetangler cluster align` builds `cores.fasta` (HD-core span ±50 bp per allele),
+`MATdetangler-cli cluster align` builds `cores.fasta` (HD-core span ±50 bp per allele),
 `cores.aln.fasta` (one MAFFT of all cores), `cores_pairs.tsv` (pairwise HD-core
 identities), and `cores_meta.tsv`. `cluster cut` reads the cached pairs/meta —
 no re-alignment — and writes `allele_classification.tsv` (columns: allele, sample,

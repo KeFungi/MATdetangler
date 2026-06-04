@@ -1,12 +1,14 @@
 #!/bin/bash
-# MATdetangler — main CLI wrapper.
+# MATdetangler-cli — main CLI wrapper for the MATdetangler project.
+# (Binary renamed from `MATdetangler` to `MATdetangler-cli` to avoid a
+# case-insensitive filename collision with the `matdetangler/` package dir.)
 #
 # Subcommands:
-#   MATdetangler run       ...  run the per-sample pipeline (one sample)
-#   MATdetangler batch     ...  loop `run` over a samplesheet (TSV: sample r1 r2 spades_dir)
-#   MATdetangler consensus ...  run only steps 6+7 (map reads → samtools consensus → QC)
-#                              on a sample whose `primary_alleles.fasta` is already on disk
-#   MATdetangler cluster   ...  multi-sample mating-type clustering (align once + cut [thresh])
+#   MATdetangler-cli run       ...  run the per-sample pipeline (one sample)
+#   MATdetangler-cli batch     ...  loop `run` over a samplesheet (TSV: sample r1 r2 spades_dir)
+#   MATdetangler-cli consensus ...  run only steps 6+7 (map reads → samtools consensus → QC)
+#                                   on a sample whose `primary_alleles.fasta` is already on disk
+#   MATdetangler-cli cluster   ...  multi-sample mating-type clustering (align once + cut [thresh])
 #
 # This is a thin Bash wrapper; the heavy lifting is in matdetangler/*.py and map_consensus.sh.
 set -uo pipefail
@@ -16,17 +18,17 @@ PY="${PYTHON:-python3}"
 
 usage(){
 cat <<EOF
-MATdetangler — recover the two alleles of a mating-type-like locus from short reads.
+MATdetangler-cli — recover the two alleles of a mating-type-like locus from short reads.
 
 Usage:
-  MATdetangler run       [options]
-  MATdetangler batch     --samplesheet samples.tsv [common options]
-  MATdetangler consensus --sample S --reads-r1 R1 --reads-r2 R2 --outdir D [--locus-ref FA] [--threads N]
-                          (runs only steps 6+7 — sample dir must already contain primary_alleles.fasta + queries/)
-  MATdetangler cluster align --results-dir DIR --queries-dir DIR --out-dir DIR
-  MATdetangler cluster cut   --align-dir DIR    --results-dir DIR --out-dir DIR [--thresh 0.90]
+  MATdetangler-cli run       [options]
+  MATdetangler-cli batch     --samplesheet samples.tsv [common options]
+  MATdetangler-cli consensus --sample S --reads-r1 R1 --reads-r2 R2 --outdir D [--locus-ref FA] [--threads N]
+                              (runs only steps 6+7 — sample dir must already contain primary_alleles.fasta + queries/)
+  MATdetangler-cli cluster align --results-dir DIR --queries-dir DIR --out-dir DIR
+  MATdetangler-cli cluster cut   --align-dir DIR    --results-dir DIR --out-dir DIR [--thresh 0.90]
 
-\`MATdetangler run\` options:
+\`MATdetangler-cli run\` options:
   --sample NAME                  sample name (used in output paths + allele headers)
   --reads-r1 FILE                trimmed R1 fastq.gz (OPTIONAL — only needed
                                  when --make-consensus is set; the pipeline
@@ -122,11 +124,11 @@ there if a flag is omitted):
   --init-nhop 3                 initial BFS hop count
   --max-nhop 10                 maximum BFS hop count
 
-\`MATdetangler batch\` requires --samplesheet plus the common shared options above (locus-ref, proteins,
+\`MATdetangler-cli batch\` requires --samplesheet plus the common shared options above (locus-ref, proteins,
 outdir, threads, etc.). The samplesheet is a 4-column TSV (no header): sample r1 r2 spades_dir.
 r1 / r2 may be "-" when --make-consensus is off.
 
-\`MATdetangler cluster\` is for multi-sample mating-type assignment. Run 'align' once to extract HD-cores
+\`MATdetangler-cli cluster\` is for multi-sample mating-type assignment. Run 'align' once to extract HD-cores
 and build the pairwise similarity matrix; run 'cut' as often as you like with different --thresh values
 on the cached matrix (no re-alignment).
 EOF
@@ -303,7 +305,7 @@ if [ "$SUB" = "consensus" ]; then
   LDIR="$SDIR/logs"; mkdir -p "$LDIR"
   PRIMARY="$SDIR/primary_alleles.fasta"
   QDIR="${QUERIES_DIR:-$SDIR/queries}"
-  [ -s "$PRIMARY" ] || { echo "[$SAMPLE] no primary_alleles.fasta at $PRIMARY — run \`MATdetangler run\` first" >&2; exit 1; }
+  [ -s "$PRIMARY" ] || { echo "[$SAMPLE] no primary_alleles.fasta at $PRIMARY — run \`MATdetangler-cli run\` first" >&2; exit 1; }
   [ -d "$QDIR" ] || { echo "[$SAMPLE] queries dir not found: $QDIR" >&2; exit 1; }
   # locus-ref: required for HD-core MAFFT in step 7; allow override or fall back to queries-dir sibling
   if [ -z "$LOCUS_REF" ]; then
