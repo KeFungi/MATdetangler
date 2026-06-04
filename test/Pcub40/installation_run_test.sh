@@ -103,7 +103,7 @@ if [ "$SLURM" -eq 1 ]; then
 set -uo pipefail
 SAMPLES=(${SAMPLES[*]})
 S="\${SAMPLES[\$SLURM_ARRAY_TASK_ID]}"
-source /home/yihongke/miniconda3/etc/profile.d/conda.sh; conda activate MATdetangler
+source "\${CONDA_INIT:-\$HOME/miniconda3/etc/profile.d/conda.sh}"; conda activate "\${MATDETANGLER_ENV:-MATdetangler}"
 "$ROOT/MATdetangler-cli" run --sample "\$S" --spades-dir "$EX/\$S" \\
   --locus-ref "$ROOT/examples/Pcub_locus/NC_062999.fasta" \\
   --proteins  "$ROOT/examples/Pcub_locus/NC_062999_HDs.fasta" \\

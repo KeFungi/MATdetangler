@@ -10,9 +10,11 @@ ROOT=$(cd "$HERE/.." && pwd)
 if command -v python3 >/dev/null 2>&1; then
     PY_VER=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
     if [ "$(echo "$PY_VER" | awk -F. '{print ($1*100 + $2)}')" -lt 309 ]; then
-        if [ -f /scratch/tyjames_root/tyjames0/yihongke/Pcub/scripts/config.sh ]; then
-            source /scratch/tyjames_root/tyjames0/yihongke/Pcub/scripts/config.sh
-            load_modules 2>/dev/null
+        # Optional escape hatch: if the user has a project-specific module
+        # loader script, set MATDETANGLER_MODULES_INIT to its path.
+        if [ -n "${MATDETANGLER_MODULES_INIT:-}" ] && [ -f "$MATDETANGLER_MODULES_INIT" ]; then
+            source "$MATDETANGLER_MODULES_INIT"
+            type load_modules >/dev/null 2>&1 && load_modules
         fi
     fi
 fi

@@ -80,11 +80,17 @@ This step has four sub-stages.
 
 **Code**: `matdetangler/graph_classifier/seg_processor.py:directional_split()`.
 
-A SPAdes segment can carry multiple labels (e.g. flankL on the left end, HD1 in the middle, HD2 on the right). The classifier needs each post-P1 node to play at most one role. P1 splits such composites at midpoints between runs of same-tag hits:
+A SPAdes segment can carry multiple BLAST labels (e.g. flankL on the left end, HD1 in the middle, HD2 on the right). The classifier needs each post-P1 node to play **at most one role** (pure flank, pure var, or pure unlabeled connector).
 
-1. Group `seg_label_hits.tsv` by `seg_id`; for each composite (≥2 runs), produce sub-nodes `<seg>#1, <seg>#2, …` indexed L→R on the stored strand.
-2. Bookkeep `provenance[sub_id] = (parent_seg_id, start, end, strand)` so downstream emission can reassemble sequences from the original GFA.
-3. Single-run segments stay as one node with their tag.
+Algorithm — for each GFA segment:
+
+1. **No hits** → stays as one node with empty label. `provenance[seg] = (seg, 0, slen, "+")`.
+2. **Hits** → sort by `start`, then merge consecutive **same-tag** hits into "runs" (multiple HD1 fragments collapse into one HD1 run). After merging, `runs` is the list of distinct-label spans on the segment.
+3. **One run** → stays as one node with that tag. `label_per_node[seg] = tag`. If `kind == "var"`, `var_per_node[seg] = {tag pieces}`.
+4. **Multi-run** (composite) → split into N sub-nodes `<seg>#1, #2, …, #N` indexed L→R on the segment's stored strand. Boundaries are at MIDPOINTS between adjacent runs' end/start. Each sub-node gets one tag. New within-segment edges connect consecutive sub-nodes (`#i — #(i+1)`).
+5. **Re-attach original GFA L-edges**: each L-line has `edge_endpoints[(a,b)] = (side_a, side_b)` recording which END of seg a/b the edge touched (L or R). Map to `subs[0]` (L side of the parent) or `subs[-1]` (R side).
+
+Provenance: `provenance[sub_id] = (parent_seg_id, start, end, strand)` — for each post-P1 node, the original GFA segment ID and the sub-region on its stored strand. Used by `_arm_sequence_for` downstream to materialize allele sequences.
 
 Returns `(nodes, edges, label_per_node, var_per_node, provenance)`.
 
@@ -114,16 +120,93 @@ The orchestrator iterates over **(cov_pass × nhop)** combinations and collects 
 
 ### 3d — Bubble classification (R1–R4)
 
-**Code**: `matdetangler/graph_classifier/bubble_classifier.py:classify()`.
+**Code**: `matdetangler/graph_classifier/bubble_classifier.py:classify()`. Helpers: `_enum_paths()`, `_enum_dangling()`, `bubble_bfs()` (in `bubble_bfs.py`).
 
-R1–R4 rules run sequentially on the post-P1 graph:
+Inputs (post-P1):
+- `nodes` (set), `edges` (frozensets), `label_per_node` (str per node — `"flankL"`, `"flankR"`, gene names, or empty), `var_per_node` (per-node set of var-gene tags)
+- From these the classifier derives:
+  - `var_nodes = {n : var_per_node[n] is non-empty}`
+  - `flankL = {n : "flankL" in label_per_node[n].split("+")}` ; `flankR` similarly
+  - `unlabeled = {n : label_per_node[n] empty AND not in var_nodes}`
+  - `adj` — undirected adjacency from edges
 
-- **R1 (separate)** — if `var_nodes` live in ≥2 disjoint full-graph components, recurse `classify()` on each network's induced subgraph, return `separate` with `sub_results` list.
-- **R2 (bubble + anchors)** — BFS from `var_nodes` through `unlabeled` nodes only (stopping at flank-labeled boundaries) defines the **bubble**. Anchors are bubble nodes that either (a) have ≥1 neighbor OUTSIDE the bubble (rule-a, the common case), or (b) have bubble-degree ≤ 1 (rule-b leaf, fallback when rule-a yields < 2 anchors).
-- **R3 (arms)** — enumerate simple paths between distinct anchors that carry at least one var node and pass the geometric filter (one endpoint in flankL_adj, the other in flankR_adj, OR a leaf-anchor on the bare side). Same-side (both L or both R) and pure leaf↔leaf paths are dropped. Per-side caps: `max_paths=1000`, `max_path_length=50`, `max_bp_since_var=5000` (bp-aware: count bp since the last var node; drop the extension if it would exceed the cap **before** taking the step — but always allow stepping onto a var or end node).
-- **R4 (verdict)** — `n_arms = 0 → complexed`, `= 1 → single`, `= 2 → closed_bubble` (whether or not one arm is dangling; topology only — the closed/open label is purely about arm count). `≥ 3 → complexed`.
+**R1 — separate.** If `var_nodes` live in ≥2 disjoint full-graph components (`connected_components(nodes, adj)`), recurse `classify()` on each network's induced subgraph and return `{class: "separate", sub_results: [...], var_components: [...]}`.
 
-`closed_arms` (rule-a both endpoints flank-adj) and `dangling_arms` (rule-a one endpoint, leaf on the other) are kept separately for diagnostic accounting, but the verdict ignores the split.
+**P2 — bubble BFS.** `bubble_bfs(adj, var_nodes, unlabeled)`:
+- Start with `bubble = set(var_nodes)`.
+- DFS through neighbors that are in `unlabeled` (not in bubble yet); add them, continue from there.
+- Stops at any flank-labeled node (flanks are NOT in `unlabeled`, so the walk can't cross them).
+- Result: `bubble = var_nodes ∪ (unlabeled connectors transitively reachable from var via unlabeled-only steps)`. Everything else is "outside" (flank or unreachable).
+
+**R2 — anchors.** Anchors are bubble nodes that "meet the outside world":
+- `flank_L_adj = {n ∈ bubble : any neighbor m ∈ flankL}` — bubble nodes whose outside-the-bubble neighbor is a flankL node. Symmetric for `flank_R_adj`.
+- **Rule (a)** anchor: `n ∈ bubble` with `deg_out(n) > 0`, where `deg_out = #{m ∈ adj[n] : m ∉ bubble}`. The common case — a bubble node with at least one neighbor outside the bubble (typically the flank-labeled neighbor itself).
+- **Rule (b)** anchor (FALLBACK, only if rule (a) gives `< 2` anchors): admit bubble-leaves — nodes with `deg_in(n) ≤ 1` where `deg_in = #{m ∈ adj[n] : m ∈ bubble}`. Dead-end leaves of the bubble subgraph. Necessary to recover anchors when the assembly broke the flank into short segments that didn't BLAST (lost-label case).
+
+  Rule (b) is gated to avoid spurious anchors on clean closed bubbles. A 90 bp leaf hanging off a Y-fork in a sample with two healthy flank anchors should NOT become a third anchor — that would add a spurious dangling arm.
+
+**R3 — arms.** For each ordered pair of distinct anchors `(s, e)`, enumerate simple paths from `s` to any `e ∈ anchors - {s}` that stay within `bubble`. The path enumerator is `_enum_paths(adj, start=s, ends, allowed=bubble, …)` — see "Path enumeration algorithm" below.
+
+After enumeration, filter each path:
+
+- **Drop** paths that don't carry any var node (`any(n in var_nodes for n in p)` must be true).
+- **Closed arm** — both endpoints are flank-adjacent on OPPOSITE sides: `{p[0], p[-1]} ∩ flank_L_adj ≠ ∅ AND ∩ flank_R_adj ≠ ∅`. A proper L↔R walk through the bubble.
+- **Dangling arm** — one endpoint is flank-adjacent (L or R), the OTHER is a bare leaf (not flank-adjacent). One side anchored, the other dangling into the bubble interior.
+- **Dropped** otherwise — same-side (both endpoints L-adj or both R-adj) and pure leaf-leaf paths.
+
+Canonicalized via `_canonical(p)` (orient so first node-id < last node-id) to dedupe reversed-equivalent walks.
+
+Also handled:
+
+- **Single-node bridge**: a var node that's an anchor with BOTH flankL AND flankR adjacency (a single composite segment spanning the whole locus) → counts as a closed arm with the 1-element path `[n]`.
+- **`_enum_dangling` extension**: from each flank-anchored start, enumerate paths that **dead-end inside the bubble** (no neighbor in `bubble` left to extend to) carrying var content NOT entirely covered by the closed arms' var union. Adds to `dangling`. Dedupe via canonical ordering. This catches arms whose other endpoint isn't an anchor at all — assembly truly ends inside the bubble.
+
+**R4 — verdict.**
+- `n_arms = n_closed + n_dangling`
+- `n_arms == 0` → `complexed` (no var-bearing arm)
+- `n_arms == 1` → `single`
+- `n_arms == 2 AND n_closed == 2` → `closed_bubble`
+- `n_arms == 2` (else) → `open_bubble` (one or both dangling)
+- `n_arms ≥ 3` → `complexed`
+
+Note: `n_closed` and `n_dangling` are kept as diagnostic fields in the verdict dict (`closed_arms`, `dangling_arms`); both feed into the picker's "complete_locus" tri-state via flank-presence checks.
+
+### 3d.1 — Path enumeration algorithm (`_enum_paths`)
+
+**Shortest-first BFS by path length.** Frontier is a list of `(path, vis_set, bp_since_var)` triples; iterate until frontier empty or `max_paths` reached.
+
+Initial frontier:
+- `start_bp = 0` if `start ∈ var_nodes`, else `node_bp[start]`
+- frontier = `[([start], {start}, start_bp)]`
+
+Step (each iteration expands one frontier into next_frontier):
+
+For each `(path, vis, bp_acc)` in frontier, for each `nxt ∈ adj[path[-1]]`:
+
+1. **Simple-path guard**: skip if `nxt ∈ vis` (no revisits).
+2. **Allowed set**: skip if `nxt ∉ allowed AND nxt ∉ ends` (only walk through the bubble or land on an anchor).
+3. **Path-length cap**: if `len(path) + 1 > max_path_length` → drop the extension (and increment `max_path_length_hit`). The partial path is also pruned from `next_frontier`.
+4. **BP-aware cap** (when `node_bp` + `var_nodes` are supplied AND `max_bp_since_var > 0`):
+   - If `nxt ∈ var_nodes` → ALWAYS extend; reset `new_bp = 0` (reaching var resets the budget).
+   - Else if `bp_acc > max_bp_since_var` → drop (and increment `max_bp_hit`). **Pre-extension check on the CURRENT accumulator, not `bp_acc + bp(nxt)`.** A path that hasn't yet blown the budget can still grab one MORE node of any size (e.g. a final 10 kb anchor); the cap only kicks in for further extensions afterward.
+   - Else `new_bp = bp_acc + node_bp[nxt]`.
+5. **Termination vs continuation**:
+   - If `nxt ∈ ends AND nxt ≠ start` → emit `path + [nxt]` into `paths` list; if `len(paths) ≥ max_paths` → set `max_paths_hit` and abort the whole enumeration.
+   - Else → push `(path + [nxt], vis ∪ {nxt}, new_bp)` onto `next_frontier`.
+
+Returns `paths` — a list of node-ID lists, each a simple bubble-internal walk from `start` to some `e ∈ ends`.
+
+### 3d.2 — Dead-end enumeration (`_enum_dangling`)
+
+Similar BFS-by-length, but:
+
+- **No `ends` set** — instead, enumerate paths that DEAD-END (no extending neighbor in `allowed`).
+- Per step, track `extended` (bool): set True if any `nxt` was accepted onto `next_frontier`. If a path body had NO valid extension AND `len(path) > 1`:
+  - Check var content: `vs = set(path) ∩ var_nodes` must be non-empty AND NOT a subset of `exclude_var_subset` (the closed arms' var union — passed in by the caller). Drops dangling arms whose var content is wholly redundant with already-found closed arms.
+  - Canonicalize `tuple(path)` (orient by endpoints), insert into `seen` set, append to `paths`.
+- Same three caps: `max_paths`, `max_path_length`, `max_bp_since_var`.
+
+Used in R3 to catch arms whose "outer" endpoint isn't actually another anchor — it's just where the bubble runs out.
 
 ### 3e — Emission + dedup + ranking
 
