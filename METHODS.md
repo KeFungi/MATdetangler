@@ -462,11 +462,17 @@ for nhop in init_nhop..max_nhop:                  # default 3..10
 
 write_candidate_fasta(candidates, out_candidate_fa)
 
-# === Unified 4-tier rank (used at all 4 picker/dedup sites) =======
+# === Unified 4-tier rank — COMPLETENESS-FIRST =====================
+# Tier order reflects the design that pre-dedup topology shape (the
+# classifier's "complexed"/"open_bubble" label) often DISAGREES with
+# what dedup actually emits after the BFS-joint extension and tblastn
+# trim. Ranking by completeness first picks the iteration that emits
+# the most-complete locus regardless of the classifier's label; bubble
+# shape only breaks ties between equally-complete candidates.
 best = min(candidates, key=lambda c: (
-    bubble_priority(c.verdict, c.n_dedup),     # 0. K-picker priority order
-    -c.complete_locus,                          # 1. tri-state DESC
-    -c.complete_var,                            # 2. tri-state DESC
+    -c.complete_locus,                          # 0. tri-state DESC (2 > 1 > 0)
+    -c.complete_var,                            # 1. tri-state DESC
+    bubble_priority(c.verdict, c.n_dedup),     # 2. shape only as a tie-breaker
     c.diploid_dist,                             # 3. |allele_cov/D_k − ½|  ASC
 ))
 
@@ -595,21 +601,41 @@ build var-trimmed sequences via provenance (orig_seg, start, end, strand)
     │      identity = 1 − min(ed_fwd, ed_rc) / |q|
     │    threshold default = 1% (collapse if identity ≥ 99%)
     ▼
-[EMIT-time re-trim: non-joint slice + tblastn-trim]
+[EMIT-time joint extension + non-joint slice + tblastn-trim]
     │  For each dedup-surviving candidate (separately from the dedup compare):
-    │    1. "joints" = nodes that appear in ≥ 2 of the pool's pre-trim paths
-    │       (the bubble's anchor/fork nodes shared by sibling arms; for a
-    │        single-arm pool joints = ∅).
-    │    2. Slice the pre-trim path from FIRST non-joint node to LAST
-    │       non-joint node (end-joints stripped; internal joints preserved).
-    │    3. Build the emitted sequence from the sliced path via provenance.
-    │    4. Apply tblastn locus-trim (same padding as the dedup-compare trim).
+    │    1. JOINTS via multi-source BFS in the post-P1 graph (label-blind):
+    │       a. For each surviving arm's endpoints, BFS outward in adj_pp
+    │          excluding that arm's own internal nodes.
+    │       b. A node is a JOINT CANDIDATE if it's reached by BFS from ≥ 2
+    │          distinct arms (and is not in any arm's internal set).
+    │    2. PAIR-SEARCH for the shared-joint pair: enumerate up to the top-20
+    │       candidates (sorted by min max_dist across arms) and pick the pair
+    │       that maximizes (n_arms_pairable, −total_walk_length). For each
+    │       pair, an arm "pairs" the pair when both joints are reachable from
+    │       its two endpoints; the chosen orientation minimizes that arm's
+    │       walk. CLOSED-BUBBLE samples typically have both arms pair the
+    │       same (j_a, j_b) → bubble.* shows SHARED nodes at both ends.
+    │    3. PER-ARM-SIDE FALLBACK: arms that didn't pair (e.g. open_bubble's
+    │       dangling arm whose leaf end can't reach any shared joint) extend
+    │       each endpoint independently to its closest reachable joint
+    │       (preferring the pair-search joints when one is reachable); sides
+    │       with NO reachable joint fall back to flank_extend (closest
+    │       flank-labeled neighbor).
+    │    4. FULL WALK = [j_left_or_flank, ..., arm internal, ..., j_right_or_flank]
+    │       — written to result.tsv's `allele_segments` and used by bubble.*
+    │       rendering. This is the "fullwalk" view including shared joints.
+    │    5. NON-JOINT SLICE: trim the full walk to its first-non-joint and
+    │       last-non-joint nodes (end-joints stripped; internal joints kept).
+    │    6. Build emitted sequence from the sliced path via provenance.
+    │    7. Apply tblastn locus-trim (same padding as the dedup-compare trim).
+    │       Fallback: keep the raw non-joint sequence if tblastn drops it.
     │  Rationale: dedup decides WHICH alleles survive (on the var-window
     │  content where the biology lives); emission decides WHAT we write to
     │  primary_alleles.fasta (the arm-unique content of each surviving
     │  allele, with flank-adjacent joint nodes excluded but the
-    │  HD-flanking padding preserved). Falls back to the raw non-joint
-    │  sequence if tblastn drops the survivor.
+    │  HD-flanking padding preserved). The joint-detection lets bubble.*
+    │  show the topologically-shared graph nodes between alleles regardless
+    │  of how they're labeled (flank, var, or unlabeled).
     ▼
 emit: allele1 / allele1+allele2 / chimera1..N (by post-dedup count)
     │
@@ -1002,7 +1028,7 @@ when the cache is warm; all hits are USE).
 | `bubble.gfa` | sub-GFA of just the walks' segments + L-links (loads in Bandage) |
 | `bubble.dot` | Graphviz DOT |
 | `bubble.tsv` | edge list |
-| `bubble.png` | matplotlib: one row per allele. **Node coloring**: yellow = carries any variable gene (e.g. HD1/HD2; flank tag, if any, ignored for color); blue = flank-only (label is purely flankL/flankR, no variable gene); white = pure-number / unlabeled. **Dashed gray cross-arm lines**: (a) one per GFA segment ID shared between the two arms — same node = definite homology; (b) fallback only when no flank-only segment ID is shared for a given flank type — one extra line connects the outermost flank-only node of each arm (leftmost flankL = arm entry, rightmost flankR = arm exit). Capped at 4 rows displayed (extras dropped from the picture; the title notes `[showing 4 of N]`). |
+| `bubble.png` | matplotlib: one row per allele. **Node coloring**: yellow = carries any variable gene (e.g. HD1/HD2; flank tag, if any, ignored for color); blue = flank-only (label is purely flankL/flankR, no variable gene); white = pure-number / unlabeled. **Solid black cross-arm lines**: one per GFA sub-node ID that's literally shared between the two arms (the cycle-joint shared nodes surfaced by `_emit_result`'s BFS-joint extension — see §3.8). Dashed flank-side lines were removed (visual clutter without topological information). **Row x-alignment**: x-coords are computed in a unified per-row coordinate system honoring all shared-anchor constraints, then rescaled globally to [0, 1] — so a shared joint at one row's END and the other row's START doesn't collapse the longer row's tail (the rows extend in opposite directions in unified coords, then fit proportionally after rescale). **Row direction**: each row is reversed if its var-tag sequence is the exact reverse of the locus-position order from `queries/manifest.json` (or for single-HD rows: if the row's flank endpoints come out flankR-then-flankL, flip). Capped at 4 rows displayed (extras dropped from the picture; the title notes `[showing 4 of N]`). |
 
 When both alleles came from the same K, node IDs are bare. When they came from
 different K's (cross-K pair), node IDs are prefixed `K33:` / `K55:` etc. so the user

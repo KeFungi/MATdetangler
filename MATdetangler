@@ -104,6 +104,20 @@ Thresholds (override the defaults at your own risk):
                                 short-tip noise. Bp-equivalent units (matches
                                 GFA DP:f: segment depths used downstream).
 
+Per-K caller pass-through (forwarded to matdetangler.run_per_k; defaults applied
+there if a flag is omitted):
+  --min-allele-bp 3000          hard min-bp floor on the dedup pool; 0 disables it
+  --divergence-threshold 0.01   RC-aware HW edit-distance dedup threshold (1% default)
+  --seeds   {var,flank,both}    BFS seed source (default "both")
+  --cov-filter {on,off}         depth filter on BFS neighborhood (default "on")
+  --max-paths 50                cap on simple paths per anchor in classifier
+  --max-path-length 15          cap on per-path length (# post-P1 nodes)
+  --locus-padding 4000          tblastn-trim padding around HD envelope (bp)
+  --lo-mult 0.2                 cov filter lower band (× per-k haploid cov D_k)
+  --hi-mult 2.0                 cov filter upper band (× D_k)
+  --init-nhop 3                 initial BFS hop count
+  --max-nhop 10                 maximum BFS hop count
+
 \`MATdetangler batch\` requires --samplesheet plus the common shared options above (locus-ref, proteins,
 outdir, threads, etc.). The samplesheet is a 4-column TSV (no header): sample r1 r2 spades_dir.
 r1 / r2 may be "-" when --make-consensus is off.
@@ -172,6 +186,20 @@ RE_BLAST=0      # --re-blast     : wipe <sample_dir>/blast_*.tsv first so all ca
                 #                  blast searches re-run. Invoke when blast params change.
 ASYM_BFS=0      # --asymmetric-bfs : step-3 BFS absorbs repeats but doesn't expand FROM them
 
+# Per-K caller tunables — passed through to matdetangler.run_per_k.
+# Each defaults to empty here, meaning "let run_per_k apply its own default".
+MIN_ALLELE_BP=""        # hard min-bp floor on the dedup pool          (default 3000)
+DIV_THRESHOLD=""        # RC-aware edlib HW divergence threshold       (default 0.01)
+SEEDS_MODE=""           # BFS seed source: var | flank | both          (default both)
+COV_FILTER=""           # depth filter on BFS neighborhood: on | off   (default on)
+MAX_PATHS=""            # cap on simple paths per anchor in classifier (default 50)
+MAX_PATH_LENGTH=""      # cap on per-path length (# post-P1 nodes)     (default 15)
+LOCUS_PADDING=""        # tblastn-trim padding around HD envelope (bp) (default 4000)
+LO_MULT=""              # cov filter lower band as multiple of D_k     (default 0.2)
+HI_MULT=""              # cov filter upper band as multiple of D_k     (default 2.0)
+INIT_NHOP=""            # initial BFS hop count                        (default 3)
+MAX_NHOP=""             # maximum BFS hop count                        (default 10)
+
 while [ $# -gt 0 ]; do
   case "$1" in
     --sample)         SAMPLE="$2"; shift 2;;
@@ -207,6 +235,18 @@ while [ $# -gt 0 ]; do
     --max-flank-len)  MAX_FLANK_LEN="$2"; shift 2;;
     --init-hops)      INIT_HOPS="$2"; shift 2;;
     --max-hops)       MAX_HOPS="$2"; shift 2;;
+    # Per-K caller pass-through tunables (forwarded to matdetangler.run_per_k):
+    --min-allele-bp)        MIN_ALLELE_BP="$2"; shift 2;;
+    --divergence-threshold) DIV_THRESHOLD="$2"; shift 2;;
+    --seeds)                SEEDS_MODE="$2"; shift 2;;
+    --cov-filter)           COV_FILTER="$2"; shift 2;;
+    --max-paths)            MAX_PATHS="$2"; shift 2;;
+    --max-path-length)      MAX_PATH_LENGTH="$2"; shift 2;;
+    --locus-padding)        LOCUS_PADDING="$2"; shift 2;;
+    --lo-mult)              LO_MULT="$2"; shift 2;;
+    --hi-mult)              HI_MULT="$2"; shift 2;;
+    --init-nhop)            INIT_NHOP="$2"; shift 2;;
+    --max-nhop)             MAX_NHOP="$2"; shift 2;;
     --contig-depth-size-cut) CONTIG_DEPTH_CUT="$2"; shift 2;;
     --samplesheet)    SAMPLESHEET="$2"; shift 2;;
     align|cut)        CLUSTER_ACTION="$1"; shift;;
@@ -444,12 +484,28 @@ print(f'{v:.4f}')
   echo "  [$K_ONE] step 3 run_per_k (new caller)"
   GFA_HERE="$SPADES_DIR/$K_ONE/assembly_graph_after_simplification.gfa"
   GS_RC=0
+  # Per-K caller pass-through tunables — only forwarded when set (so
+  # run_per_k.py's own defaults remain authoritative when the wrapper
+  # is invoked without these flags).
+  PERK_EXTRA=()
+  [ -n "$MIN_ALLELE_BP"   ] && PERK_EXTRA+=(--min-allele-bp        "$MIN_ALLELE_BP")
+  [ -n "$DIV_THRESHOLD"   ] && PERK_EXTRA+=(--divergence-threshold "$DIV_THRESHOLD")
+  [ -n "$SEEDS_MODE"      ] && PERK_EXTRA+=(--seeds                "$SEEDS_MODE")
+  [ -n "$COV_FILTER"      ] && PERK_EXTRA+=(--cov-filter           "$COV_FILTER")
+  [ -n "$MAX_PATHS"       ] && PERK_EXTRA+=(--max-paths            "$MAX_PATHS")
+  [ -n "$MAX_PATH_LENGTH" ] && PERK_EXTRA+=(--max-path-length      "$MAX_PATH_LENGTH")
+  [ -n "$LOCUS_PADDING"   ] && PERK_EXTRA+=(--locus-padding        "$LOCUS_PADDING")
+  [ -n "$LO_MULT"         ] && PERK_EXTRA+=(--lo-mult              "$LO_MULT")
+  [ -n "$HI_MULT"         ] && PERK_EXTRA+=(--hi-mult              "$HI_MULT")
+  [ -n "$INIT_NHOP"       ] && PERK_EXTRA+=(--init-nhop            "$INIT_NHOP")
+  [ -n "$MAX_NHOP"        ] && PERK_EXTRA+=(--max-nhop             "$MAX_NHOP")
   "$PY" -u -m matdetangler.run_per_k --sample "$SAMPLE" --k "$K_ONE" \
     --gfa "$GFA_HERE" \
     --queries-dir "$QDIR" \
     --hd-proteins "$PROTEINS" \
     --cov-file "$K_COV_FILE" \
     --outdir "$SDIR" --threads "$THREADS" \
+    "${PERK_EXTRA[@]}" \
     2>&1 | tee "$LDIR/03_run_per_k_${K_ONE}.log" || GS_RC=$?
   # Backward-compat alias: bubble_alleles_${K_ONE}.fasta points to the new alleles.fasta
   if [ -s "$SDIR/$K_ONE/alleles.fasta" ]; then

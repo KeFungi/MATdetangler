@@ -117,9 +117,9 @@ def _score(row: dict) -> tuple:
     gen_cov = row.get("genome_cov", 0.0)
     cv_balance = abs((ac_mean / gen_cov) - 0.5) if gen_cov else 1.0
     return (
-        prio,
         -int(row.get("complete_locus", 0) or 0),
         -int(row.get("complete_var",   0) or 0),
+        prio,
         cv_balance,
     )
 

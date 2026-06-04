@@ -423,54 +423,80 @@ def emit_png_paired(arms: list[list[str]], arm_names: list[str], labels: dict[st
     else:
         row_anchors = []
 
-    # Compute per-row x-positions such that anchored nodes (in adjacent
-    # rows) share the same x. We solve top-down: row 0 is laid out evenly,
-    # then row 1 is laid out to honor row 0's anchored x's, then row 2
-    # honors row 1's, etc.
-    def _row_xs_even(n: int) -> list[float]:
-        if n < 2: return [0.5]
-        return [i / (n - 1) for i in range(n)]
-
-    def _row_xs_aligned(n_b: int,
-                         pairs: list[tuple[int, int, str]],
-                         xs_a: list[float]) -> list[float]:
-        """Layout row b. For each (i, j) anchor, x_b[j] = xs_a[i]. Between
-        anchors, distribute b's remaining nodes evenly in the gap."""
+    # Compute per-row x-positions in a unified (un-normalized) coordinate
+    # system first, then rescale globally to [0, 1] at the end. This avoids
+    # the "anchor at one row's end pinned to the other row's end" squeeze:
+    # when allele1's last node = allele2's first node, both rows would have
+    # been laid out in [0, 1] independently and the shared anchor forces
+    # one row's tail to all collapse to x=1. In unified coords the rows
+    # extend naturally and the global rescale fits everything proportionally.
+    #
+    # Layout method per row:
+    #   * Row 0 sits at integer positions 0..n0-1.
+    #   * Row k (k≥1) honors its anchors to row k-1 in unified coords:
+    #       - For each (i, j) anchor: row k's node j must sit at row k-1's
+    #         coord for node i.
+    #       - With 1 anchor: row k extends as integer offsets around it.
+    #       - With ≥2 anchors: linear interpolation between anchored coords;
+    #         outside anchors extrapolate at the inter-anchor unit slope.
+    def _row_unified(n_b: int,
+                      pairs: list[tuple[int, int, str]],
+                      xs_a: list[float]) -> list[float]:
         if n_b == 0: return []
-        if not pairs: return _row_xs_even(n_b)
+        if not pairs:
+            # Unanchored row: place at integer positions 0..n_b-1.
+            return [float(i) for i in range(n_b)]
+        pairs_sorted = sorted(pairs, key=lambda t: t[1])
+        if len(pairs_sorted) == 1:
+            i, j, _ = pairs_sorted[0]
+            anchor_x = xs_a[i]
+            # Unit spacing radiating out from anchor.
+            return [anchor_x + (k - j) for k in range(n_b)]
+        # ≥ 2 anchors → linear interp between consecutive anchored coords.
         xs_b = [None] * n_b
-        for (i, j, _) in pairs:
+        for i, j, _ in pairs_sorted:
             xs_b[j] = xs_a[i]
-        # Anchor boundary indices (sorted by b-index)
-        b_anch = sorted([j for (_, j, _) in pairs])
-        # Fill left of first anchor — spread from 0 to first_x.
-        first_b = b_anch[0]
-        first_x = xs_b[first_b]
-        for k in range(first_b):
-            xs_b[k] = first_x * (k / first_b) if first_b > 0 else first_x
-        # Fill right of last anchor
-        last_b = b_anch[-1]
-        last_x = xs_b[last_b]
-        for k in range(last_b + 1, n_b):
-            xs_b[k] = last_x + (1.0 - last_x) * ((k - last_b) / (n_b - last_b))
-        # Fill between consecutive anchors
-        for a, c in zip(b_anch[:-1], b_anch[1:]):
-            x_a, x_c = xs_b[a], xs_b[c]
-            gap = c - a
-            for k in range(a + 1, c):
-                xs_b[k] = x_a + (x_c - x_a) * ((k - a) / gap)
-        # Sanity: any None means an unconstrained run — fill linearly
-        for k in range(n_b):
-            if xs_b[k] is None: xs_b[k] = k / max(1, n_b - 1)
-        # Clamp to [0, 1] for safety
-        return [max(0.0, min(1.0, x)) for x in xs_b]
+        # Inter-anchor unit slopes (in coord per b-index step).
+        slopes = []
+        for (i_a, j_a, _), (i_c, j_c, _) in zip(pairs_sorted[:-1], pairs_sorted[1:]):
+            span_b = j_c - j_a
+            slopes.append((xs_a[i_c] - xs_a[i_a]) / max(1, span_b))
+        # Fill between consecutive anchors with linear interpolation.
+        for (i_a, j_a, _), (i_c, j_c, _) in zip(pairs_sorted[:-1], pairs_sorted[1:]):
+            x_a, x_c = xs_a[i_a], xs_a[i_c]
+            gap = j_c - j_a
+            for k in range(j_a + 1, j_c):
+                xs_b[k] = x_a + (x_c - x_a) * ((k - j_a) / gap)
+        # Extrapolate left of first anchor using the leftmost slope.
+        first_i, first_j, _ = pairs_sorted[0]
+        first_x = xs_a[first_i]
+        left_slope = slopes[0] if slopes else 1.0
+        for k in range(first_j):
+            xs_b[k] = first_x + (k - first_j) * left_slope
+        # Extrapolate right of last anchor using the rightmost slope.
+        last_i, last_j, _ = pairs_sorted[-1]
+        last_x = xs_a[last_i]
+        right_slope = slopes[-1] if slopes else 1.0
+        for k in range(last_j + 1, n_b):
+            xs_b[k] = last_x + (k - last_j) * right_slope
+        return xs_b
 
+    # Build unified-coord positions row by row.
     xs_rows: list[list[float]] = []
-    xs_rows.append(_row_xs_even(len(arms[0])))
+    xs_rows.append([float(i) for i in range(len(arms[0]))])
     for k in range(1, N):
-        xs_rows.append(_row_xs_aligned(len(arms[k]),
-                                         row_anchors[k - 1] if k - 1 < len(row_anchors) else [],
-                                         xs_rows[k - 1]))
+        xs_rows.append(_row_unified(len(arms[k]),
+                                      row_anchors[k - 1] if k - 1 < len(row_anchors) else [],
+                                      xs_rows[k - 1]))
+    # Global rescale to [0, 1]. Treat single-point rows as centered.
+    all_xs = [x for row in xs_rows for x in row]
+    if all_xs:
+        lo, hi = min(all_xs), max(all_xs)
+        span = hi - lo
+        if span <= 0:
+            xs_rows = [[0.5] * len(r) for r in xs_rows]
+        else:
+            xs_rows = [[(x - lo) / span for x in r] for r in xs_rows]
     row_pos = [[(xs_rows[i][j], ys[i]) for j in range(len(arms[i]))] for i in range(N)]
     palette = ["#3b6db8", "#d97a3a", "#5e9c64", "#a463b5", "#c7503f",
                "#1f8a8a", "#8a6f2e", "#5b5f96"]

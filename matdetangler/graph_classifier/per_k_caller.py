@@ -471,15 +471,19 @@ def find_alleles(
         return _empty_find_alleles_result(k, genome_cov)
 
     # Unified ranking — 4 tiers (smaller value = better):
-    #   0. bubble_priority      (K-picker order)
-    #   1. complete_locus       DESC   tri-state 2 > 1 > 0
-    #   2. complete_var         DESC   tri-state 2 > 1 > 0
+    #   0. complete_locus       DESC   tri-state 2 > 1 > 0
+    #   1. complete_var         DESC   tri-state 2 > 1 > 0
+    #   2. bubble_priority      (closed > open > complexed > single > separate)
     #   3. diploid_dist         ASC    |mean(allele_cov)/D_k − 0.5|
+    # Completeness-first: when emitted content already covers the locus
+    # (full HDs + flanks), prefer that iteration regardless of the
+    # classifier's pre-dedup topology label. The bubble shape only
+    # breaks ties between equally-complete candidates.
     def _rank_key(c: dict) -> tuple:
         return (
-            _bubble_priority(c["verdict"], c["n_dedup"]),    # 0
-            -int(c["complete_locus"]),                        # 1 (negate so 2 sorts first)
-            -int(c["complete_var"]),                          # 2
+            -int(c["complete_locus"]),                        # 0 (negate so 2 sorts first)
+            -int(c["complete_var"]),                          # 1
+            _bubble_priority(c["verdict"], c["n_dedup"]),    # 2
             c["diploid_dist"],                                # 3
         )
 
@@ -1401,48 +1405,161 @@ def _emit_result(res: dict, gfa_seqs: dict[str, str],
                 if Lb_e: walk.append(Lb_e);   added.add(Lb_e)
             return walk, added
 
-        # Build full_walk for every survivor.
+        # Hybrid joint extension:
+        #   (1) PAIR-SEARCH first — pick the joint pair (j_a, j_b) that
+        #       minimizes total walk length across arms that CAN reach both
+        #       joints. This is the closed_bubble case: when both arms can
+        #       reach (j_a, j_b), they share those exact nodes → solid lines
+        #       in the PNG.
+        #   (2) PER-ARM-SIDE fallback — for arms that can't reach both
+        #       joints of the chosen pair (open_bubble / dangling case),
+        #       extend each endpoint independently to its closest reachable
+        #       joint (preferring the chosen pair joints when reachable),
+        #       and flank_extend any side with no joint.
+        joint_set: set[str] = set(joint_cands.keys())
+
+        def _closest_joint_in(visits: dict, exclude: set[str] = set()) -> str | None:
+            best = None; best_d = 10**9
+            for n in joint_set:
+                if n in exclude: continue
+                if n in visits and visits[n][0] < best_d:
+                    best_d = visits[n][0]; best = n
+            return best
+
+        def _flank_side(p: list[str], side: str) -> str | None:
+            ep = p[0] if side == "L" else p[-1]
+            want = _is_flankL if side == "L" else _is_flankR
+            other = _is_flankR if side == "L" else _is_flankL
+            nb = next((m for m in adj_pp.get(ep, ()) if want(m)), None)
+            if nb is None:
+                nb = next((m for m in adj_pp.get(ep, ()) if other(m)), None)
+            return nb
+
+        # Step 1 — pair search. Score each pair by total walk over arms that
+        # can pair both joints; ignore arms that can't (they fall through to
+        # per-side fallback below). Pair with the most reachers wins; ties
+        # broken by total walk length.
+        K_MAX = 20
+        sorted_j = sorted(joint_cands.keys(),
+                          key=lambda n: max(joint_cands[n].values()))
+        cand_set = sorted_j[:K_MAX]
+        best_pair = (None, None); best_n_pairable = -1; best_total = 10**18
+        best_per_arm_pair: dict[str, tuple] = {}
+        if len(cand_set) >= 2 and len(survivor_pre) >= 2:
+            for i in range(len(cand_set)):
+                for j_idx in range(i + 1, len(cand_set)):
+                    j_x, j_y = cand_set[i], cand_set[j_idx]
+                    pair_arms: dict[str, tuple] = {}; total = 0; n_pairable = 0
+                    for rn, p in survivor_pre.items():
+                        if not p: continue
+                        vl, vr = arm_bfs[rn]
+                        if len(p) == 1:
+                            pa = _trace(vl, j_x); pb = _trace(vl, j_y)
+                            if pa and pb:
+                                pair_arms[rn] = (j_x, j_y, pa, pb)
+                                total += len(pa) + len(pb) - 1
+                                n_pairable += 1
+                            continue
+                        opts = []
+                        for jl, jr in ((j_x, j_y), (j_y, j_x)):
+                            pl = _trace(vl, jl); pr = _trace(vr, jr)
+                            if pl and pr:
+                                opts.append((len(pl) + len(pr), jl, jr, pl, pr))
+                        if opts:
+                            opts.sort()
+                            w, jl, jr, pl, pr = opts[0]
+                            pair_arms[rn] = (jl, jr, pl, pr)
+                            total += w; n_pairable += 1
+                    if n_pairable == 0: continue
+                    # Prefer pair with the most arms pairable; tie-break by total walk.
+                    if (n_pairable, -total) > (best_n_pairable, -best_total):
+                        best_n_pairable = n_pairable; best_total = total
+                        best_pair = (j_x, j_y); best_per_arm_pair = pair_arms
+        j_a, j_b = best_pair
+
+        # Step 2 — build full_walk per arm. Use the pair extension when this
+        # arm pairs both joints; otherwise per-side fallback.
         full_walk: dict[str, list[str]] = {}
         for rn, p in survivor_pre.items():
             if not p:
                 full_walk[rn] = []; continue
-            if j_a is None:
-                walk, added = _flank_extend(p)
-                full_walk[rn] = walk
-                chosen_joints |= added
-                continue
             vl, vr = arm_bfs[rn]
-            if j_b is None:
-                # Only one joint candidate — extend whichever side reaches it.
-                t_l = _trace(vl, j_a)
-                t_r = _trace(vr, j_a) if vr is not vl else None
-                if t_l and (not t_r or len(t_l) <= len(t_r)):
-                    full_walk[rn] = list(reversed(t_l))[:-1] + list(p)
-                elif t_r:
-                    full_walk[rn] = list(p) + t_r[1:]
+
+            # Path A: arm participates in the chosen pair (both joints reached).
+            if rn in best_per_arm_pair:
+                jl, jr, pl, pr = best_per_arm_pair[rn]
+                chosen_joints.add(jl); chosen_joints.add(jr)
+                if len(p) == 1:
+                    full_walk[rn] = list(reversed(pl)) + pr[1:]
+                else:
+                    left_ext  = list(reversed(pl))[:-1]
+                    right_ext = pr[1:]
+                    full_walk[rn] = left_ext + list(p) + right_ext
+                continue
+
+            # Path B: per-arm-side fallback. Prefer pair-chosen joints when
+            # one of them is reachable, otherwise pick per-side closest.
+            if len(p) == 1:
+                # Try chosen pair first; if only one is reachable, use it + flank-fill.
+                j_options = [j for j in (j_a, j_b) if j is not None]
+                # Also fall back to any reachable joints.
+                preferred = set(j_options)
+                j1 = next((j for j in j_options if _trace(vl, j) is not None),
+                          _closest_joint_in(vl))
+                j2 = next((j for j in j_options
+                           if j != j1 and _trace(vl, j) is not None),
+                          _closest_joint_in(vl, exclude={j1} if j1 else set()))
+                t1 = _trace(vl, j1) if j1 else None
+                t2 = _trace(vl, j2) if j2 else None
+                if t1 and t2:
+                    full_walk[rn] = list(reversed(t1)) + t2[1:]
+                    chosen_joints.add(j1); chosen_joints.add(j2)
+                elif t1:
+                    walk = list(reversed(t1))
+                    Rb = _flank_side(p, "R")
+                    if Rb: walk.append(Rb); chosen_joints.add(Rb)
+                    full_walk[rn] = walk
+                    chosen_joints.add(j1)
                 else:
                     walk, added = _flank_extend(p)
                     full_walk[rn] = walk
                     chosen_joints |= added
                 continue
-            # Two joints: reuse the per-arm pairing chosen by _pair_total
-            # so the global "min total walk length" decision drives every
-            # arm's individual walk too.
-            chosen = best_per_arm.get(rn)
-            if chosen is None:
-                walk, added = _flank_extend(p)
-                full_walk[rn] = walk
-                chosen_joints |= added
-                continue
-            jl, jr, pl, pr = chosen
-            if len(p) == 1:
-                # pl = [ep, ..., j_a]; pr = [ep, ..., j_b]
-                full_walk[rn] = list(reversed(pl)) + pr[1:]
+
+            # Multi-node arm — extend each endpoint independently.
+            def _pick_side(visits, prefer_first: str | None, prefer_second: str | None):
+                """Closest joint in `visits`, preferring the chosen pair joints."""
+                if prefer_first and prefer_first in visits: return prefer_first
+                if prefer_second and prefer_second in visits: return prefer_second
+                return _closest_joint_in(visits)
+
+            j_left  = _pick_side(vl, j_a, j_b)
+            j_right = _pick_side(vr, j_b if j_left != j_b else j_a,
+                                     j_a if j_left == j_a else j_b)
+            # Avoid both ends collapsing to the same joint.
+            if j_right == j_left:
+                j_right = _closest_joint_in(vr, exclude={j_left} if j_left else set())
+
+            t_left  = _trace(vl, j_left)  if j_left  else None
+            t_right = _trace(vr, j_right) if j_right else None
+
+            if t_left:
+                left_ext = list(reversed(t_left))[:-1]
+                chosen_joints.add(j_left)
             else:
-                # pl = [p[0], ..., j_l]; pr = [p[-1], ..., j_r]
-                left_ext  = list(reversed(pl))[:-1]
-                right_ext = pr[1:]
-                full_walk[rn] = left_ext + list(p) + right_ext
+                Lb = _flank_side(p, "L")
+                left_ext = [Lb] if Lb else []
+                if Lb: chosen_joints.add(Lb)
+
+            if t_right:
+                right_ext = t_right[1:]
+                chosen_joints.add(j_right)
+            else:
+                Rb = _flank_side(p, "R")
+                right_ext = [Rb] if Rb else []
+                if Rb: chosen_joints.add(Rb)
+
+            full_walk[rn] = left_ext + list(p) + right_ext
 
         # seg_processor.directional_split now emits clean position-indexed
         # sub-node IDs ("{parent}#1", "{parent}#2", "{parent}#N"). The
