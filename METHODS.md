@@ -1108,11 +1108,14 @@ consistently L→R across rows AND across samples. The title shows
 
 ```
 bowtie2-build idx ← primary_alleles.fasta
-bowtie2 --end-to-end --very-sensitive -k 1 --no-unal -1 R1 -2 R2 | samtools sort → reads.sorted.bam
-samtools index → reads.sorted.bam.bai
-# one samtools consensus call per allele record, records rewritten to allele_1, allele_2, ...
-# and concatenated into one multi-record FASTA:
-samtools consensus -r <allele_i> -f fasta -o tmp reads.sorted.bam → consensus_alleles.fasta
+bowtie2 --end-to-end --very-sensitive -k 1 --no-unal -1 R1 -2 R2 → reads.sam
+samtools sort reads.sam → reads.sorted.bam (+ samtools index; used only as internal
+                                              intermediate for coverage + consensus,
+                                              deleted at end-of-step)
+# one samtools consensus call per allele record. Record IDs are PRESERVED from the
+# input reference (e.g. >SAMPLE_kNN_allele1) so consensus_alleles.fasta can be used
+# as a drop-in replacement reference without remapping naming conventions.
+samtools consensus -r <allele_i> -f fasta -o tmp reads.sorted.bam → append to consensus_alleles.fasta
 
 # coverage_core.py: per-allele depth restricted to HD-core
 hd_iv(a)          = positions in any variable-gene tblastn hit on a
@@ -1120,8 +1123,10 @@ hd_iv(a)          = positions in any variable-gene tblastn hit on a
 core_meandepth(a) = mean depth over hd_iv(a)
 ```
 
-Outputs: `reads.sorted.bam`, `reads.sorted.bam.bai`, `consensus_alleles.fasta`,
-`coverage.tsv`.
+Persisted outputs: `reads.sam`, `consensus_alleles.fasta`, `coverage.tsv`.
+The intermediate BAM is dropped — SAM is the human-readable artifact users typically
+want for downstream inspection. To re-derive the BAM:
+`samtools sort -o reads.sorted.bam reads.sam && samtools index reads.sorted.bam`.
 
 `coverage.tsv` columns: `whole_meandepth` (raw) **and** `core_meandepth` (HD-core only).
 Summary reports the core depth — it's what tells you whether a real dikaryon allele is

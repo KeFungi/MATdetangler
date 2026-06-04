@@ -255,7 +255,7 @@ layouts.
 | `genome_cov_spades_k<K>.txt` | per-k genome coverage (median of contigs.fasta `cov_` ≥ 5 kb). Bp-equivalent units. |
 | `queries/` | auto-derived `variable_proteins.fasta`, `flankL.fasta`, `flankR.fasta`, `variable_nt.fasta`, `manifest.json`. |
 | `consensus_alleles.fasta` | `samtools consensus` per allele. Only written when `--make-consensus`. |
-| `reads.sorted.bam` (+ `.bai`) | competitive end-to-end bowtie2 mapping reads → picks. `--make-consensus` only. |
+| `reads.sam` | competitive end-to-end bowtie2 mapping reads → picks (`--make-consensus` only). The BAM is built as an internal intermediate for `samtools consensus` and `coverage_core.py`, then deleted — SAM is the human-readable artifact persisted. To re-derive the BAM: `samtools sort -o reads.sorted.bam reads.sam && samtools index reads.sorted.bam`. |
 | `coverage.tsv` | per-allele depth: `whole_meandepth` AND `core_meandepth` (HD-core only). `--make-consensus` only. |
 | `identity.tsv` | MAFFT id_pct + aln_frac on the picks. |
 | `identity_consensus.tsv` | MAFFT id_pct + aln_frac on the read-derived consensus pair. `--make-consensus` only. |

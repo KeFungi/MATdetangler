@@ -5,9 +5,11 @@
 #   map_consensus.sh  <SAMPLE> <PRIMARY_ALLELES_FA> <R1.fq.gz> <R2.fq.gz> <OUTDIR> [THREADS] [QUERIES_DIR] [REPEATS_FA]
 #
 # Writes (in OUTDIR):
-#   reads.sam, reads.sorted.bam(+.bai)            — competitive end-to-end mapping (-k 1, --no-unal)
+#   reads.sam                                     — competitive end-to-end mapping (-k 1, --no-unal)
+#                                                    [BAM is an internal intermediate, deleted at the end]
 #   consensus_alleles.fasta                       — samtools consensus per allele, all in one multi-record FASTA
-#                                                    (record IDs: allele_1, allele_2, …)
+#                                                    (record IDs preserved from the input reference's
+#                                                    primary_alleles.fasta — same names as the BAM @SQ entries)
 #   coverage.tsv                                  — per-allele whole + HD-core (repeat-masked) depth
 set -uo pipefail
 S="$1"; FA="$2"; R1="$3"; R2="$4"; OD="$5"; NT="${6:-4}"; QDIR="${7:-}"; REPEATS="${8:-}"
@@ -31,19 +33,17 @@ else
   } > "$OD/coverage.tsv"
 fi
 # per-allele consensus, all records concatenated into one consensus_alleles.fasta.
-# Record IDs are rewritten as allele_1, allele_2, ... in the same order as in the input
-# primary_alleles.fasta. (samtools consensus emits a record per region; we rename so the
-# IDs are uniform across the pipeline and don't carry the long path-walk names.)
+# Record IDs are PRESERVED from the input reference — same names as the BAM @SQ
+# entries (e.g. SAMPLE_kNN_allele1). This makes the consensus FASTA usable as a
+# drop-in replacement reference without remapping name conventions.
 CONS="$OD/consensus_alleles.fasta"
 : > "$CONS"
-i=0
 for al in $(grep '^>' "$FA" | awk '{print $1}' | sed 's/^>//'); do
-  i=$((i + 1))
-  tmp="$OD/_cons_${i}.fa"
+  tmp="$OD/_cons.fa"
   samtools consensus -r "$al" -f fasta -o "$tmp" "$OD/reads.sorted.bam" 2>/dev/null
-  # rewrite the single record's ID, append to consensus_alleles.fasta
-  awk -v i="$i" 'BEGIN{first=1} /^>/{ if(first){print ">allele_"i; first=0} next } { print }' "$tmp" >> "$CONS"
+  cat "$tmp" >> "$CONS"
   rm -f "$tmp"
 done
-rm -f "$IDX"*.bt2 "$OD/reads.sam"
+# Persist SAM (human-readable), drop the intermediate BAM(+index).
+rm -f "$IDX"*.bt2 "$OD/reads.sorted.bam" "$OD/reads.sorted.bam.bai"
 echo "[map_consensus] $S done -> $OD/"
