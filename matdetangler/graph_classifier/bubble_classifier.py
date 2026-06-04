@@ -54,6 +54,12 @@ def _enum_paths(adj, start, ends, allowed, max_paths=1000, max_path_length=50,
 
     def _get_max_visits(n):
         if not depths or not genome_cov or not provenance: return 1
+        # Re-check topology: only unroll if node has a self-loop
+        # (edge from n to n). Tandem repeats in GFA appear as
+        # edges from the segment end back to its start.
+        if n not in adj.get(n, ()):
+            return 1
+        
         # provenance[n] = (parent_seg, start, end, strand)
         parent = provenance.get(n, (n,))[0]
         d = depths.get(parent, genome_cov)
@@ -118,6 +124,9 @@ def _enum_dangling(adj, start, allowed, var_nodes, exclude_var_subset,
 
     def _get_max_visits(n):
         if not depths or not genome_cov or not provenance: return 1
+        # Only unroll if node has a self-loop
+        if n not in adj.get(n, ()):
+            return 1
         parent = provenance.get(n, (n,))[0]
         d = depths.get(parent, genome_cov)
         return max(1, round(d / genome_cov))
