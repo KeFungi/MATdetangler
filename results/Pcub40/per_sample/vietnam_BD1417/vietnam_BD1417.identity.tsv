@@ -1,2 +1,2 @@
 a1	a2	len_a1	len_a2	id_pct	aln_frac	distinct	metric
-vietnam_BD1417_k45_allele1	vietnam_BD1417_k45_allele2	6163	5018	61.3	0.94	True	whole-allele
+vietnam_BD1417_k45_allele1	vietnam_BD1417_k45_allele2	5755	5758	61.0	0.54	True	whole-allele

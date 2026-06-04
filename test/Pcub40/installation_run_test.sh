@@ -59,9 +59,12 @@ echo "[$(date)] decompressing GFAs in-place next to .gfa.gz files"
 # stays committed (canonical) and a sibling *.gfa is created for the
 # pipeline to read. Idempotent (skips already-decompressed) and tracked
 # so a final cleanup step at the end can remove just the .gfa siblings.
+# Only k45 and k53 are decompressed — these match `--ks k45,k53` below,
+# so we don't waste disk decompressing k33 (which the wrapper won't use).
 declare -a DECOMPRESSED_GFAS
 for s in "${SAMPLES[@]}"; do
-  for kgz in "$EX/$s"/k*/*.gfa.gz; do
+  for K in k45 k53; do
+    kgz="$EX/$s/$K/assembly_graph_after_simplification.gfa.gz"
     [ -s "$kgz" ] || continue
     plain="${kgz%.gz}"
     if [ ! -s "$plain" ]; then
@@ -147,8 +150,12 @@ TOLERATE = {
     # bp totals (drift with locus-trim boundaries)
     "basepair",
 }
-# Per-allele fields ignored: drift-sensitive numerics; the analysis result
-# is the segments + name + bool flags, not the cov/len numbers.
+# Per-allele fields ignored: drift-sensitive numerics only. Graph segments
+# ARE compared — the wrapper exports `PYTHONHASHSEED=0`, which locks
+# set/dict iteration order across runs and pins BFS tie-breaking, so the
+# exact list of segments per allele is reproducible within an install.
+# (Verified: two independent demo runs of the 32-sample Pcub40 grid with
+# seed=0 give 0/32 diff at this tolerance level.)
 ALLELE_TOLERATE = {"cov", "len"}
 def scrub(s):
     s = dict(s)
@@ -156,8 +163,6 @@ def scrub(s):
     alleles = []
     for a in s.get("alleles", []):
         a = {k: v for k, v in a.items() if k not in ALLELE_TOLERATE}
-        # Segments compared as set (order can drift with BLAST hit boundaries
-        # while content stays the same).
         a["segments"] = sorted(a.get("segments", []) or [])
         alleles.append(a)
     if "alleles" in s: s["alleles"] = alleles

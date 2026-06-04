@@ -1,1 +1,1 @@
-{"a1": "IBUG-12310_k45_allele1", "a2": "IBUG-12310_k45_allele2", "len_a1": 5754, "len_a2": 5977, "id_pct": 62.1, "aln_frac": 0.55, "distinct": true, "metric": "whole-allele"}
+{"a1": "IBUG-12310_k45_allele1", "a2": "IBUG-12310_k45_allele2", "len_a1": 5754, "len_a2": 5977, "id_pct": 61.4, "aln_frac": 0.52, "distinct": true, "metric": "whole-allele"}

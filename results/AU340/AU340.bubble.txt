@@ -1,2 +1,0 @@
-allele1: 4465787 (flankL) <-> 42066 (Suilu4_MATA_HD2+Suilu4_MATA_HD1) <-> 4709409 <-> 49826 (flankR)
-allele2: 4465787 (flankL) <-> 39632 (Suilu4_MATA_HD2+Suilu4_MATA_HD1) <-> 4709409 <-> 49826 (flankR)

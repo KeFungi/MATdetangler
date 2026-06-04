@@ -4,8 +4,8 @@
     "all_k_tried": "k45,k53",
     "allele1_complete": false,
     "allele1_path_str": "16972239 (flankL) <-> 12582487#3 (flankL) <-> 12582487#2 (NC_062999_HD1) <-> 12582487#1 (NC_062999_HD2) <-> 15544054 (flankR)",
-    "allele1_vs_allele2_aln_frac": 0.88,
-    "allele1_vs_allele2_id_pct": 57.8,
+    "allele1_vs_allele2_aln_frac": 0.86,
+    "allele1_vs_allele2_id_pct": 50.4,
     "allele2_complete": false,
     "allele2_path_str": "16972239 (flankL) <-> 12895539 (flankL) <-> 12972503 (NC_062999_HD1) <-> 24987914 <-> 15544054 (flankR)",
     "allele_cov": [
@@ -25,11 +25,11 @@
         "origin": "path",
         "sample": "AJB36",
         "segments": [
-          "15544054",
-          "12582487#1",
-          "12582487#2",
+          "16972239",
           "12582487#3",
-          "16972239"
+          "12582487#2",
+          "12582487#1",
+          "15544054"
         ],
         "type": "partial"
       },
@@ -107,7 +107,7 @@
     "sample": "AJB36"
   },
   "version": {
-    "describe": "dee7d85-dirty",
-    "git_hash": "dee7d8596e18f4442e2a4dcdf28baf6e10b039d9"
+    "describe": "07b244f-dirty",
+    "git_hash": "07b244f25f7fc9358fce784ceb51341e62073aec"
   }
 }

@@ -1,19 +1,19 @@
 graph bubble {
   graph [rankdir=LR, layout=neato];
-  "16914612#1" [label="16914612#1\nflankL", style=filled, fillcolor=lightblue];
   "15471940" [label="15471940\nflankL", style=filled, fillcolor=lightblue];
   "16948582#3" [label="16948582#3\nNC_062999_HD1", style=filled, fillcolor=lightyellow];
   "16948582#2" [label="16948582#2\nNC_062999_HD2", style=filled, fillcolor=lightyellow];
   "16948582#1" [label="16948582#1\nflankR", style=filled, fillcolor=lightblue];
   "16942314" [label="16942314\nflankR", style=filled, fillcolor=lightblue];
+  "16914612#1" [label="16914612#1\nflankL", style=filled, fillcolor=lightblue];
   "16914612#2" [label="16914612#2\nNC_062999_HD1", style=filled, fillcolor=lightyellow];
   "16914612#3" [label="16914612#3\nNC_062999_HD2", style=filled, fillcolor=lightyellow];
   "16914612#4" [label="16914612#4\nflankR", style=filled, fillcolor=lightblue];
-  "16914612#1" -- "15471940" [color=royalblue];
   "15471940" -- "16948582#3" [color=royalblue];
   "16948582#3" -- "16948582#2" [color=royalblue];
   "16948582#2" -- "16948582#1" [color=royalblue];
   "16948582#1" -- "16942314" [color=royalblue];
+  "15471940" -- "16914612#1" [color=darkorange];
   "16914612#1" -- "16914612#2" [color=darkorange];
   "16914612#2" -- "16914612#3" [color=darkorange];
   "16914612#3" -- "16914612#4" [color=darkorange];

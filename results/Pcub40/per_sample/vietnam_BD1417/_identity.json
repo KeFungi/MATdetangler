@@ -1,1 +1,1 @@
-{"a1": "vietnam_BD1417_k45_allele1", "a2": "vietnam_BD1417_k45_allele2", "len_a1": 6163, "len_a2": 5018, "id_pct": 61.3, "aln_frac": 0.94, "distinct": true, "metric": "whole-allele"}
+{"a1": "vietnam_BD1417_k45_allele1", "a2": "vietnam_BD1417_k45_allele2", "len_a1": 5755, "len_a2": 5758, "id_pct": 61.0, "aln_frac": 0.54, "distinct": true, "metric": "whole-allele"}

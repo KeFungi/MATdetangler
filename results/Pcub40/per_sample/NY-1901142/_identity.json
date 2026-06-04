@@ -1,1 +1,1 @@
-{"a1": "NY-1901142_k53_allele1", "a2": "NY-1901142_k53_allele2", "len_a1": 5979, "len_a2": 5987, "id_pct": 65.4, "aln_frac": 0.9, "distinct": true, "metric": "whole-allele"}
+{"a1": "NY-1901142_k53_allele1", "a2": "NY-1901142_k53_allele2", "len_a1": 5979, "len_a2": 5987, "id_pct": 61.4, "aln_frac": 0.59, "distinct": true, "metric": "whole-allele"}

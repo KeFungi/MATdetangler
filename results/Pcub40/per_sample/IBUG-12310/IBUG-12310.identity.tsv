@@ -1,2 +1,2 @@
 a1	a2	len_a1	len_a2	id_pct	aln_frac	distinct	metric
-IBUG-12310_k45_allele1	IBUG-12310_k45_allele2	5754	5977	62.1	0.55	True	whole-allele
+IBUG-12310_k45_allele1	IBUG-12310_k45_allele2	5754	5977	61.4	0.52	True	whole-allele

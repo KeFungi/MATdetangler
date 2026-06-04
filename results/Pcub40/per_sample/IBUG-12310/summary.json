@@ -4,8 +4,8 @@
     "all_k_tried": "k45,k53",
     "allele1_complete": true,
     "allele1_path_str": "12560442 <-> 7685561#1 (flankL) <-> 7685561#2 (NC_062999_HD1) <-> 7685561#3 (NC_062999_HD2) <-> 7685561#4 (flankR) <-> 10892992 (flankR)",
-    "allele1_vs_allele2_aln_frac": 0.55,
-    "allele1_vs_allele2_id_pct": 62.1,
+    "allele1_vs_allele2_aln_frac": 0.52,
+    "allele1_vs_allele2_id_pct": 61.4,
     "allele2_complete": true,
     "allele2_path_str": "12560442 <-> 6674176#1 (flankL) <-> 6674176#2 (NC_062999_HD1) <-> 6674176#3 (NC_062999_HD2) <-> 6674176#4 (flankR) <-> 10892992 (flankR)",
     "allele_cov": [
@@ -25,12 +25,12 @@
         "origin": "path",
         "sample": "IBUG-12310",
         "segments": [
-          "10892992",
-          "7685561#4",
-          "7685561#3",
-          "7685561#2",
+          "12560442",
           "7685561#1",
-          "12560442"
+          "7685561#2",
+          "7685561#3",
+          "7685561#4",
+          "10892992"
         ],
         "type": "complete"
       },
@@ -46,12 +46,12 @@
         "origin": "path",
         "sample": "IBUG-12310",
         "segments": [
-          "12560442",
-          "6674176#1",
-          "6674176#2",
-          "6674176#3",
+          "10892992",
           "6674176#4",
-          "10892992"
+          "6674176#3",
+          "6674176#2",
+          "6674176#1",
+          "12560442"
         ],
         "type": "complete"
       }
@@ -109,7 +109,7 @@
     "sample": "IBUG-12310"
   },
   "version": {
-    "describe": "dee7d85-dirty",
-    "git_hash": "dee7d8596e18f4442e2a4dcdf28baf6e10b039d9"
+    "describe": "07b244f-dirty",
+    "git_hash": "07b244f25f7fc9358fce784ceb51341e62073aec"
   }
 }

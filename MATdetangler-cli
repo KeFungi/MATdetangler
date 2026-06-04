@@ -14,6 +14,12 @@
 set -uo pipefail
 HERE="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 export PYTHONPATH="$HERE:${PYTHONPATH:-}"
+# Lock Python's hash randomization so set/dict iteration order is
+# deterministic across runs. Eliminates the BFS "alternative parallel
+# segment" tie-breaker drift (e.g. AJB36 swapping segment 20848525 ↔
+# 20297847 without changing the verdict). Bit-for-bit reproducibility
+# within one install.
+export PYTHONHASHSEED="${PYTHONHASHSEED:-0}"
 PY="${PYTHON:-python3}"
 
 usage(){

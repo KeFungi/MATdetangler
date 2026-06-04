@@ -1,2 +1,2 @@
 a1	a2	len_a1	len_a2	id_pct	aln_frac	distinct	metric
-NY-1593933_k53_allele1	NY-1593933_k53_allele2	5925	6017	62.6	0.92	True	whole-allele
+NY-1593933_k53_allele1	NY-1593933_k53_allele2	5925	6017	61.6	0.83	True	whole-allele

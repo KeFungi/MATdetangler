@@ -7,7 +7,7 @@ graph bubble {
   "29115823" [label="29115823\n", style=filled, fillcolor=lightyellow];
   "21073062" [label="21073062\n", style=filled, fillcolor=lightyellow];
   "15150988" [label="15150988\n", style=filled, fillcolor=lightyellow];
-  "20656687" [label="20656687\nflankR", style=filled, fillcolor=lightblue];
+  "18821945" [label="18821945\nflankR", style=filled, fillcolor=lightblue];
   "20095578#3" [label="20095578#3\nflankL", style=filled, fillcolor=lightblue];
   "20095578#2" [label="20095578#2\nNC_062999_HD1", style=filled, fillcolor=lightyellow];
   "20095578#1" [label="20095578#1\nNC_062999_HD2", style=filled, fillcolor=lightyellow];
@@ -17,10 +17,10 @@ graph bubble {
   "17681182#1" -- "29115823" [color=royalblue];
   "29115823" -- "21073062" [color=royalblue];
   "21073062" -- "15150988" [color=royalblue];
-  "15150988" -- "20656687" [color=royalblue];
+  "15150988" -- "18821945" [color=royalblue];
   "19679029" -- "20095578#3" [color=darkorange];
   "20095578#3" -- "20095578#2" [color=darkorange];
   "20095578#2" -- "20095578#1" [color=darkorange];
   "20095578#1" -- "15150988" [color=darkorange];
-  "15150988" -- "20656687" [color=darkorange];
+  "15150988" -- "18821945" [color=darkorange];
 }

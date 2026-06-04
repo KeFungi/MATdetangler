@@ -1,2 +1,2 @@
 a1	a2	len_a1	len_a2	id_pct	aln_frac	distinct	metric
-KM-123956_k53_allele1	KM-123956_k53_allele2	5853	5867	63.4	0.89	True	whole-allele
+KM-123956_k53_allele1	KM-123956_k53_allele2	5853	5867	55.9	0.64	True	whole-allele

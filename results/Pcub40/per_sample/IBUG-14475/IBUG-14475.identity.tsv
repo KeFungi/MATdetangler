@@ -1,2 +1,2 @@
 a1	a2	len_a1	len_a2	id_pct	aln_frac	distinct	metric
-IBUG-14475_k53_allele1	IBUG-14475_k53_allele2	6164	6763	59.1	0.91	True	whole-allele
+IBUG-14475_k53_allele1	IBUG-14475_k53_allele2	6164	6453	55.6	0.85	True	whole-allele

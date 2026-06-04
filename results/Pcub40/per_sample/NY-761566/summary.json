@@ -4,8 +4,8 @@
     "all_k_tried": "k45,k53",
     "allele1_complete": true,
     "allele1_path_str": "23527568 (flankL) <-> 24162773#4 (flankL) <-> 24162773#3 (NC_062999_HD1) <-> 24162773#2 (NC_062999_HD2) <-> 24162773#1 (flankR) <-> 24337791 (flankR)",
-    "allele1_vs_allele2_aln_frac": 0.93,
-    "allele1_vs_allele2_id_pct": 60.7,
+    "allele1_vs_allele2_aln_frac": 0.89,
+    "allele1_vs_allele2_id_pct": 61.4,
     "allele2_complete": true,
     "allele2_path_str": "23527568 (flankL) <-> 24410735#4 (flankL) <-> 24410735#3 (NC_062999_HD1) <-> 24410735#2 (NC_062999_HD2) <-> 24410735#1 (flankR) <-> 24337791 (flankR)",
     "allele_cov": [
@@ -25,12 +25,12 @@
         "origin": "path",
         "sample": "NY-761566",
         "segments": [
-          "23527568",
-          "24162773#4",
-          "24162773#3",
-          "24162773#2",
+          "24337791",
           "24162773#1",
-          "24337791"
+          "24162773#2",
+          "24162773#3",
+          "24162773#4",
+          "23527568"
         ],
         "type": "complete"
       },
@@ -46,12 +46,12 @@
         "origin": "path",
         "sample": "NY-761566",
         "segments": [
-          "23527568",
-          "24410735#4",
-          "24410735#3",
-          "24410735#2",
+          "24337791",
           "24410735#1",
-          "24337791"
+          "24410735#2",
+          "24410735#3",
+          "24410735#4",
+          "23527568"
         ],
         "type": "complete"
       }
@@ -109,7 +109,7 @@
     "sample": "NY-761566"
   },
   "version": {
-    "describe": "dee7d85-dirty",
-    "git_hash": "dee7d8596e18f4442e2a4dcdf28baf6e10b039d9"
+    "describe": "07b244f-dirty",
+    "git_hash": "07b244f25f7fc9358fce784ceb51341e62073aec"
   }
 }

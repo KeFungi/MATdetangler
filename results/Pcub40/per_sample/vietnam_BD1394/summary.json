@@ -4,8 +4,8 @@
     "all_k_tried": "k45,k53",
     "allele1_complete": true,
     "allele1_path_str": "21340444 (flankL) <-> 12514030#1 (flankL) <-> 12514030#2 (NC_062999_HD1) <-> 12514030#3 (NC_062999_HD2) <-> 4975 (flankR)",
-    "allele1_vs_allele2_aln_frac": 0.95,
-    "allele1_vs_allele2_id_pct": 63.3,
+    "allele1_vs_allele2_aln_frac": 0.71,
+    "allele1_vs_allele2_id_pct": 54.1,
     "allele2_complete": true,
     "allele2_path_str": "21340444 (flankL) <-> 20811480#1 (flankL) <-> 20811480#2 (NC_062999_HD1) <-> 20811480#3 (NC_062999_HD2) <-> 4975 (flankR)",
     "allele_cov": [
@@ -25,11 +25,11 @@
         "origin": "path",
         "sample": "vietnam_BD1394",
         "segments": [
-          "21340444",
-          "12514030#1",
-          "12514030#2",
+          "4975",
           "12514030#3",
-          "4975"
+          "12514030#2",
+          "12514030#1",
+          "21340444"
         ],
         "type": "complete"
       },
@@ -107,7 +107,7 @@
     "sample": "vietnam_BD1394"
   },
   "version": {
-    "describe": "dee7d85-dirty",
-    "git_hash": "dee7d8596e18f4442e2a4dcdf28baf6e10b039d9"
+    "describe": "07b244f-dirty",
+    "git_hash": "07b244f25f7fc9358fce784ceb51341e62073aec"
   }
 }

@@ -1,2 +1,2 @@
 a1	a2	len_a1	len_a2	id_pct	aln_frac	distinct	metric
-UBC-8428_k53_allele1	UBC-8428_k53_allele2	5801	5750	65.0	0.92	True	whole-allele
+UBC-8428_k53_allele1	UBC-8428_k53_allele2	5801	5750	63.9	0.55	True	whole-allele

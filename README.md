@@ -65,18 +65,48 @@ against GFA segments and doesn't consume anchor seeds.
 ## Installation
 
 One-time conda environment (covers every external binary the pipeline needs:
-SPAdes, BLAST+, bowtie2, samtools, MAFFT, plus Python + matplotlib + edlib):
+SPAdes, BLAST+, bowtie2, samtools, MAFFT, plus Python + matplotlib + edlib +
+git-lfs):
 
 ```bash
 conda env create -f install/env.yml      # ~5 min on first run
-conda activate matdetangler
+conda activate MATdetangler
 ```
 
 The pipeline is pure Python stdlib + `matplotlib` (for `bubble.png`) + `edlib`
 (for dedup) + a handful of subprocess calls. No biopython, numpy, or other
 heavy Python deps. If you already have the external binaries on `$PATH`
 (`spades.py`, `makeblastdb`, `tblastn`, `blastn`, `bowtie2`, `samtools`,
-`mafft`) plus `pip install edlib`, you can skip the conda env entirely.
+`mafft`, `git-lfs`) plus `pip install edlib`, you can skip the conda env entirely.
+
+### Verify the install
+
+After `conda env create`, run the Pcub40 installation test to confirm
+the pipeline reproduces the committed baseline byte-for-byte on the
+bundled 32-sample demo:
+
+```bash
+# Pull the LFS-stored demo GFAs (1.9 GB; first time only)
+git lfs install
+git lfs pull
+
+# Run the test (32 samples, ~3 min wall on SLURM, ~20-30 min serial)
+bash test/Pcub40/installation_run_test.sh                 # serial
+bash test/Pcub40/installation_run_test.sh --slurm         # SLURM array
+bash test/Pcub40/installation_run_test.sh AJB36 BD-1248   # subset
+```
+
+PASS = your install produces identical per-sample summary.json files to
+`test/Pcub40/known_results.json` (after ignoring documented install-drift
+fields like MAFFT alignment scores). The wrapper exports `PYTHONHASHSEED=0`
+so set/dict iteration order is locked — runs are byte-for-byte deterministic
+across invocations within one install.
+
+`test/Pcub40/analysis_run_test.sh` is the companion script for the OPPOSITE
+direction: when you've *changed* the implementation and want a structured
+report of which Pcub40 samples got called differently (verdict change /
+completeness change / allele-structure change / segment-walk drift). It
+always exits 0 — divergence is information, not error.
 
 ## Quick start
 
@@ -238,7 +268,7 @@ layouts.
 
 ## Outputs (per sample, in `results/<sample>/`)
 
-![bubble schema](results/AU340/bubble.png)
+![bubble schema](results/Pcub40/bubble_png/NY-761566.bubble.png)
 
 | file | what |
 |---|---|

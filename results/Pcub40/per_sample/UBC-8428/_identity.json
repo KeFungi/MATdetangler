@@ -1,1 +1,1 @@
-{"a1": "UBC-8428_k53_allele1", "a2": "UBC-8428_k53_allele2", "len_a1": 5801, "len_a2": 5750, "id_pct": 65.0, "aln_frac": 0.92, "distinct": true, "metric": "whole-allele"}
+{"a1": "UBC-8428_k53_allele1", "a2": "UBC-8428_k53_allele2", "len_a1": 5801, "len_a2": 5750, "id_pct": 63.9, "aln_frac": 0.55, "distinct": true, "metric": "whole-allele"}

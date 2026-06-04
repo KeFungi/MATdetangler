@@ -1,1 +1,1 @@
-{"a1": "KM-84372_k45_allele1", "a2": "KM-84372_k45_allele2", "len_a1": 5818, "len_a2": 5907, "id_pct": 63.3, "aln_frac": 0.9, "distinct": true, "metric": "whole-allele"}
+{"a1": "KM-84372_k45_allele1", "a2": "KM-84372_k45_allele2", "len_a1": 5818, "len_a2": 5907, "id_pct": 63.0, "aln_frac": 0.91, "distinct": true, "metric": "whole-allele"}
