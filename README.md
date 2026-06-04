@@ -5,6 +5,15 @@ using a **pre-built SPAdes assembly graph** as the substrate. Originally designe
 fungal HD locus (HD1 / HD2 + conserved flanks); generalizes to any analogous locus with
 conserved flanks and one or more variable genes (P/R, PR, idiomorph-like loci).
 
+![bubble schema](results/Pcub40/bubble_png/NY-761566.bubble.png)
+
+*Example output for Pcub sample NY-761566 — a clean closed-bubble call.
+Two alleles traced through the assembly graph, one row each, x-aligned at
+shared joints. Yellow boxes carry variable genes (HD1 / HD2); blue boxes
+are pure flanks. The `×N.NN` tag below each segment is the normalized
+coverage (`seg_cov / genome_cov`) — ×1.0 = haploid depth (single allele),
+×2.0 = collapsed-repeat / double-allele.*
+
 > Methods + rationale + pseudocode: **[METHODS.md](METHODS.md)**.
 > Open algorithmic improvements: **[TODO.md](TODO.md)**.
 > Retired methods (legacy `graph_path_search` + `pick_alleles` chain):
@@ -267,8 +276,6 @@ one assembly per (sample, k) pair so each K's GFA is preserved.
 layouts.
 
 ## Outputs (per sample, in `results/<sample>/`)
-
-![bubble schema](results/Pcub40/bubble_png/NY-761566.bubble.png)
 
 | file | what |
 |---|---|
