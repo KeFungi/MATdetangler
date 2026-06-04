@@ -106,12 +106,15 @@ Thresholds (override the defaults at your own risk):
 
 Per-K caller pass-through (forwarded to matdetangler.run_per_k; defaults applied
 there if a flag is omitted):
-  --min-allele-bp 3000          hard min-bp floor on the dedup pool; 0 disables it
+  --min-allele-bp 0             hard min-bp floor on the dedup pool; 0 disables (default)
   --divergence-threshold 0.01   RC-aware HW edit-distance dedup threshold (1% default)
   --seeds   {var,flank,both}    BFS seed source (default "both")
   --cov-filter {on,off}         depth filter on BFS neighborhood (default "on")
-  --max-paths 50                cap on simple paths per anchor in classifier
-  --max-path-length 15          cap on per-path length (# post-P1 nodes)
+  --max-paths 1000              cap on simple paths per anchor in classifier
+  --max-path-length 50          cap on per-path length (# post-P1 nodes)
+  --max-bp-since-var 5000       bp-aware path enumeration cap; drop partial paths
+                                whose accumulated bp since the last var-bearing node
+                                exceeds this. 0 disables.
   --locus-padding 4000          tblastn-trim padding around HD envelope (bp)
   --lo-mult 0.2                 cov filter lower band (× per-k haploid cov D_k)
   --hi-mult 2.0                 cov filter upper band (× D_k)
@@ -194,6 +197,7 @@ SEEDS_MODE=""           # BFS seed source: var | flank | both          (default 
 COV_FILTER=""           # depth filter on BFS neighborhood: on | off   (default on)
 MAX_PATHS=""            # cap on simple paths per anchor in classifier (default 50)
 MAX_PATH_LENGTH=""      # cap on per-path length (# post-P1 nodes)     (default 15)
+MAX_BP_SINCE_VAR=""     # bp-aware path enumeration cap; 0 disables    (default 0)
 LOCUS_PADDING=""        # tblastn-trim padding around HD envelope (bp) (default 4000)
 LO_MULT=""              # cov filter lower band as multiple of D_k     (default 0.2)
 HI_MULT=""              # cov filter upper band as multiple of D_k     (default 2.0)
@@ -242,6 +246,7 @@ while [ $# -gt 0 ]; do
     --cov-filter)           COV_FILTER="$2"; shift 2;;
     --max-paths)            MAX_PATHS="$2"; shift 2;;
     --max-path-length)      MAX_PATH_LENGTH="$2"; shift 2;;
+    --max-bp-since-var)     MAX_BP_SINCE_VAR="$2"; shift 2;;
     --locus-padding)        LOCUS_PADDING="$2"; shift 2;;
     --lo-mult)              LO_MULT="$2"; shift 2;;
     --hi-mult)              HI_MULT="$2"; shift 2;;
@@ -494,6 +499,7 @@ print(f'{v:.4f}')
   [ -n "$COV_FILTER"      ] && PERK_EXTRA+=(--cov-filter           "$COV_FILTER")
   [ -n "$MAX_PATHS"       ] && PERK_EXTRA+=(--max-paths            "$MAX_PATHS")
   [ -n "$MAX_PATH_LENGTH" ] && PERK_EXTRA+=(--max-path-length      "$MAX_PATH_LENGTH")
+  [ -n "$MAX_BP_SINCE_VAR" ] && PERK_EXTRA+=(--max-bp-since-var    "$MAX_BP_SINCE_VAR")
   [ -n "$LOCUS_PADDING"   ] && PERK_EXTRA+=(--locus-padding        "$LOCUS_PADDING")
   [ -n "$LO_MULT"         ] && PERK_EXTRA+=(--lo-mult              "$LO_MULT")
   [ -n "$HI_MULT"         ] && PERK_EXTRA+=(--hi-mult              "$HI_MULT")

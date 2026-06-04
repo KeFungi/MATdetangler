@@ -87,13 +87,19 @@ def main(argv: list[str] | None = None) -> int:
                     help="BFS seed source (var-labeled, flank-labeled, or both). Default: both.")
     ap.add_argument("--cov-filter", choices=("on","off"), default="on",
                     help="Depth filter on the BFS neighborhood. Default: on.")
-    ap.add_argument("--max-paths", type=int, default=50,
-                    help="Hard cap on simple paths per anchor in classifier. Default: 50.")
-    ap.add_argument("--max-path-length", type=int, default=15,
-                    help="Hard cap on individual path length (# of post-P1 nodes). Default: 15.")
-    ap.add_argument("--min-allele-bp", type=int, default=3000,
+    ap.add_argument("--max-paths", type=int, default=1000,
+                    help="Hard cap on simple paths per anchor in classifier. Default: 1000.")
+    ap.add_argument("--max-path-length", type=int, default=50,
+                    help="Hard cap on individual path length (# of post-P1 nodes). Default: 50.")
+    ap.add_argument("--max-bp-since-var", type=int, default=5000,
+                    help="BP-aware path enumeration cap: drop any partial path "
+                         "whose accumulated bp since the last var-bearing node "
+                         "exceeds this. Saves search effort on long chains of "
+                         "unlabeled connectors that won't reach productive "
+                         "content. 0 = disabled. Default: 5000.")
+    ap.add_argument("--min-allele-bp", type=int, default=0,
                     help="Hard minimum per-allele length (bp) — alleles shorter than "
-                         "this are dropped from dedup/picker. Default: 3000.")
+                         "this are dropped from dedup/picker. 0 = disabled (default).")
     args = ap.parse_args(argv)
 
     out_k = os.path.join(args.outdir, args.k)
@@ -155,6 +161,7 @@ def main(argv: list[str] | None = None) -> int:
             cov_filter=(args.cov_filter == "on"),
             max_paths=args.max_paths,
             max_path_length=args.max_path_length,
+            max_bp_since_var=args.max_bp_since_var,
             min_allele_bp=args.min_allele_bp,
         )
     except Exception as e:

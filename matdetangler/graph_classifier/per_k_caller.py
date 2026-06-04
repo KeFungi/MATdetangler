@@ -261,8 +261,9 @@ def _try_one_pass(seeds: set[str], all_edges: set[frozenset],
                    divergence_threshold: float,
                    apply_cov_filter: bool,
                    lo_mult: float, hi_mult: float,
-                   max_paths: int = 50,
-                   max_path_length: int = 15) -> dict:
+                   max_paths: int = 1000,
+                   max_path_length: int = 50,
+                   max_bp_since_var: int = 5000) -> dict:
     """One pass: BFS-expand seeds N hops, optionally cov-filter, classify,
     return verdict dict with arm sequences attached if it classified."""
     nhood = bfs_expand_segments(seeds, adj_und, n_hops)
@@ -275,8 +276,14 @@ def _try_one_pass(seeds: set[str], all_edges: set[frozenset],
     nodes, edges_pp, labels, var_per, provenance = directional_split(
         pass_seg_labels, pass_seg_length, pass_edges, pass_endpoints,
     )
+    # Per-node bp lengths from provenance — feeds the bp-aware path
+    # enumeration cap inside classify(). prov[n] = (parent, start, end, strand);
+    # end - start = sub-region length in bp.
+    node_bp = {n: max(0, p[2] - p[1]) for n, p in provenance.items()}
     res = classify(nodes, edges_pp, labels, var_per,
-                    max_paths=max_paths, max_path_length=max_path_length)
+                    max_paths=max_paths, max_path_length=max_path_length,
+                    node_bp=node_bp,
+                    max_bp_since_var=max_bp_since_var)
     res["_bfs_limits"] = res.get("bfs_limits", {})
     res["_provenance"] = provenance
     res["_nhood"] = nhood
@@ -314,9 +321,10 @@ def find_alleles(
         out_candidate_fa: str | None = None,
         seeds_mode: str = "both",            # "flank" | "var" | "both"
         cov_filter: bool = True,             # cov filter ON by default
-        max_paths: int = 50,
-        max_path_length: int = 15,
-        min_allele_bp: int = 3000,           # hard floor on per-allele length
+        max_paths: int = 1000,
+        max_path_length: int = 50,
+        max_bp_since_var: int = 5000,        # bp-aware path enumeration cap
+        min_allele_bp: int = 0,              # hard floor on per-allele length
 ) -> dict:
     """Run the full orchestrator. Returns a dict with the final classification
     and any emitted allele/chimera sequences:
@@ -367,9 +375,11 @@ def find_alleles(
         nhood  = len(res.get("_nhood", ()))
         limits = res.get("_bfs_limits", {})
         lim_str = ""
-        if limits.get("max_paths_hit") or limits.get("max_path_length_hit"):
+        if (limits.get("max_paths_hit") or limits.get("max_path_length_hit")
+                or limits.get("max_bp_hit")):
             lim_str = (f"  ⚠ limits: max_paths_hit={limits.get('max_paths_hit',0)}"
-                       f" max_path_length_hit={limits.get('max_path_length_hit',0)}")
+                       f" max_path_length_hit={limits.get('max_path_length_hit',0)}"
+                       f" max_bp_hit={limits.get('max_bp_hit',0)}")
         print(f"  [nhop={nhop} seeds={seeds_mode} cov={'on' if cov_filter else 'off'}] "
               f"|nhood|={nhood:<6} var={n_var:<3} cls={res['class']:<14} arms={n_arms}{lim_str}",
               flush=True)
@@ -396,6 +406,7 @@ def find_alleles(
             apply_cov_filter=cov_filter,
             lo_mult=lo_mult, hi_mult=hi_mult,
             max_paths=max_paths, max_path_length=max_path_length,
+            max_bp_since_var=max_bp_since_var,
         )
         res["_phase"]      = seeds_mode
         res["_n_hops"]     = nhop
@@ -620,7 +631,7 @@ def _finalize_candidates(siblings: list[dict], iter_meta: dict,
                           queries_dir: str | None,
                           seg_labels: dict,
                           k,
-                          min_allele_bp: int = 3000) -> dict:
+                          min_allele_bp: int = 0) -> dict:
     """Take all same-iteration sibling candidates, run cross-network dedup
     (RC-aware, completeness-first ranking), and build the final output dict
     in the same shape that the legacy _emit_result+_finalize path produced.
@@ -999,7 +1010,7 @@ def _emit_result(res: dict, gfa_seqs: dict[str, str],
                   hi_mult: float = 2.0,
                   queries_dir: str | None = None,
                   return_pools: bool = False,
-                  min_allele_bp: int = 3000,
+                  min_allele_bp: int = 0,
                   force: bool = False) -> dict:
     """Pipe every var-bearing candidate through trim → dedup → emit.
 

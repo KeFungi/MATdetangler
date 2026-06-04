@@ -412,7 +412,7 @@ the rest is a single counting step.
 
 ### 3.7 `find_alleles` BFS loop
 
-`find_alleles(seg_label_hits_tsv, gfa_path, genome_cov, init_nhop=3, max_nhop=10, var_proteins_ref=…, expected_var_tags=…, locus_padding=4000, lo_mult=0.2, hi_mult=2.0, divergence_threshold=0.01, queries_dir=…, out_candidate_fa=…, seeds_mode="both", cov_filter=True, max_paths=50, max_path_length=15, min_allele_bp=3000)`
+`find_alleles(seg_label_hits_tsv, gfa_path, genome_cov, init_nhop=3, max_nhop=10, var_proteins_ref=…, expected_var_tags=…, locus_padding=4000, lo_mult=0.2, hi_mult=2.0, divergence_threshold=0.01, queries_dir=…, out_candidate_fa=…, seeds_mode="both", cov_filter=True, max_paths=1000, max_path_length=50, max_bp_since_var=5000, min_allele_bp=0)`
 
 The orchestrator runs the BFS at increasing hop counts, collects per-network
 candidates from every iteration, optionally short-circuits when a fully
@@ -540,12 +540,23 @@ SHORTEST `max_paths` paths survive — the real diploid pair (typically 2–6
 nodes) always makes it into the cap even on fork-explosion samples where
 DFS would plunge deep on one branch and miss the other arms.
 
-Two hard caps:
-- `max_paths = 50` — total number of simple paths per starting anchor
-- `max_path_length = 15` — drop any path whose node count exceeds this
+Three hard caps:
+- `max_paths = 1000` — total number of simple paths per starting anchor
+- `max_path_length = 50` — drop any path whose node count exceeds this
+- `max_bp_since_var = 5000` — drop any partial path whose accumulated bp
+  since the last var-bearing node exceeds this (set 0 to disable). Cap
+  check is PRE-extension: if the path's current `bp_since_var` is already
+  over the threshold, no further extension; if it's still within the
+  threshold, the next hop is allowed regardless of its own size (so a
+  productive final anchor of any size can still be reached). Var nodes
+  reset the counter to 0. Bp values come from each post-P1 sub-node's
+  `(end − start)` in provenance. Targets long unlabeled-connector chains
+  that wander far from var content — saves search effort with no loss
+  on real-data Pcub40 picks (sweep confirmed identical output at
+  bp_cap=5000 vs disabled).
 
-Each iteration's log line shows `⚠ limits: max_paths_hit=N max_path_length_hit=M`
-when either cap fired (suppressed when both = 0).
+Each iteration's log line shows `⚠ limits: max_paths_hit=N max_path_length_hit=M max_bp_hit=K`
+when any cap fired (suppressed when all three = 0).
 
 #### Completeness — graph-level flank check
 
@@ -740,9 +751,9 @@ Mechanics:
 - Emitted alleles remain the full padded ~9 kb sequences — only the
   divergence metric narrows to the var region.
 
-#### Hard minimum-length floor (`min_allele_bp`, default 3000)
+#### Hard minimum-length floor (`min_allele_bp`, default 0 — disabled)
 
-Three-stage filter that drops sub-3kb fragment candidates:
+Three-stage filter that drops sub-X-bp fragment candidates when X > 0:
 1. **Pre-locus-trim** — applied to raw walk content before tblastn, so
    fragment-network walks (e.g. KYH069 n1's 308 bp single-HD segments)
    never reach the tblastn step.
@@ -752,8 +763,19 @@ Three-stage filter that drops sub-3kb fragment candidates:
    per-iteration siblings, catches fragments that came in via a sibling
    network's emission.
 
-Clean closed_bubble samples (real 4.5–5 kb diploid pairs) are unaffected;
-fragment-only "n1 308 bp" pools are dropped entirely.
+The floor was previously set to 3000 to drop sub-HD fragments (e.g.
+KYH069 n1's 308 bp pair). It is now **disabled by default (0)** so the
+pipeline surfaces alternative HD-bearing arms — open_bubble samples
+whose dangling end carries a var node in the tail (e.g. FLAS-59250's
+flankL-anchored HD1-only arm at ~2700 bp var-trimmed / 4022 bp emitted)
+represent a real second HD-bearing region in the graph (paralog or
+alternative allele), not noise. The 3000 floor would have hidden that
+biology. Set `--min-allele-bp 3000` to restore the legacy filter when
+you want only "complete" picks. The Pcub40 sweep at default settings:
+- `min_bp=0` (default): surfaces 5 alternative HD-bearing arms alongside
+  22 closed-bubble diploid pairs — more graph information per sample
+- `min_bp=3000`: hides the 5 alternative arms; reports 24 closed-bubble
+  diploid pairs only
 
 The current `_blastn_flank_presence()` helper still exists for fallback /
 diagnostic use but is NOT consulted during normal emission — the
@@ -881,7 +903,7 @@ extend_bounds  allele_segments
 
 | file | content |
 |---|---|
-| `alleles.fasta` | post-dedup picked alleles, FASTA. Post-`min_allele_bp` (default 3000 bp). |
+| `alleles.fasta` | post-dedup picked alleles, FASTA. `min_allele_bp` floor is disabled by default (set 3000 to restore the legacy sub-HD-fragment filter). |
 | `longest_alleles.fasta` | length-first RC-aware dedup over the full candidate pool — keeps the LONGEST representative of each edit-distance equivalence class (HD-only divergence, 5%). Wider net than `alleles.fasta`; the bash wrapper unions per-k versions into a sample-level `<sample>/longest_alleles.fasta` with `k{NN}_` prefixed headers. |
 | `result.tsv` | the 22-column row above. `complete_var` and `complete_locus` are now tri-state integers (0=none, 1=some, 2=all). |
 | `seg_label_hits.tsv` | labeler output (§3.2) |

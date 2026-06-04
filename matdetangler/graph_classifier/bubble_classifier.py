@@ -20,23 +20,40 @@ from __future__ import annotations
 from .bubble_bfs import bubble_bfs, build_adj, connected_components
 
 
-def _enum_paths(adj, start, ends, allowed, max_paths=50, max_path_length=15,
-                 limit_counter=None):
+def _enum_paths(adj, start, ends, allowed, max_paths=1000, max_path_length=50,
+                 limit_counter=None,
+                 node_bp=None, var_nodes=None, max_bp_since_var=5000):
     """Simple paths from `start` to any node in `ends`, using only `allowed`.
 
-    SHORTEST-FIRST enumeration (BFS by path length). Two hard limits:
-      - max_paths        : abort once this many simple paths are emitted
-      - max_path_length  : drop any path whose node count would exceed this
-                            (the partial path is also dropped from extension)
+    SHORTEST-FIRST enumeration (BFS by path length). Three hard limits:
+      - max_paths          : abort once this many simple paths are emitted
+      - max_path_length    : drop any path whose node count would exceed this
+                              (the partial path is also dropped from extension)
+      - max_bp_since_var   : BP-AWARE cap. When > 0, track per-path the bp
+                              accumulated since the last VAR node in the path
+                              (or since `start` if no var node yet). Drop
+                              extensions where the post-extension bp count
+                              would exceed this. Reaching a VAR node OR an
+                              END node always extends (we want to reach
+                              productive content even at high bp). Set 0 to
+                              disable. Saves enumeration time on chains of
+                              long unlabeled connectors that would never
+                              reach productive content.
 
     `limit_counter` (optional dict) tallies each cap hit so callers can log:
-        {"max_paths_hit": int, "max_path_length_hit": int}
+        {"max_paths_hit": int, "max_path_length_hit": int, "max_bp_hit": int}
     """
+    bp_enabled = (max_bp_since_var > 0 and node_bp is not None
+                  and var_nodes is not None)
+    def _bp(n): return node_bp.get(n, 0) if node_bp else 0
     paths = []
-    frontier = [([start], frozenset({start}))]
+    # State: (path, vis, bp_since_var). bp_since_var starts at start's own
+    # bp if start is not var, else 0.
+    start_bp = 0 if (bp_enabled and start in var_nodes) else _bp(start)
+    frontier = [([start], frozenset({start}), start_bp)]
     while frontier and len(paths) < max_paths:
         next_frontier = []
-        for path, vis in frontier:
+        for path, vis, bp_acc in frontier:
             if len(paths) >= max_paths: break
             curr = path[-1]
             for nxt in adj.get(curr, ()):
@@ -47,6 +64,29 @@ def _enum_paths(adj, start, ends, allowed, max_paths=50, max_path_length=15,
                         limit_counter["max_path_length_hit"] = \
                             limit_counter.get("max_path_length_hit", 0) + 1
                     continue
+                # BP-aware cap, PRE-extension check:
+                #   * Var nodes always extend and reset the tail to 0.
+                #   * Non-var nodes extend ONLY when the CURRENT accumulated
+                #     bp (bp_acc, NOT bp_acc + size of nxt) is within the
+                #     cap. This means a path that hasn't blown the budget
+                #     yet can still pick up one MORE node of any size —
+                #     e.g., a final 10 kb anchor — and the cap only kicks
+                #     in for FURTHER extensions afterward. Stops chain
+                #     extension once the path has clearly wandered too far
+                #     from var content, but doesn't lose paths that reach
+                #     a productive target on the next hop.
+                if bp_enabled:
+                    if nxt in var_nodes:
+                        new_bp = 0
+                    else:
+                        if bp_acc > max_bp_since_var:
+                            if limit_counter is not None:
+                                limit_counter["max_bp_hit"] = \
+                                    limit_counter.get("max_bp_hit", 0) + 1
+                            continue
+                        new_bp = bp_acc + _bp(nxt)
+                else:
+                    new_bp = 0
                 new_path = path + [nxt]
                 if nxt in ends and nxt != start:
                     paths.append(new_path)
@@ -56,21 +96,25 @@ def _enum_paths(adj, start, ends, allowed, max_paths=50, max_path_length=15,
                                 limit_counter.get("max_paths_hit", 0) + 1
                         break
                 else:
-                    next_frontier.append((new_path, vis | {nxt}))
+                    next_frontier.append((new_path, vis | {nxt}, new_bp))
         frontier = next_frontier
     return paths
 
 
 def _enum_dangling(adj, start, allowed, var_nodes, exclude_var_subset,
-                    max_paths=50, max_path_length=15, limit_counter=None):
+                    max_paths=1000, max_path_length=50, limit_counter=None,
+                    node_bp=None, max_bp_since_var=5000):
     """Var-bearing simple paths from `start` that dead-end inside `allowed`.
     Drop a path if its var content is wholly inside `exclude_var_subset`.
-    Same two limits as `_enum_paths`."""
+    Same three caps as `_enum_paths` (incl. BP-since-var)."""
+    bp_enabled = max_bp_since_var > 0 and node_bp is not None
+    def _bp(n): return node_bp.get(n, 0) if node_bp else 0
     paths, seen = [], set()
-    frontier = [([start], frozenset({start}))]
+    start_bp = 0 if (bp_enabled and start in var_nodes) else _bp(start)
+    frontier = [([start], frozenset({start}), start_bp)]
     while frontier and len(paths) < max_paths:
         next_frontier = []
-        for path, vis in frontier:
+        for path, vis, bp_acc in frontier:
             if len(paths) >= max_paths: break
             curr = path[-1]
             extended = False
@@ -82,8 +126,20 @@ def _enum_dangling(adj, start, allowed, var_nodes, exclude_var_subset,
                         limit_counter["max_path_length_hit"] = \
                             limit_counter.get("max_path_length_hit", 0) + 1
                     continue
+                if bp_enabled:
+                    if nxt in var_nodes:
+                        new_bp = 0
+                    else:
+                        if bp_acc > max_bp_since_var:
+                            if limit_counter is not None:
+                                limit_counter["max_bp_hit"] = \
+                                    limit_counter.get("max_bp_hit", 0) + 1
+                            continue
+                        new_bp = bp_acc + _bp(nxt)
+                else:
+                    new_bp = 0
                 extended = True
-                next_frontier.append((path + [nxt], vis | {nxt}))
+                next_frontier.append((path + [nxt], vis | {nxt}, new_bp))
             if not extended and len(path) > 1:
                 vs = set(path) & var_nodes
                 if vs and not (vs <= exclude_var_subset):
@@ -106,9 +162,18 @@ def _canonical(p):
 def classify(nodes: set[str], edges: set[frozenset],
              label_per_node: dict[str, str],
              var_per_node: dict[str, set[str]],
-             max_paths: int = 50,
-             max_path_length: int = 15) -> dict:
-    """Appendix-B classifier. Returns verdict dict."""
+             max_paths: int = 1000,
+             max_path_length: int = 50,
+             node_bp: dict[str, int] | None = None,
+             max_bp_since_var: int = 5000) -> dict:
+    """Appendix-B classifier. Returns verdict dict.
+
+    BP-aware path enumeration: when `node_bp` (per-node bp lengths from
+    provenance) AND `max_bp_since_var > 0` are supplied, simple-path
+    enumeration drops any extension whose accumulated bp since the last
+    var node would exceed the threshold. Saves search effort on chains
+    of long unlabeled connectors that have already moved far from
+    productive content."""
     var_nodes = {n for n in nodes if var_per_node.get(n)}
     flankL = {n for n in nodes if "flankL" in (label_per_node.get(n, "")).split("+")}
     flankR = {n for n in nodes if "flankR" in (label_per_node.get(n, "")).split("+")}
@@ -139,7 +204,9 @@ def classify(nodes: set[str], edges: set[frozenset],
             comp_labels  = {n: label_per_node.get(n, "") for n in comp_nodes}
             comp_var_per = {n: var_per_node.get(n, set()) for n in comp_nodes if var_per_node.get(n)}
             sub = classify(comp_nodes, comp_edges, comp_labels, comp_var_per,
-                            max_paths=max_paths, max_path_length=max_path_length)
+                            max_paths=max_paths, max_path_length=max_path_length,
+                            node_bp=node_bp,
+                            max_bp_since_var=max_bp_since_var)
             sub_results.append(sub)
         return {"class": "separate", **info,
                 "n_var_components": len(var_full),
@@ -213,7 +280,9 @@ def classify(nodes: set[str], edges: set[frozenset],
     for s in anchors:
         for p in _enum_paths(adj, s, anchors - {s}, bubble,
                               max_paths=max_paths, max_path_length=max_path_length,
-                              limit_counter=limits):
+                              limit_counter=limits,
+                              node_bp=node_bp, var_nodes=var_nodes,
+                              max_bp_since_var=max_bp_since_var):
             if not any(n in var_nodes for n in p): continue
             if _is_closed_endpoints(p):
                 closed.setdefault(_canonical(p), p)
@@ -236,7 +305,9 @@ def classify(nodes: set[str], edges: set[frozenset],
     for s in flank_anchored:
         for p in _enum_dangling(adj, s, bubble, var_nodes, closed_var_union,
                                   max_paths=max_paths, max_path_length=max_path_length,
-                                  limit_counter=limits):
+                                  limit_counter=limits,
+                                  node_bp=node_bp,
+                                  max_bp_since_var=max_bp_since_var):
             if p[-1] in flank_anchored and p[-1] != s: continue
             dangling.setdefault(_canonical(p), p)
 
