@@ -58,16 +58,16 @@ def directional_split(
         seg_length: dict[str, int],
         edges: set[frozenset],
         edge_endpoints: dict[frozenset, tuple[str, str]] | None = None,
-) -> tuple[set[str], set[frozenset], dict[str, str], dict[str, set[str]],
+) -> tuple[set[str], dict[str, set[tuple[str, str, str]]], dict[str, str], dict[str, set[str]],
            dict[str, tuple[str, int, int, str]]]:
-    """Apply P1 to the input. Returns (nodes, edges, labels, var_per, provenance).
+    """Apply P1 to the input. Returns (nodes, directed_adj, labels, var_per, provenance).
 
-    `provenance[sub_id] = (original_seg_id, start, end, strand)` — for each
-    post-P1 node, the original GFA segment ID and the sub-region of that
-    segment on its stored strand. Used for arm-sequence reconstruction.
+    `directed_adj[node_id] = {(side, neighbor_id, neighbor_side), ...}`
+    where side is "L" or "R".
+    `provenance[sub_id] = (original_seg_id, start, end, strand)`
     """
     new_nodes: set[str] = set()
-    new_edges: set[frozenset] = set()
+    new_adj: dict[str, set[tuple[str, str, str]]] = {}
     new_labels: dict[str, str] = {}
     new_vars: dict[str, set[str]] = {}
     side_to_sub: dict[tuple[str, str], str] = {}
@@ -88,12 +88,6 @@ def directional_split(
             provenance[seg] = (seg, 0, slen, "+")
             continue
 
-        # Merge consecutive same-tag hits into a single "run" — multiple
-        # blastn/tblastn fragments of the same gene/flank on one segment
-        # collapse to one labeled sub-segment, so a composite seg like
-        # flankL/HD1/HD1/HD2/HD2/flankR (6 hits) becomes 4 sub-segments
-        # (flankL/HD1/HD2/flankR) with no unlabeled "linker" sub-segments
-        # between adjacent same-tag fragments.
         runs: list[Hit] = []
         for h in hits:
             if runs and runs[-1].tag == h.tag:
@@ -114,14 +108,9 @@ def directional_split(
             seg_subs[seg] = [seg]
             side_to_sub[(seg, "L")] = seg
             side_to_sub[(seg, "R")] = seg
-            # Single run = single label = whole segment.
             provenance[seg] = (seg, 0, slen, r.strand)
             continue
 
-        # Multi-run: split into a chain of pure sub-segments — ONE piece per
-        # unique-label run, boundaries at midpoints between adjacent runs.
-        # Sub-node IDs are clean position-indexed (#1, #2, …); coords live
-        # in provenance.
         boundaries = [0]
         for i in range(len(runs) - 1):
             boundaries.append((runs[i].end + runs[i + 1].start) // 2)
@@ -135,29 +124,28 @@ def directional_split(
                 new_vars.setdefault(sub_id, set()).update(r.tag.split("+"))
             subs.append(sub_id)
             if i > 0:
-                new_edges.add(frozenset((subs[i - 1], sub_id)))
+                # Internal link between subsegments of same parent
+                new_adj.setdefault(subs[i-1], set()).add(("R", sub_id, "L"))
+                new_adj.setdefault(sub_id, set()).add(("L", subs[i-1], "R"))
             provenance[sub_id] = (seg, boundaries[i], boundaries[i + 1], r.strand)
         seg_subs[seg] = subs
         side_to_sub[(seg, "L")] = subs[0]
         side_to_sub[(seg, "R")] = subs[-1]
 
-    # Re-attach original edges to the correct sub-segments.
-    # Edge endpoints are looked up by the canonical (sorted) tuple, so the
-    # mapping is deterministic regardless of frozenset iteration order.
     for e in edges:
         t = sorted(tuple(e))
-        # self-loops allowed for palindromes
         a = t[0]
         b = t[1] if len(t) > 1 else t[0]
         if edge_endpoints and (a, b) in edge_endpoints:
             sa, sb = edge_endpoints[(a, b)]
         elif edge_endpoints and e in edge_endpoints:
-            sa, sb = edge_endpoints[e]                # legacy frozenset key (may flip)
+            sa, sb = edge_endpoints[e]
         else:
-            sa, sb = "L", "L"                         # safe default when no orientation
+            sa, sb = "L", "L"
         new_a = side_to_sub.get((a, sa), a)
         new_b = side_to_sub.get((b, sb), b)
-        if True: # Always add edge even if same node (self-loop)
-            new_edges.add(frozenset((new_a, new_b)))
+        # Add directed edge in both directions (GFA L-line is undirected link)
+        new_adj.setdefault(new_a, set()).add((sa, new_b, sb))
+        new_adj.setdefault(new_b, set()).add((sb, new_a, sa))
 
-    return new_nodes, new_edges, new_labels, new_vars, provenance
+    return new_nodes, new_adj, new_labels, new_vars, provenance
