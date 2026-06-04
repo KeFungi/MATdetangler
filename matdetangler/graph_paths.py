@@ -340,7 +340,9 @@ def emit_dot_tsv(arm1: list[str], arm2: list[str] | None, labels: dict[str, str]
         o.write("}\n")
 
 def emit_png_paired(arms: list[list[str]], arm_names: list[str], labels: dict[str, str],
-                    out_path: str, title: str | None = None) -> None:
+                    out_path: str, title: str | None = None,
+                    seg_cov: dict[str, float] | None = None,
+                    genome_cov: float | None = None) -> None:
     """Render N walks as N stacked horizontal rows (top to bottom). Each row
     keeps its own node IDs. For N=1 the single row is centered (singleton
     mode). For N=2 the original blue/orange paired layout is preserved.
@@ -527,6 +529,16 @@ def emit_png_paired(arms: list[list[str]], arm_names: list[str], labels: dict[st
             la = labels.get(n, "")
             ax.annotate(f"{n}\n{la}" if la else n, (x, y), ha="center", va="center", fontsize=8,
                         bbox=dict(boxstyle="round,pad=0.30", fc=face_for(la), ec="0.4"), zorder=2)
+            # Normalized coverage tag beneath each seg box: cov / genome_cov.
+            # MATdetangler-decorated sub-IDs ("parent#N") inherit the parent's
+            # GFA depth — strip the suffix when looking up. Print only when
+            # both seg_cov and a positive genome_cov are supplied.
+            if seg_cov is not None and genome_cov:
+                base = n.split("#", 1)[0]
+                cov = seg_cov.get(n) or seg_cov.get(base)
+                if cov is not None:
+                    ax.annotate(f"×{cov / genome_cov:.2f}", (x, y - 0.16),
+                                ha="center", va="top", fontsize=7, color="0.25", zorder=2)
         # Row label (e.g. "chimera3") above its segment row, NOT on the
         # same y as the segment boxes — keeps the label out of the box
         # area when arms are dense and avoids overlap with cross-row
@@ -572,7 +584,8 @@ def run(sample: str, gfa: str, primary_alleles_fa: str, queries_dir: str, outdir
         per_allele_gfas: dict[str, str] | None = None,
         recorded_paths: dict[str, list[str]] | None = None,
         subnode_seqs_per_gfa: dict[str, dict[str, str]] | None = None,
-        bubble_type: str | None = None) -> dict:
+        bubble_type: str | None = None,
+        genome_cov: float | None = None) -> dict:
     """Trace each picked allele's walk through a GFA and emit ASCII/DOT/PNG views.
 
     `per_allele_gfas`: optional mapping allele_name -> GFA path. When given (and the allele's
@@ -816,8 +829,26 @@ def run(sample: str, gfa: str, primary_alleles_fa: str, queries_dir: str, outdir
     else:
         ks_label = ' vs '.join('K' + os.path.basename(os.path.dirname(g)).lstrip('kK') for g in used_gfas)
         _png_title = f"{sample}: per-allele walks ({ks_label})"
+    # Per-seg depth from each used GFA, merged across the GFAs we touched.
+    # Auto-derive genome_cov from outdir/genome_cov_spades_<k>.txt if the
+    # caller didn't supply one — uses the k of the first used GFA.
+    merged_depth: dict[str, float] = {}
+    for g in used_gfas:
+        tag = _tag_for(g)
+        for raw_id, dep in _gfa_depth(g).items():
+            merged_depth[f"{tag}{raw_id}" if tag else raw_id] = dep
+    g_cov = genome_cov
+    if g_cov is None and used_gfas:
+        try:
+            kname = os.path.basename(os.path.dirname(used_gfas[0])).lstrip("kK")
+            cov_file = os.path.join(outdir, f"genome_cov_spades_k{kname}.txt")
+            if os.path.exists(cov_file):
+                g_cov = float(open(cov_file).read().strip().split()[0])
+        except (ValueError, OSError):
+            g_cov = None
     emit_png_paired(arm_paths, allele_names_list, merged_labels,
-                    os.path.join(outdir, "bubble.png"), title=_png_title)
+                    os.path.join(outdir, "bubble.png"), title=_png_title,
+                    seg_cov=merged_depth or None, genome_cov=g_cov)
     arm1_str = _astr(arm1, merged_labels)
     arm2_str = _astr(arm2 or [], merged_labels)
     import json
@@ -995,6 +1026,11 @@ def _cli(argv=None):
                         "(source-k, segment-walk) when picks.tsv is unavailable (--skip-pick mode). "
                         "Lets step 7 use the recorded path verbatim — no whole-GFA labeling needed.")
     p.add_argument("--spades-dir", default=None)
+    p.add_argument("--genome-cov", type=float, default=None,
+                   help="genome mean depth (D_k). If omitted, auto-read from "
+                        "outdir/genome_cov_spades_k<k>.txt for the chosen k. "
+                        "Used to print normalized coverage (×N.NN) under each "
+                        "segment box in bubble.png.")
     a = p.parse_args(argv)
     if a.picks_tsv and a.spades_dir and os.path.exists(a.picks_tsv):
         pag, rec = _per_allele_gfas_and_paths(a.picks_tsv, a.spades_dir, a.primary_alleles)
@@ -1008,7 +1044,8 @@ def _cli(argv=None):
         pag, rec, sub_per_gfa, btype = ({}, {}, {}, None)
     run(a.sample, a.gfa, a.primary_alleles, a.queries_dir, a.outdir,
         a.known_degHD, a.repeats, per_allele_gfas=pag, recorded_paths=rec,
-        subnode_seqs_per_gfa=sub_per_gfa, bubble_type=btype)
+        subnode_seqs_per_gfa=sub_per_gfa, bubble_type=btype,
+        genome_cov=a.genome_cov)
 
 if __name__ == "__main__":
     _cli()
