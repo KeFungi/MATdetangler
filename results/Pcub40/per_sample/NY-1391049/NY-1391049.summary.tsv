@@ -1,0 +1,2 @@
+sample	used_k	bubble_type	genome_coverage	allele1_complete	allele2_complete	allele1_coverage	allele2_coverage	allele1_vs_allele2_id_pct	allele1_vs_allele2_aln_frac	cons_allele1_complete	cons_allele2_complete	cons_allele1_vs_allele2_id_pct	cons_allele1_vs_allele2_aln_frac	allele1_path	allele2_path
+NY-1391049	k45	NA	0.0	FALSE	FALSE	0.0	0.0	49.6	0.89	-	-	-	-	23390051 (flankL) <-> 23681617 <-> 12107293#2 (NC_062999_HD1) <-> 12107293#1 (NC_062999_HD2) <-> 13225471 (flankR)	23390051 (flankL) <-> 23681617 <-> 10583224 <-> 12575657 (NC_062999_HD1) <-> 22078235 <-> 13225471 (flankR)

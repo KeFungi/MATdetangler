@@ -1,0 +1,2 @@
+a1	a2	len_a1	len_a2	id_pct	aln_frac	distinct	metric
+FLAS-53882_k53_allele1	FLAS-53882_k53_allele2	5903	5915	65.1	0.41	True	whole-allele

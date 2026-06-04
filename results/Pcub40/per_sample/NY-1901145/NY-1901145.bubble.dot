@@ -1,0 +1,35 @@
+graph bubble {
+  graph [rankdir=LR, layout=neato];
+  "18411" [label="18411\nflankL", style=filled, fillcolor=lightblue];
+  "37630272" [label="37630272\n", style=filled, fillcolor=lightyellow];
+  "37594883#3" [label="37594883#3\nNC_062999_HD1", style=filled, fillcolor=lightyellow];
+  "37594883#2" [label="37594883#2\nNC_062999_HD2", style=filled, fillcolor=lightyellow];
+  "37594883#1" [label="37594883#1\nflankR", style=filled, fillcolor=lightblue];
+  "39109504" [label="39109504\nflankR", style=filled, fillcolor=lightblue];
+  "37630270" [label="37630270\nflankL", style=filled, fillcolor=lightblue];
+  "38196809" [label="38196809\nNC_062999_HD1", style=filled, fillcolor=lightyellow];
+  "39082284" [label="39082284\n", style=filled, fillcolor=lightyellow];
+  "38196799" [label="38196799\n", style=filled, fillcolor=lightyellow];
+  "17733193" [label="17733193\n", style=filled, fillcolor=lightyellow];
+  "39116708" [label="39116708\n", style=filled, fillcolor=lightyellow];
+  "3199271" [label="3199271\n", style=filled, fillcolor=lightyellow];
+  "14290026" [label="14290026\nNC_062999_HD2", style=filled, fillcolor=lightyellow];
+  "37594881" [label="37594881\n", style=filled, fillcolor=lightyellow];
+  "1110024" [label="1110024\n", style=filled, fillcolor=lightyellow];
+  "18411" -- "37630272" [color=royalblue];
+  "37630272" -- "37594883#3" [color=royalblue];
+  "37594883#3" -- "37594883#2" [color=royalblue];
+  "37594883#2" -- "37594883#1" [color=royalblue];
+  "37594883#1" -- "39109504" [color=royalblue];
+  "18411" -- "37630270" [color=darkorange];
+  "37630270" -- "38196809" [color=darkorange];
+  "38196809" -- "39082284" [color=darkorange];
+  "39082284" -- "38196799" [color=darkorange];
+  "38196799" -- "17733193" [color=darkorange];
+  "17733193" -- "39116708" [color=darkorange];
+  "39116708" -- "3199271" [color=darkorange];
+  "3199271" -- "14290026" [color=darkorange];
+  "14290026" -- "37594881" [color=darkorange];
+  "37594881" -- "1110024" [color=darkorange];
+  "1110024" -- "39109504" [color=darkorange];
+}

@@ -1,0 +1,2 @@
+sample	used_k	bubble_type	genome_coverage	allele1_complete	allele2_complete	allele1_coverage	allele2_coverage	allele1_vs_allele2_id_pct	allele1_vs_allele2_aln_frac	cons_allele1_complete	cons_allele2_complete	cons_allele1_vs_allele2_id_pct	cons_allele1_vs_allele2_aln_frac	allele1_path	allele2_path
+vietnam_BD1418	k45	NA	0.0	TRUE	TRUE	0.0	0.0	61.0	0.97	-	-	-	-	1169361#1 (flankL) <-> 1169361#2 (NC_062999_HD1) <-> 1169361#3 (NC_062999_HD2) <-> 2700055 (flankR)	511705#1 (NC_062999_HD1) <-> 511705#2 (NC_062999_HD2) <-> 2700055 (flankR)

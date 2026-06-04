@@ -1,0 +1,10 @@
+graph bubble {
+  graph [rankdir=LR, layout=neato];
+  "24597041#4" [label="24597041#4\nflankL", style=filled, fillcolor=lightblue];
+  "24597041#3" [label="24597041#3\nNC_062999_HD1", style=filled, fillcolor=lightyellow];
+  "24597041#2" [label="24597041#2\nNC_062999_HD2", style=filled, fillcolor=lightyellow];
+  "24597041#1" [label="24597041#1\nflankR", style=filled, fillcolor=lightblue];
+  "24597041#4" -- "24597041#3" [color=royalblue];
+  "24597041#3" -- "24597041#2" [color=royalblue];
+  "24597041#2" -- "24597041#1" [color=royalblue];
+}

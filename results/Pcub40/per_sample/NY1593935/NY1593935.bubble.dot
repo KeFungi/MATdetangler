@@ -1,0 +1,21 @@
+graph bubble {
+  graph [rankdir=LR, layout=neato];
+  "29558297" [label="29558297\nflankL", style=filled, fillcolor=lightblue];
+  "29531542#4" [label="29531542#4\nflankL", style=filled, fillcolor=lightblue];
+  "29531542#3" [label="29531542#3\nNC_062999_HD1", style=filled, fillcolor=lightyellow];
+  "29531542#2" [label="29531542#2\nNC_062999_HD2", style=filled, fillcolor=lightyellow];
+  "29531542#1" [label="29531542#1\nflankR", style=filled, fillcolor=lightblue];
+  "26410680" [label="26410680\nflankR", style=filled, fillcolor=lightblue];
+  "28801442" [label="28801442\nflankL", style=filled, fillcolor=lightblue];
+  "29578371" [label="29578371\nNC_062999_HD1", style=filled, fillcolor=lightyellow];
+  "25526701" [label="25526701\nflankR", style=filled, fillcolor=lightblue];
+  "29558297" -- "29531542#4" [color=royalblue];
+  "29531542#4" -- "29531542#3" [color=royalblue];
+  "29531542#3" -- "29531542#2" [color=royalblue];
+  "29531542#2" -- "29531542#1" [color=royalblue];
+  "29531542#1" -- "26410680" [color=royalblue];
+  "29558297" -- "28801442" [color=darkorange];
+  "28801442" -- "29578371" [color=darkorange];
+  "29578371" -- "25526701" [color=darkorange];
+  "25526701" -- "26410680" [color=darkorange];
+}

@@ -1,0 +1,35 @@
+graph bubble {
+  graph [rankdir=LR, layout=neato];
+  "20297847" [label="20297847\nflankL", style=filled, fillcolor=lightblue];
+  "7126749#4" [label="7126749#4\nflankL", style=filled, fillcolor=lightblue];
+  "7126749#3" [label="7126749#3\nNC_062999_HD1", style=filled, fillcolor=lightyellow];
+  "7126749#2" [label="7126749#2\nNC_062999_HD2", style=filled, fillcolor=lightyellow];
+  "7126749#1" [label="7126749#1\nflankR", style=filled, fillcolor=lightblue];
+  "12784011" [label="12784011\nflankR", style=filled, fillcolor=lightblue];
+  "6990633#1" [label="6990633#1\nflankL", style=filled, fillcolor=lightblue];
+  "6990633#2" [label="6990633#2\nNC_062999_HD1", style=filled, fillcolor=lightyellow];
+  "6990605" [label="6990605\n", style=filled, fillcolor=lightyellow];
+  "6990611" [label="6990611\n", style=filled, fillcolor=lightyellow];
+  "13021155" [label="13021155\n", style=filled, fillcolor=lightyellow];
+  "1222084" [label="1222084\n", style=filled, fillcolor=lightyellow];
+  "6311815" [label="6311815\n", style=filled, fillcolor=lightyellow];
+  "6311809" [label="6311809\n", style=filled, fillcolor=lightyellow];
+  "10512699#1" [label="10512699#1\nNC_062999_HD2", style=filled, fillcolor=lightyellow];
+  "10512699#2" [label="10512699#2\nflankR", style=filled, fillcolor=lightblue];
+  "20297847" -- "7126749#4" [color=royalblue];
+  "7126749#4" -- "7126749#3" [color=royalblue];
+  "7126749#3" -- "7126749#2" [color=royalblue];
+  "7126749#2" -- "7126749#1" [color=royalblue];
+  "7126749#1" -- "12784011" [color=royalblue];
+  "20297847" -- "6990633#1" [color=darkorange];
+  "6990633#1" -- "6990633#2" [color=darkorange];
+  "6990633#2" -- "6990605" [color=darkorange];
+  "6990605" -- "6990611" [color=darkorange];
+  "6990611" -- "13021155" [color=darkorange];
+  "13021155" -- "1222084" [color=darkorange];
+  "1222084" -- "6311815" [color=darkorange];
+  "6311815" -- "6311809" [color=darkorange];
+  "6311809" -- "10512699#1" [color=darkorange];
+  "10512699#1" -- "10512699#2" [color=darkorange];
+  "10512699#2" -- "12784011" [color=darkorange];
+}

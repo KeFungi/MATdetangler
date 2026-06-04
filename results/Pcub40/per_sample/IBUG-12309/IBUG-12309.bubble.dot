@@ -1,0 +1,37 @@
+graph bubble {
+  graph [rankdir=LR, layout=neato];
+  "4732856" [label="4732856\nflankL", style=filled, fillcolor=lightblue];
+  "11762284#2" [label="11762284#2\nflankL", style=filled, fillcolor=lightblue];
+  "11762284#1" [label="11762284#1\nNC_062999_HD1", style=filled, fillcolor=lightyellow];
+  "4453941" [label="4453941\n", style=filled, fillcolor=lightyellow];
+  "12164011" [label="12164011\n", style=filled, fillcolor=lightyellow];
+  "11493834" [label="11493834\n", style=filled, fillcolor=lightyellow];
+  "4537190" [label="4537190\n", style=filled, fillcolor=lightyellow];
+  "12041061" [label="12041061\n", style=filled, fillcolor=lightyellow];
+  "4567694" [label="4567694\n", style=filled, fillcolor=lightyellow];
+  "9077212" [label="9077212\n", style=filled, fillcolor=lightyellow];
+  "16683727" [label="16683727\n", style=filled, fillcolor=lightyellow];
+  "2843324#1" [label="2843324#1\nNC_062999_HD2", style=filled, fillcolor=lightyellow];
+  "2843324#2" [label="2843324#2\nflankR", style=filled, fillcolor=lightblue];
+  "4312134" [label="4312134\nflankR", style=filled, fillcolor=lightblue];
+  "3820823" [label="3820823\nflankL", style=filled, fillcolor=lightblue];
+  "2883838" [label="2883838\nNC_062999_HD1", style=filled, fillcolor=lightyellow];
+  "7291237" [label="7291237\nflankR", style=filled, fillcolor=lightblue];
+  "4732856" -- "11762284#2" [color=royalblue];
+  "11762284#2" -- "11762284#1" [color=royalblue];
+  "11762284#1" -- "4453941" [color=royalblue];
+  "4453941" -- "12164011" [color=royalblue];
+  "12164011" -- "11493834" [color=royalblue];
+  "11493834" -- "4537190" [color=royalblue];
+  "4537190" -- "12041061" [color=royalblue];
+  "12041061" -- "4567694" [color=royalblue];
+  "4567694" -- "9077212" [color=royalblue];
+  "9077212" -- "16683727" [color=royalblue];
+  "16683727" -- "2843324#1" [color=royalblue];
+  "2843324#1" -- "2843324#2" [color=royalblue];
+  "2843324#2" -- "4312134" [color=royalblue];
+  "4732856" -- "3820823" [color=darkorange];
+  "3820823" -- "2883838" [color=darkorange];
+  "2883838" -- "7291237" [color=darkorange];
+  "7291237" -- "4312134" [color=darkorange];
+}
