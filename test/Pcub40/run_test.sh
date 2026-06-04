@@ -49,24 +49,32 @@ if [ ${#SAMPLES[@]} -eq 0 ]; then
 fi
 
 echo "[$(date)] Pcub40 test: ${#SAMPLES[@]} samples, out=$OUT_DIR"
-echo "[$(date)] decompressing GFAs to $TMP_ROOT/spades/<sample>/"
+echo "[$(date)] decompressing GFAs in-place next to .gfa.gz files"
 
-# Step 1: decompress + per-sample spades dir
+# Step 1: decompress in place — examples/Pcub40/<sample>/k<k>/*.gfa.gz
+# stays committed (canonical) and a sibling *.gfa is created for the
+# pipeline to read. Idempotent (skips already-decompressed) and tracked
+# so a final cleanup step at the end can remove just the .gfa siblings.
+declare -a DECOMPRESSED_GFAS
 for s in "${SAMPLES[@]}"; do
-  sd="$TMP_ROOT/spades/$s"
   for kgz in "$EX/$s"/k*/*.gfa.gz; do
     [ -s "$kgz" ] || continue
-    k=$(basename "$(dirname "$kgz")")
-    mkdir -p "$sd/$k"
-    gunzip -c "$kgz" > "$sd/$k/$(basename "$kgz" .gz)"
+    plain="${kgz%.gz}"
+    if [ ! -s "$plain" ]; then
+      gunzip -c "$kgz" > "$plain"
+      DECOMPRESSED_GFAS+=("$plain")
+    fi
   done
 done
+echo "[$(date)] decompressed ${#DECOMPRESSED_GFAS[@]} GFA(s) (skipped any already present)"
 
 # Step 2: run MATdetangler — args mirror run_args.json defaults.
+# spades-dir is examples/Pcub40/<sample> (which now contains both *.gfa.gz
+# and *.gfa side-by-side; the wrapper reads the *.gfa).
 run_one() {
   local s="$1"
   "$ROOT/MATdetangler-cli" run \
-    --sample "$s" --spades-dir "$TMP_ROOT/spades/$s" \
+    --sample "$s" --spades-dir "$EX/$s" \
     --locus-ref "$ROOT/examples/Pcub_locus/NC_062999.fasta" \
     --proteins  "$ROOT/examples/Pcub_locus/NC_062999_HDs.fasta" \
     --outdir "$OUT_DIR" \
@@ -88,8 +96,8 @@ if [ "$SLURM" -eq 1 ]; then
 set -uo pipefail
 SAMPLES=(${SAMPLES[*]})
 S="\${SAMPLES[\$SLURM_ARRAY_TASK_ID]}"
-source /home/yihongke/miniconda3/etc/profile.d/conda.sh; conda activate hddetangler
-"$ROOT/MATdetangler-cli" run --sample "\$S" --spades-dir "$TMP_ROOT/spades/\$S" \\
+source /home/yihongke/miniconda3/etc/profile.d/conda.sh; conda activate MATdetangler
+"$ROOT/MATdetangler-cli" run --sample "\$S" --spades-dir "$EX/\$S" \\
   --locus-ref "$ROOT/examples/Pcub_locus/NC_062999.fasta" \\
   --proteins  "$ROOT/examples/Pcub_locus/NC_062999_HDs.fasta" \\
   --outdir "$OUT_DIR" --ks k45,k53 --threads 4 --expected-count 2 --no-skip-pick
@@ -169,8 +177,12 @@ status=$?
 
 if [ $status -eq 0 ]; then
   rm -rf "$TMP_ROOT"
-  echo "[$(date)] PASS — tmp cleaned"
+  # Clean up the in-place decompressed *.gfa siblings (keep the canonical
+  # *.gfa.gz). Only removes files this run created — never touches existing
+  # .gfa files the user may have placed under examples/ manually.
+  for f in "${DECOMPRESSED_GFAS[@]}"; do rm -f "$f"; done
+  echo "[$(date)] PASS — tmp cleaned, ${#DECOMPRESSED_GFAS[@]} in-place .gfa siblings removed"
 else
-  echo "[$(date)] FAIL — tmp kept at $TMP_ROOT for inspection"
+  echo "[$(date)] FAIL — tmp kept at $TMP_ROOT; in-place .gfa siblings kept under $EX for inspection"
 fi
 exit $status
