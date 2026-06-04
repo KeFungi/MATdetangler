@@ -293,6 +293,28 @@ Python ≥ 3.9. The pipeline imports the standard library + `matplotlib` (for
 `bubble.png`) + `edlib` (for sequence dedup in the per-K caller). No
 biopython / numpy required.
 
+`bash` ≥ 3.2 (the macOS system bash is fine — the wrapper avoids bash-4-only
+constructs and empty-array expansion under `set -u`).
+
+## Reproducibility test (`test/Pcub40`)
+
+A frozen 32-sample _P. cubensis_ dataset (`examples/Pcub40/`, GFAs committed as
+`*.gfa.gz`) with known-good outputs in `test/Pcub40/known_results.json`. The
+harness decompresses each `*.gfa.gz` in place, runs the pipeline, and diffs the
+result against the known values (ignoring install-drift fields — MAFFT/BLAST
+version noise, coverage estimates).
+
+```bash
+conda activate MATdetangler
+bash test/Pcub40/run_test.sh                 # all 32 samples
+bash test/Pcub40/run_test.sh AJB36 BD-1248   # just these (only the run samples are diffed)
+bash test/Pcub40/run_test.sh --slurm         # submit a SLURM array instead of serial
+```
+
+Exit 0 = every **run** sample matches; a subset run only checks the samples it
+ran. On PASS the decompressed `*.gfa` siblings are kept next to their `*.gfa.gz`
+(gitignored) so re-runs reuse them without re-decompressing.
+
 ## License & citation
 
 TBD. If you use MATdetangler in a paper, please cite this repository.

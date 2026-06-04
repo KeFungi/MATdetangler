@@ -58,6 +58,9 @@ _*/
 !examples/
 !examples/**
 !examples/**/*.gfa.gz
+# ...but the decompressed *.gfa siblings the test harness creates from those
+# *.gfa.gz are derived (regenerated on demand) — keep them out of git.
+examples/**/assembly_graph_after_simplification.gfa
 
 # Editor / OS
 .DS_Store

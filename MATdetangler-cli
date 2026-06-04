@@ -522,7 +522,7 @@ print(f'{v:.4f}')
     --hd-proteins "$PROTEINS" \
     --cov-file "$K_COV_FILE" \
     --outdir "$SDIR" --threads "$THREADS" \
-    "${PERK_EXTRA[@]}" \
+    ${PERK_EXTRA[@]+"${PERK_EXTRA[@]}"} \
     2>&1 | tee "$LDIR/03_run_per_k_${K_ONE}.log" || GS_RC=$?
   # Backward-compat alias: bubble_alleles_${K_ONE}.fasta points to the new alleles.fasta
   if [ -s "$SDIR/$K_ONE/alleles.fasta" ]; then

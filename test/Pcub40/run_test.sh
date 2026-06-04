@@ -2,16 +2,20 @@
 # Pcub40 reproducibility test.
 #
 # Pipeline:
-#   1. Decompress examples/Pcub40/<sample>/k<k>/*.gfa.gz to a fresh tmp spades dir.
+#   1. Decompress examples/Pcub40/<sample>/k<k>/*.gfa.gz in place (sibling *.gfa
+#      next to each *.gfa.gz; idempotent — skips any already decompressed).
 #   2. Run MATdetangler with the args defined in test/Pcub40/run_args.json
 #      (read by humans; the script forwards the same flags to MATdetangler).
 #   3. Summarize the output with test/Pcub40/summarize.py.
-#   4. Diff the new JSON against test/Pcub40/known_results.json.
-#   5. Exit 0 if no semantic regression, 1 otherwise.
+#   4. Diff the new JSON against test/Pcub40/known_results.json. Only the
+#      samples actually run this invocation are diffed — a subset run does not
+#      fail on samples it didn't run.
+#   5. Exit 0 if no semantic regression, 1 otherwise. On PASS the decompressed
+#      *.gfa siblings are kept (gitignored) so re-runs reuse them.
 #
 # Usage:
 #   bash test/Pcub40/run_test.sh                 # run all 32 samples
-#   bash test/Pcub40/run_test.sh AJB36 BD-1248   # just these
+#   bash test/Pcub40/run_test.sh AJB36 BD-1248   # just these (only these diffed)
 #   bash test/Pcub40/run_test.sh --slurm         # submit a slurm array instead of serial
 #
 # Tolerated diffs (will not fail the test):
@@ -159,7 +163,10 @@ def scrub(s):
     if "alleles" in s: s["alleles"] = alleles
     return s
 diffs = []
-for s in sorted(set(new["samples"]) | set(known["samples"])):
+# Only compare samples that were actually run this invocation (present in
+# new_results.json). Running a subset — e.g. `run_test.sh AJB36` — must not
+# FAIL just because the other known samples weren't run.
+for s in sorted(new["samples"]):
     n = scrub(new["samples"].get(s, {}))
     k = scrub(known["samples"].get(s, {}))
     if n != k:
@@ -177,11 +184,11 @@ status=$?
 
 if [ $status -eq 0 ]; then
   rm -rf "$TMP_ROOT"
-  # Clean up the in-place decompressed *.gfa siblings (keep the canonical
-  # *.gfa.gz). Only removes files this run created — never touches existing
-  # .gfa files the user may have placed under examples/ manually.
-  for f in "${DECOMPRESSED_GFAS[@]}"; do rm -f "$f"; done
-  echo "[$(date)] PASS — tmp cleaned, ${#DECOMPRESSED_GFAS[@]} in-place .gfa siblings removed"
+  # Keep the in-place decompressed *.gfa siblings (next to the canonical
+  # *.gfa.gz). The decompress step above is idempotent — it skips any .gfa
+  # that already exists — so leaving them lets subsequent runs reuse them
+  # without re-gunzipping.
+  echo "[$(date)] PASS — tmp cleaned; ${#DECOMPRESSED_GFAS[@]} .gfa sibling(s) kept under $EX for reuse"
 else
   echo "[$(date)] FAIL — tmp kept at $TMP_ROOT; in-place .gfa siblings kept under $EX for inspection"
 fi
