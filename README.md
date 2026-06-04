@@ -11,88 +11,56 @@ conserved flanks and one or more variable genes (P/R, PR, idiomorph-like loci).
 Two alleles traced through the assembly graph, one row each, x-aligned at
 shared joints. Yellow boxes carry variable genes (HD1 / HD2); blue boxes
 are pure flanks. The `×N.NN` tag below each segment is the normalized
-coverage (`seg_cov / genome_cov`) — ×1.0 = haploid depth (single allele),
-×2.0 = collapsed-repeat / double-allele.*
+coverage (`seg_cov / genome_cov`). `genome_cov` is the median GFA segment
+depth — for a (mostly homozygous) diploid that's ≈ 2 × haploid coverage,
+so a unique bubble-allele segment (one haploid's reads only) reads
+**×0.5**, a segment shared between alleles or homozygous background
+reads **×1.0**, and a collapsed two-copy repeat reads **×2.0**.*
 
-> Methods + rationale + pseudocode: **[METHODS.md](METHODS.md)**.
+> Methods + algorithm + pseudocode: **[METHODS.md](METHODS.md)**.
 > Open algorithmic improvements: **[TODO.md](TODO.md)**.
-> Retired methods (legacy `graph_path_search` + `pick_alleles` chain):
-> **[METHODS.legacy.md](METHODS.legacy.md)**.
 
 ---
 
-## What it actually does
+## What it does (one paragraph)
 
-Stages 1–5 are **reads-free** — only the SPAdes assembly + locus reference are needed.
-Reads (`--reads-r1`/`--reads-r2`) are required only when you opt into the read-derived
-consensus path (stages 6 and 7) via `--make-consensus`.
+Pre-built SPAdes per-k assembly graphs come in (GFA `.gfa` or `.gfa.gz`).
+For each sample × each k, MATdetangler-cli (a) BLASTs the user-supplied HD
+proteins + auto-derived flanks against the segments, (b) finds the bubble
+in the graph (set of var-bearing segments + unlabeled connectors between
+them), (c) enumerates the simple paths between flank-adjacent anchors,
+(d) emits the two divergent allele walks as FASTA + a PNG with normalized
+coverage tags. Stages 1–5 are reads-free; stage 6 (`--make-consensus`)
+opts in to bowtie2 + `samtools consensus` for a read-derived allele pair.
 
-1. **Input processing → query construction** — tblastn user-supplied HD proteins
-   against the locus reference. HSPs are resolved in confidence order with
-   cross-protein non-overlap (HD1's weak partial HSPs in HD2's region don't leak
-   into HD1's reported span). Per-gene spans come from the union of accepted
-   same-protein HSPs; the HD envelope is the union of gene spans padded by 500 bp
-   each side. Flanks are auto-derived as the locus sequence outside the envelope
-   (trimmed to `--max-flank-len` per side).
-2. **Per-K genome coverage** — per-k median of the GFA's per-segment `DP:f:`
-   tag across segments ≥ `--contig-depth-size-cut` bp (default 5000). Bp-equivalent
-   units; same scale as the segment depths used downstream. Cached as
-   `genome_cov_spades_k<K>.txt`. Reads-free, contigs.fasta-free — works on .gfa
-   or .gfa.gz transparently.
-3. **Per-K allele caller (`matdetangler.run_per_k`)** — for each K:
-   extract `S`-line segments from `gfa(K)` → BLAST DB → full outfmt-6 blastn
-   flankL/flankR + tblastn HD proteins → labeler builds `seg_label_hits.tsv` →
-   `find_alleles` runs the bubble classifier (directional split → bubble BFS →
-   universal-leaf anchors → endpoint-flank-status arms → verdict) followed by
-   the trim → dedup → emit chain. Writes `<outdir>/<K>/result.tsv` +
-   `<outdir>/<K>/alleles.fasta`.
-4. **Cross-K consolidation (`matdetangler.pick_k`)** — reads each sample's
-   per-K result.tsv files and picks the best K (priority by topology and dedup
-   count; tie-break on completeness, locus coverage, diploid balance, total bp,
-   raw candidates). Emits `picks.tsv` (legacy 12-col schema, downstream
-   compatible) + `picks_summary.tsv` (new sample-level schema with extend_bounds,
-   n_dedup, k_chosen) + `primary_alleles.fasta`. Skipped under `--skip-pick`.
-5. **Annotated allele walks (`graph_paths`)** — render each picked allele back
-   on the GFA: ASCII walk, sub-GFA, DOT, PNG, edge-list TSV. Reads-free.
-6. **Mapping + read-derived consensus (`map_consensus.sh`)** — `--make-consensus` opts in.
-   Competitive bowtie2 `--end-to-end`, `samtools consensus` per allele, HD-core depth.
-7. **Consensus QC (`consensus_qc` + `pairwise_identity` rerun)** — `--make-consensus`
-   opts in. tblastn / blastn re-check completeness on the consensus; MAFFT divergence
-   re-run on the consensus pair. Keep both pick-level AND consensus-level numbers
-   side-by-side in `summary.tsv`.
-8. **Cross-sample mating-type clustering (`MATdetangler-cli cluster`)** — separate
-   post-batch command. `align` extracts each picked allele's HD-core (variable-gene
-   span ±50 bp), runs ONE MAFFT, and emits the pairwise similarity matrix; `cut`
-   does single-linkage on the cached matrix at `--thresh` (default 0.90) and writes
-   `allele_classification.tsv` + `allele_distance_matrix.tsv`. Cheap to re-run `cut`
-   at any threshold.
+## Pipeline overview (9 stages)
 
-The legacy contig anchor search (`anchor_search.py` step 2 in earlier versions)
-is **no longer in the default flow** — the new per-K caller blasts directly
-against GFA segments and doesn't consume anchor seeds.
+1. **input_process** — tblastn proteins → locus_ref → confidence-ordered HSP acceptance → derive HD envelope and per-side flanks → write `queries/{variable_proteins, variable_nt, flankL, flankR, manifest.json}`.
+2. **Per-K genome coverage** — median of GFA per-segment `DP:f:` across segments ≥ 5 kb → `genome_cov_spades_k<K>.txt`. Reads-free, **GFA-only** (no contigs.fasta).
+3. **Per-K allele caller** (`matdetangler.run_per_k` → `find_alleles`) — per k: BLAST DB the GFA segments, blastn flanks + tblastn proteins, build `seg_label_hits.tsv`, P1 directional split into pure-role sub-nodes, bubble BFS, R1–R4 classification (closed_bubble / open_bubble / single / complexed / separate), arm enumeration with three caps (`max_paths=1000`, `max_path_length=50`, `max_bp_since_var=5000`), 4-tier ranking, dedup. **Two-pass cov-filter loop**: cov-OFF main + cov-ON fallback (only if the main pass didn't accept).
+4. **Cross-K consolidation** (`pick_k`) — pick the best k by `(complete_locus, complete_var, bubble_priority, diploid_dist)`. Skipped under `--skip-pick` (default).
+5. **Annotated bubble views** (`graph_paths`) — bubble.{txt,gfa,dot,tsv,png}. PNG carries `×N.NN` normalized coverage per segment.
+6. **Read mapping + consensus** (`map_consensus.sh`, `--make-consensus` only) — bowtie2 competitive end-to-end → `samtools consensus`. Persists `reads.sam` (BAM is internal intermediate); `consensus_alleles.fasta` keeps original reference seq IDs.
+7. **Identity + QC** — MAFFT pairwise identity on the picks + (if consensus) on the consensus pair; tblastn / blastn re-check of consensus completeness.
+8. **summary_table** — wide-format per-sample `summary.tsv` row (verdict, completeness, identities, allele paths).
+9. **summarize.py** — comprehensive cross-run-comparable `summary.json` (NEW step; the dictionary form of summary.tsv plus the BFS per-k trace and finished_nhop; used by `test/Pcub40/*_run_test.sh`).
+
+**Determinism**: the wrapper exports `PYTHONHASHSEED=0` so set/dict iteration order is locked. Two independent runs of the same demo on the same install are byte-identical (including the exact graph segments per allele).
 
 ## Installation
 
-One-time conda environment (covers every external binary the pipeline needs:
-SPAdes, BLAST+, bowtie2, samtools, MAFFT, plus Python + matplotlib + edlib +
-git-lfs):
-
 ```bash
+# One-time conda environment — SPAdes, BLAST+, bowtie2, samtools, MAFFT,
+# Python (3.9+), matplotlib, edlib, git-lfs.
 conda env create -f install/env.yml      # ~5 min on first run
 conda activate MATdetangler
 ```
 
-The pipeline is pure Python stdlib + `matplotlib` (for `bubble.png`) + `edlib`
-(for dedup) + a handful of subprocess calls. No biopython, numpy, or other
-heavy Python deps. If you already have the external binaries on `$PATH`
-(`spades.py`, `makeblastdb`, `tblastn`, `blastn`, `bowtie2`, `samtools`,
-`mafft`, `git-lfs`) plus `pip install edlib`, you can skip the conda env entirely.
+If you already have the external binaries on `$PATH` (`spades.py`,
+`makeblastdb`, `tblastn`, `blastn`, `bowtie2`, `samtools`, `mafft`,
+`git-lfs`) plus `pip install edlib`, you can skip the conda env entirely.
 
 ### Verify the install
-
-After `conda env create`, run the Pcub40 installation test to confirm
-the pipeline reproduces the committed baseline byte-for-byte on the
-bundled 32-sample demo:
 
 ```bash
 # Pull the LFS-stored demo GFAs (1.9 GB; first time only)
@@ -105,17 +73,19 @@ bash test/Pcub40/installation_run_test.sh --slurm         # SLURM array
 bash test/Pcub40/installation_run_test.sh AJB36 BD-1248   # subset
 ```
 
-PASS = your install produces identical per-sample summary.json files to
-`test/Pcub40/known_results.json` (after ignoring documented install-drift
-fields like MAFFT alignment scores). The wrapper exports `PYTHONHASHSEED=0`
-so set/dict iteration order is locked — runs are byte-for-byte deterministic
-across invocations within one install.
+PASS = your install reproduces `test/Pcub40/known_results.json` (the
+committed Pcub40 baseline) on every sample run. The widened tolerance
+ignores documented install-drift fields (MAFFT alignment scores,
+human-readable path strings, allele lengths, per-allele cov); the
+analysis-critical fields (bubble_type, complete_var, complete_locus,
+n_dedup, allele identity, segments) are compared strictly.
 
-`test/Pcub40/analysis_run_test.sh` is the companion script for the OPPOSITE
-direction: when you've *changed* the implementation and want a structured
-report of which Pcub40 samples got called differently (verdict change /
-completeness change / allele-structure change / segment-walk drift). It
-always exits 0 — divergence is information, not error.
+The companion script `test/Pcub40/analysis_run_test.sh` does the OPPOSITE:
+when you've changed the implementation and want a structured report of
+which Pcub40 samples got called differently. It ALWAYS exits 0 —
+divergence is information, not error. Reports per-sample by change
+category (verdict / completeness / allele-structure / BFS-state /
+segment-drift).
 
 ## Quick start
 
@@ -125,7 +95,7 @@ MATdetangler-spades \
   --sample Tu127439 \
   --reads-r1 reads/R1.fq.gz --reads-r2 reads/R2.fq.gz \
   --outdir examples/Tu127439_spades/ \
-  --ks 33,45
+  --ks 45,53
 
 # Stages 1-5 (reads-free, default) — recover the two alleles
 MATdetangler-cli run \
@@ -134,7 +104,7 @@ MATdetangler-cli run \
   --locus-ref examples/Suilu_locus/Suilu4_MATA.fasta \
   --proteins  examples/Suilu_locus/Suilu4_HDs.fasta \
   --outdir results/ \
-  --ks k33,k45 \
+  --ks k45,k53 \
   --no-skip-pick
 
 # Stages 1-8 with read-derived consensus + QC (opt in)
@@ -145,7 +115,7 @@ MATdetangler-cli run \
   --locus-ref examples/Suilu_locus/Suilu4_MATA.fasta \
   --proteins  examples/Suilu_locus/Suilu4_HDs.fasta \
   --outdir results/ \
-  --ks k33,k45 \
+  --ks k45,k53 \
   --no-skip-pick \
   --make-consensus
 
@@ -153,7 +123,7 @@ MATdetangler-cli run \
 MATdetangler-cli batch --samplesheet samples.tsv \
   --locus-ref examples/Suilu_locus/Suilu4_MATA.fasta \
   --proteins  examples/Suilu_locus/Suilu4_HDs.fasta \
-  --outdir results/ --threads 8 --ks k33,k45 \
+  --outdir results/ --threads 8 --ks k45,k53 \
   --no-skip-pick
 
 # Only steps 6+7 on a sample already processed (primary_alleles.fasta on disk)
@@ -189,169 +159,152 @@ different `--thresh` values to explore the mating-type partition.
 
 | flag | what |
 |---|---|
-| `--locus-ref FASTA` | single-record DNA reference spanning the HD region + both flanks. ~10–15 kb is plenty. |
-| `--proteins FASTA` | **curated** protein fasta (HD1, HD2, …). Real proteins, intron-free. Records with duplicate IDs are auto-suffixed (`_1`, `_2`, …). |
-| `--sample`, `--spades-dir`, `--outdir` | per-sample inputs |
-| `--reads-r1`, `--reads-r2` | **OPTIONAL** — only required when `--make-consensus` is set. The pipeline is reads-free through stage 5 by default. |
+| `--locus-ref FASTA` | single-record DNA reference spanning the HD region + both flanks (~10–15 kb is plenty). |
+| `--proteins FASTA` | curated protein fasta (HD1, HD2, …). Real proteins, intron-free. Duplicate IDs auto-suffixed (`_1`, `_2`, …). |
+| `--sample`, `--spades-dir`, `--outdir` | per-sample inputs. spades-dir contains `k<K>/assembly_graph_after_simplification.gfa[.gz]`. |
+| `--reads-r1`, `--reads-r2` | **OPTIONAL** — only required when `--make-consensus` is set. Pipeline is reads-free through stage 5 by default. |
 
-### Optional
+### Optional (most-used)
 
 | flag | default | what |
 |---|---|---|
-| `--ks LIST` | `k45` | which per-k subdirs of `--spades-dir` to consider. Comma-separated to sweep multiple. |
-| `--max-flank-len` | 2000 | trim each flank to at most this many bp |
-| `--envelope-padding` | 500 | bp pad on each side of the HD envelope at input processing |
-| `--no-skip-pick` | (default = skip ON) | run stage 4 (`pick_k`) — the cross-K picker. Default behavior skips it and aliases the per-K candidate pool as `primary_alleles.fasta`, so stages 5+ run on the raw candidates. `--no-skip-pick` runs the full pipeline. |
-| `--make-consensus` | off | Run stage 6 (`map_consensus.sh`) and the consensus-derived parts of stage 7. Default OFF — the pipeline is reads-free through stage 5. `--make-consensus` opts in; `--reads-r1`/`--reads-r2` become required. |
-| `--continue` | off | Re-run with additional k's, reusing existing sample-level outputs: stage 1 (`input_process`) is skipped if `queries/manifest.json` exists; per-k genome coverage reuses cached `genome_cov_spades_k<K>.txt`; per-K stage 3 is skipped for any k whose `<outdir>/<K>/result.tsv` already exists. Implies `--no-skip-pick` so `pick_k` runs on the combined per-K pool. |
-| `--re-blast` | off | Remove the per-K cache directories (`<outdir>/<sample>/<K>/`) before running. Use whenever you've changed blast parameters or want a clean run. |
-| `--threads` | 4 | blast / bowtie2 / mafft thread count |
-| `--expected-count {1,2}` | 2 | 1 = haploid, 2 = dikaryon. Consumed by the cross-K picker's diploid-balance tie-break. |
-| `--genome-coverage FLOAT` | auto-estimated per k (median of SPAdes contigs.fasta `cov_` across contigs ≥ `--contig-depth-size-cut` bp) | mean genomic depth, bp-equivalent units (same scale as GFA `DP:f:` segment depths). Drives the per-K caller's depth filter band `[lo_mult × D_k, hi_mult × D_k]` AND the diploid-balance tie-break in `pick_k`. When supplied, overrides the per-k estimate for ALL k's. |
-| `--contig-depth-size-cut INT` | 5000 | minimum contig length (bp) used by the per-k genome-cov estimator. Lower → more contigs but more short-tip noise. |
+| `--genome-coverage FLOAT` | auto-estimated from GFA `DP:f:` median | mean genomic depth, bp-equivalent. When supplied, overrides per-k estimate for ALL k's. |
+| `--ks LIST` | `k45,k53` | k subdirs to consider |
+| `--threads N` | 4 | threads for blast/bowtie2/mafft |
+| `--expected-count {1,2}` | 2 | 1=haploid, 2=dikaryon |
+| `--no-skip-pick` | (skip is default) | run step 4 (pick_k) + step 8 (summary row) instead of QC-only |
+| `--make-consensus` | OFF | opt in to step 6 (read mapping + consensus). Requires `--reads-r1`/`-r2`. |
+| `--cov-filter {on,off}` | `on` | depth filter on BFS neighborhood. `on` = cov-OFF main + cov-ON fallback; `off` = cov-OFF only, no fallback. |
+| `--max-nhop N` | 8 | BFS hop count cap. Reduced from 10 in 2026-06 (Pcub40 sweeps show 53/53 useful short-circuits by nhop=6). |
+| `--init-nhop N` | 3 | initial BFS hop count |
+| `--max-paths N` | 1000 | cap on simple paths per anchor in classifier |
+| `--max-path-length N` | 50 | cap on per-path length (# post-P1 nodes) |
+| `--max-bp-since-var N` | 5000 | bp-aware path enumeration cap; drop partial paths whose bp since last var-bearing node exceeds this. 0 disables. |
+| `--seeds {var,flank,both}` | `both` | BFS seed source |
+| `--lo-mult X --hi-mult Y` | 0.2 / 2.0 | cov filter band `[X × D_k, Y × D_k]` |
+| `--min-allele-bp N` | 0 | hard min-bp floor on dedup pool. 0 = disabled. |
+| `--contig-depth-size-cut N` | 5000 | min seg length (bp) used by the GFA-DP median estimator |
+| `--debug` | OFF | trace every shell command + unbuffered Python |
+| `--re-blast` | OFF | wipe per-sample cached blast result TSVs before running |
+| `--continue` | OFF | reuse cached per-k outputs; useful when adding a new k to an existing sample |
 
-The legacy graph_path_search / pick_alleles knobs (`--asymmetric-bfs`,
-`--dup-id`, `--dup-frac`, `--max-hops`, `--init-hops`, `--max-walk-bp`,
-`--max-locus-len`) no longer apply to the default flow and have been
-retired. See `METHODS.legacy.md` if you need to understand what they did.
-
-### Per-K BLAST cache
-
-Heavy BLAST results (per-K segment-level blastn / tblastn) are cached
-under each per-K result dir:
-
-```
-results/<sample>/<K>/
-  flankL_blastn.tsv           ← full outfmt-6, 12 cols
-  flankR_blastn.tsv
-  HD_tblastn.tsv
-  seg_label_hits.tsv          ← labeler output
-  result.tsv                  ← 21-col per-K row
-  alleles.fasta               ← emitted allele/chimera records
-```
-
-To force re-BLAST: delete `<outdir>/<sample>/<K>/` or pass `--re-blast`.
-
-## Preparing the SPAdes graphs (step 0)
-
-MATdetangler needs `contigs.fasta` + `assembly_graph_after_simplification.gfa` for
-**each k** in the sweep. The included wrapper `MATdetangler-spades` does this in the
-exact layout downstream stages expect:
-
-```bash
-# Single sample (submits one SLURM job per k)
-MATdetangler-spades \
-  --sample Tu127439 \
-  --reads-r1 R1.fq.gz --reads-r2 R2.fq.gz \
-  --outdir examples/Tu127439_spades/ \
-  --ks 33,45,53
-
-# Batch (3-col TSV: sample r1 r2) — submits a SLURM array
-MATdetangler-spades batch \
-  --samplesheet samples.tsv \
-  --outdir examples/Tu127439_spades/ \
-  --ks 33,45,53 \
-  --threads 8 --mem 24 --time 2:30:00 \
-  --account my-acct --partition standard
-
-# Laptop / no SLURM
-MATdetangler-spades batch --samplesheet samples.tsv --outdir examples/Tu127439_spades/ --local
-```
-
-Defaults:
-
-- `--ks 33,45,53` (override with any comma-separated list, e.g. `21,33,55`)
-- `--threads 8`, `--mem 24` (GB), `--time 2:30:00`
-- **No BayesHammer** (uses `--only-assembler`), assuming the reads were already
-  adapter- and quality-trimmed. Add `--bayes-hammer` if you want SPAdes to do the
-  read correction.
-- Layout: `<outdir>/<sample>/k<K>/{contigs.fasta, assembly_graph_after_simplification.gfa, contigs.paths}`
-- **Skip-safe**: any (sample, k) whose two output files already exist is skipped,
-  so re-running the wrapper only fills in the missing tasks.
-
-**Why one SPAdes job per k.** SPAdes' multi-k mode (`-k 33,45,53` in one call)
-keeps only the FINAL-k GFA — intermediate k GFAs are stripped. MATdetangler runs
-one assembly per (sample, k) pair so each K's GFA is preserved.
-`matdetangler/paths.py` resolves either `k33/` (lowercase) or `K33/` (uppercase)
-layouts.
+Full per-K caller pass-through: `--divergence-threshold`, `--locus-padding`, `--asymmetric-bfs` — see `MATdetangler-cli` `--help`.
 
 ## Outputs (per sample, in `results/<sample>/`)
 
 | file | what |
 |---|---|
-| **`primary_alleles.fasta`** | **The picked allele set** — from the chosen K. Headers `<sample>_<k>_<allele_name>`. Empty if every per-K result errored. By default the `--min-allele-bp` floor is **disabled** (0) — open_bubble samples whose dangling end carries a var node in the tail are EMITTED as a second allele (they represent a real alternative HD-bearing region in the graph: paralog or alternative allele). Set `--min-allele-bp 3000` to restore the legacy filter that hides these sub-HD-content picks when you only want canonical closed-bubble pairs. Each emitted sequence is the "arm-unique" content: the first-non-joint to last-non-joint slice of the BFS-extended fullwalk (cycle-joint nodes shared across arms excluded at the ends), then tblastn locus-trimmed. Joints are detected label-blind via multi-source BFS in the post-P1 graph (a node visited by ≥ 2 arms' BFS frontiers is a joint candidate; pair-search picks the globally-best (j_a, j_b) pair, with per-arm-side fallback for asymmetric open_bubbles where one arm can't reach both joints). Dedup ranking and divergence compare run on the var-trimmed → HD-only slice separately — see METHODS.md §3.8. The cross-K picker ranks completeness FIRST (complete_locus, then complete_var), so the K that emits the most-complete locus wins regardless of the classifier's pre-dedup topology label. **Cov-filter fallback** (default): the per-K caller runs the cov-OFF main pass first; if no complete-locus closed_bubble short-circuits, it falls back to a cov-ON pass over the same nhop range. `--cov-filter off` disables the fallback. **Short-circuit acceptance** requires only `closed_bubble + n≥2 + complete_locus=2` — complete_var is NOT required, so a diploid n=2 with one truncated allele (cv=1) wins over a homozygote-collapsed n=1 (cv=2). **Search-space caps**: `max_paths=1000`, `max_path_length=50`, `max_bp_since_var=5000` (bp-aware path enumeration cap; drops partial paths that wander > 5 kb without hitting a var node), `max_nhop=8` (reduced from 10 — empirically all useful short-circuits on Pcub40 happen by nhop=6). |
-| **`longest_alleles.fasta`** | Union of `<K>/longest_alleles.fasta` across all per-K iterations: length-first RC-aware dedup at the same divergence threshold (1%) over the full candidate pool. Each header is prefixed with the source k (e.g. `k45_…`, `k53_…`). Wider net than `primary_alleles.fasta` — useful for downstream variant analyses that want every distinct LONGEST walk we ever observed across the BFS grid. |
-| `picks.tsv` | legacy 12-col schema, one row per emitted allele: `sample, allele, origin, k, type, len, from_contig, segments, cov, n_variable_genes, has_both_flanks, is_degHD`. Compatible with downstream `graph_paths` + `summary_table`. |
-| `picks_summary.tsv` | sample-level new schema, one row per sample: `sample, k_chosen, bubble_type, n_dedup, complete_var, complete_locus, locus_coverage, basepair, genome_cov, allele_cov, n_cand, extend_bounds, components, all_k_tried`. |
-| `<K>/result.tsv` | per-K caller output, 22 columns. See METHODS.md §3.11. `complete_var` and `complete_locus` are now tri-state integers (0=none, 1=some, 2=all). |
+| **`primary_alleles.fasta`** | **The picked allele set** — from the chosen K. Headers `<sample>_<k>_<allele_name>`. Each emitted sequence is the "arm-unique" content: the first-non-joint to last-non-joint slice of the BFS-extended fullwalk (cycle-joint nodes shared across arms excluded at the ends), then tblastn locus-trimmed. Joints are detected label-blind via multi-source BFS in the post-P1 graph. Dedup ranking and divergence compare run on the var-trimmed → HD-only slice separately — see METHODS.md §3e. The cross-K picker ranks completeness FIRST (complete_locus, then complete_var). **Cov-filter fallback** (default): the per-K caller runs the cov-OFF main pass first; if no complete-locus closed_bubble short-circuits, it falls back to a cov-ON pass over the same nhop range. **Short-circuit acceptance** requires only `closed_bubble + n≥2 + complete_locus=2` — complete_var is NOT required, so a diploid n=2 with one truncated allele (cv=1) wins over a homozygote-collapsed n=1 (cv=2). **Search-space caps**: `max_paths=1000`, `max_path_length=50`, `max_bp_since_var=5000`, `max_nhop=8`. |
+| `longest_alleles.fasta` | length-first RC-aware dedup over the candidate pool — keeps the LONGEST representative of each edit-distance class (HD-only divergence). |
+| `picks.tsv` | per-allele 12-col metadata: sample, allele, origin, k, type, len, from_contig, segments, cov, n_variable_genes, has_both_flanks, is_degHD. |
+| `picks_summary.tsv` | sample-level (`--no-skip-pick` only): k_chosen, bubble_type, n_dedup, complete_var, complete_locus, locus_coverage, basepair, genome_cov, allele_cov, n_cand, extend_bounds, components, all_k_tried. |
+| `summary.tsv` | wide-format pairwise summary (sample, used_k, bubble_type, genome_coverage, allele*_complete, allele*_coverage, allele1_vs_allele2_id_pct/aln_frac, cons_*, allele*_path). |
+| `summary.json` | NEW (step 9) — same data as summary.tsv plus per-allele segments + per-k BFS trace + finished_nhop + git hash + args. Cross-run-comparable. |
+| `bubble.{txt,gfa,dot,tsv}` | bubble views (ASCII / Bandage-loadable sub-GFA / Graphviz / edge list TSV). |
+| `bubble.png` | matplotlib render: each allele on its own row, x-aligned at shared joints. Cross-row solid black lines mark sub-nodes literally shared between rows. Node face: yellow=var-bearing, blue=flank-only, white=unlabeled. Below each node a normalized coverage tag `×<seg_cov / genome_cov>` is drawn. `genome_cov` is the median GFA segment depth (≈ 2× haploid in a low-het diploid), so `×0.5` ≈ unique bubble-allele segment, `×1.0` ≈ shared-between-alleles or homozygous background, `×2.0` ≈ collapsed two-copy repeat. |
+| `genome_cov_spades_k<K>.txt` | per-k genome coverage (median DP:f: across GFA segments ≥ 5 kb). Bp-equivalent units. Cached for `--continue`. |
+| `queries/` | auto-derived `variable_proteins.fasta`, `flankL.fasta`, `flankR.fasta`, `variable_nt.fasta`, `manifest.json`. |
+| `consensus_alleles.fasta` | `samtools consensus` per allele. **Record IDs preserved verbatim** from the input reference (drop-in replacement, no rename to `allele_1/2/3`). `--make-consensus` only. |
+| `reads.sam` | competitive end-to-end bowtie2 mapping reads → picks (`--make-consensus` only). The BAM is built as an internal intermediate for `samtools consensus` + `coverage_core.py`, then deleted — SAM is the human-readable artifact persisted. Re-derive BAM via `samtools sort -o reads.sorted.bam reads.sam && samtools index reads.sorted.bam`. |
+| `coverage.tsv` | per-allele depth: whole_meandepth AND core_meandepth (HD-core only). `--make-consensus` only. |
+| `identity.tsv` | MAFFT identity + alignment-fraction on the picks. |
+| `identity_consensus.tsv` | same, on the consensus (when produced). |
+| `consensus_qc.tsv` | tblastn / blastn re-check of consensus completeness. |
+| `_graph.json` | per-allele segment walks (machine-readable). |
+| `<K>/result.tsv` | per-K caller output, 22 columns. `complete_var` and `complete_locus` are tri-state integers (0=none, 1=some, 2=all). |
 | `<K>/alleles.fasta` | per-K picked allele/chimera records (post-dedup, post-`min_allele_bp` floor, HD-only divergence comparison). |
-| `<K>/longest_alleles.fasta` | length-first RC-aware dedup over the candidate pool — keeps the LONGEST representative of each edit-distance class (HD-only divergence). |
 | `<K>/candidate_allele.fasta` | every emission across all BFS iterations (forensic record). Headers `cand{id}_h{nhop}_n{net}_c{cov}_{verdict}_{name}`. |
-| `<K>/subnode_seqs.fasta` | materialized sub-segment sequences for `{parent}#N` IDs (after P1 directional split — one sub-segment per unique-label run on the parent; see METHODS.md §3.3). Consumed by `graph_paths` to draw bubble outputs with coord-free IDs. |
 | `<K>/seg_label_hits.tsv` | labeler output for this K. |
 | `<K>/{flankL,flankR}_blastn.tsv`, `<K>/HD_tblastn.tsv` | full outfmt-6 BLAST caches. |
-| `genome_cov_spades_k<K>.txt` | per-k genome coverage (median of GFA `DP:f:` across segments ≥ 5 kb). Bp-equivalent units. Filename retained for backward compatibility — the value is now GFA-derived, not contigs.fasta-derived. |
-| `queries/` | auto-derived `variable_proteins.fasta`, `flankL.fasta`, `flankR.fasta`, `variable_nt.fasta`, `manifest.json`. |
-| `consensus_alleles.fasta` | `samtools consensus` per allele. Only written when `--make-consensus`. |
-| `reads.sam` | competitive end-to-end bowtie2 mapping reads → picks (`--make-consensus` only). The BAM is built as an internal intermediate for `samtools consensus` and `coverage_core.py`, then deleted — SAM is the human-readable artifact persisted. To re-derive the BAM: `samtools sort -o reads.sorted.bam reads.sam && samtools index reads.sorted.bam`. |
-| `coverage.tsv` | per-allele depth: `whole_meandepth` AND `core_meandepth` (HD-core only). `--make-consensus` only. |
-| `identity.tsv` | MAFFT id_pct + aln_frac on the picks. |
-| `identity_consensus.tsv` | MAFFT id_pct + aln_frac on the read-derived consensus pair. `--make-consensus` only. |
-| `consensus_qc.tsv` | tblastn(proteins → consensus) + blastn(flanks → consensus); per-allele `complete` flag. `--make-consensus` only. |
-| `bubble.txt` | two-line labeled walks (one per allele) — full joint-to-joint walk including the BFS-detected cycle joints at both endpoints (the "fullwalk"). For open_bubble samples where only one side has a shared joint, the other end falls back to the closest flank-labeled neighbor. Intentionally wider than `primary_alleles.fasta` (which is the non-joint slice + tblastn-trim). |
-| `bubble.png` | matplotlib render: each allele on its own row, x-aligned in a unified coordinate system so shared joints across rows sit at the same x. Cross-row solid black lines mark sub-nodes literally shared between rows (the cycle joints). Node face: yellow=var-bearing, blue=flank-only, white=unlabeled. Below each node a normalized coverage tag `×<seg_cov / genome_cov>` is drawn — `×1.0` means haploid depth (single allele), `×2.0` collapsed double allele / repeat. `genome_cov` is auto-read from `<sample>/genome_cov_spades_k<k>.txt` or can be passed via `--genome-cov`. Row direction is canonicalized to match locus-position gene order (from `queries/manifest.json`); single-HD rows use flank-endpoint orientation when var-tag direction is ambiguous. |
-| `bubble.gfa` / `.dot` / `.tsv` | sub-GFA + Graphviz + edge list for any network library. |
-| `summary.tsv` (per-sample) | one row, same schema as the aggregate's row for this sample. |
-| `logs/` | per-step stdout/stderr. |
+| `logs/` | per-step stdout/stderr. The per-K caller log (`logs/03_run_per_k_k<K>.log`) carries the BFS trace consumed by `summary.json`. |
 
-Plus one aggregate: `results/summary.tsv` (one row per sample). Schema:
+### Per-K BLAST cache
 
+Cached at `<outdir>/<sample>/<K>/{flankL,flankR}_blastn.tsv` + `HD_tblastn.tsv`. First run blasts; downstream stages re-read them. Pass `--re-blast` to wipe and recompute (after changing blast thresholds).
+
+## Preparing the SPAdes graphs (step 0)
+
+The pipeline assumes you already have per-k SPAdes runs. If not, the
+`MATdetangler-spades` helper wraps the per-k SPAdes call:
+
+```bash
+# Single sample (submits one SLURM job per k)
+MATdetangler-spades \
+  --sample Tu127439 \
+  --reads-r1 reads/R1.fq.gz --reads-r2 reads/R2.fq.gz \
+  --outdir examples/Tu127439_spades/ \
+  --ks 45,53
+
+# Batch (3-col TSV: sample r1 r2) — submits a SLURM array
+MATdetangler-spades-batch --samplesheet samples.tsv --outdir spades_out/ --ks 45,53
 ```
-sample  used_k  bubble_type  genome_coverage
-allele1_complete          allele2_complete           ← pick-level (path completeness)
-allele1_coverage          allele2_coverage           ← consensus-mapped HD-core depth (--make-consensus)
-allele1_vs_allele2_id_pct allele1_vs_allele2_aln_frac ← pick-level divergence
-cons_allele1_complete     cons_allele2_complete      ← consensus tblastn re-check (--make-consensus)
-cons_allele1_vs_allele2_id_pct cons_allele1_vs_allele2_aln_frac ← consensus divergence
-allele1_path  allele2_path
-```
+
+Each k gets its own `spades.py` invocation (single-k mode), which is the
+only way to retain the per-k GFA. (SPAdes' multi-k mode `-k 21,33,55`
+keeps only the final-k GFA.) The output dir layout is what
+`MATdetangler-cli run --spades-dir` expects.
 
 ## Dependencies
 
-All wrapped by the conda env in `install/env.yml`. External tools (on `$PATH`):
+The pipeline is pure Python stdlib + `matplotlib` (for `bubble.png`) + `edlib`
+(for dedup) + a handful of subprocess calls (BLAST+, MAFFT, bowtie2, samtools).
+No biopython, numpy, or other heavy Python deps. Python ≥ 3.9 (needs
+`from __future__ import annotations` support — every module starts with that
+line). The conda env in `install/env.yml` provides all the external binaries
+plus `git-lfs` (required to fetch the demo GFAs under `examples/Pcub40/`).
 
-- `spades.py` ≥ 3.15 (only needed for step 0; `MATdetangler-spades`)
-- BLAST+ (`makeblastdb`, `blastn`, `tblastn`) ≥ 2.10
-- `bowtie2` ≥ 2.4 (and `bowtie2-build`)
-- `samtools` ≥ 1.15
-- `mafft`
+## Determinism + reproducibility
 
-Python ≥ 3.9. The pipeline imports the standard library + `matplotlib` (for
-`bubble.png`) + `edlib` (for sequence dedup in the per-K caller). No
-biopython / numpy required.
+- `MATdetangler-cli` exports `PYTHONHASHSEED=0` at startup. Locks Python set/dict iteration order; bit-for-bit reproducible across runs on the same install.
+- `test/Pcub40/` is the canonical regression suite:
+  - `installation_run_test.sh` — strict tolerance, exits 1 on any divergence
+  - `analysis_run_test.sh` — biology-focused, always exits 0, structured per-sample report
+  - `known_results.json` — 32-sample committed baseline
+  - `run_args.json` — canonical run configuration document
+- The decompressed `.gfa` siblings (under `examples/Pcub40/<sample>/k<k>/`) are gitignored; the canonical `.gfa.gz` is stored via git-lfs.
 
-`bash` ≥ 3.2 (the macOS system bash is fine — the wrapper avoids bash-4-only
-constructs and empty-array expansion under `set -u`).
+## Layout
 
-## Reproducibility test (`test/Pcub40`)
-
-A frozen 32-sample _P. cubensis_ dataset (`examples/Pcub40/`, GFAs committed as
-`*.gfa.gz`) with known-good outputs in `test/Pcub40/known_results.json`. The
-harness decompresses each `*.gfa.gz` in place, runs the pipeline, and diffs the
-result against the known values (ignoring install-drift fields — MAFFT/BLAST
-version noise, coverage estimates).
-
-```bash
-conda activate MATdetangler
-bash test/Pcub40/run_test.sh                 # all 32 samples
-bash test/Pcub40/run_test.sh AJB36 BD-1248   # just these (only the run samples are diffed)
-bash test/Pcub40/run_test.sh --slurm         # submit a SLURM array instead of serial
+```
+MATdetangler-cli           # the wrapper (case-renamed from `MATdetangler` for case-insensitive filesystem safety)
+MATdetangler-spades        # per-k SPAdes orchestrator
+matdetangler/              # package
+  graph_classifier/
+    bubble_classifier.py   # R1–R4 + _enum_paths / _enum_dangling
+    bubble_bfs.py          # P2 bubble-from-var BFS
+    seg_processor.py       # P1 directional split
+    per_k_caller.py        # find_alleles orchestrator (two-pass loop, dedup, emit)
+    labeler.py             # seg_label_hits.tsv producer
+  input_process.py         # tblastn → flanks → queries
+  run_per_k.py             # per-k BLAST + classify CLI
+  pick_k.py                # cross-K consolidation
+  graph_paths.py           # bubble.{txt,gfa,dot,tsv,png} renderer
+  map_consensus.sh         # bowtie2 + samtools consensus
+  pairwise_identity.py     # MAFFT pairwise id
+  consensus_qc.py          # tblastn / blastn re-check of consensus
+  coverage_core.py         # per-allele HD-core depth
+  cluster.py               # cross-sample mating-type clustering
+  summary_table.py         # summary.tsv writer
+  summarize.py             # NEW: comprehensive summary.json (step 9)
+examples/
+  Pcub_locus/              # locus ref + HD proteins (Pcub demo)
+  Pcub40/<sample>/k<k>/    # 96 LFS-stored .gfa.gz (32 samples × 3 ks)
+  Suilu_locus/, AU340/, …
+test/Pcub40/
+  installation_run_test.sh # strict reproducibility test
+  analysis_run_test.sh     # biology-focused report (no pass/fail)
+  known_results.json       # committed baseline
+  run_args.json            # canonical args document
+results/Pcub40/
+  primary_allele/          # 32 picked-allele FASTAs
+  bubble_png/              # 32 cov-annotated bubble PNGs
+  per_sample/              # full pipeline output per sample (18 MB total)
+install/env.yml            # conda environment specification
 ```
 
-Exit 0 = every **run** sample matches; a subset run only checks the samples it
-ran. On PASS the decompressed `*.gfa` siblings are kept next to their `*.gfa.gz`
-(gitignored) so re-runs reuse them without re-decompressing.
+## Help + feedback
 
-## License & citation
-
-TBD. If you use MATdetangler in a paper, please cite this repository.
+- `/help` in the CLI for option reference: `MATdetangler-cli` (no args) or `MATdetangler-cli run --help`.
+- Methods deep dive: **[METHODS.md](METHODS.md)**.
+- Open algorithmic improvements: **[TODO.md](TODO.md)**.
+- Issues: https://github.com/KeFungi/MATdetangler-demo/issues

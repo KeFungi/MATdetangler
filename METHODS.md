@@ -1,1249 +1,434 @@
-# MATdetangler — Methods
+# MATdetangler — methods (code-grounded)
 
-Academic-style pseudocode + rationale for each step. Mirror of the production code:
-modules referenced here are the actual files under `matdetangler/`.
+This file describes the pipeline as the code at `master` actually implements
+it. Where it disagrees with `METHODS.md`, this file is correct — `METHODS.md`
+has drifted across recent refactors (GFA-only genome cov, max_nhop=8,
+PYTHONHASHSEED lock, MATdetangler-cli rename, step 9 summary.json, etc.).
 
-## Notation
-
-| symbol | meaning |
-|---|---|
-| `locus.fasta` | single-record DNA reference spanning HD region + both flanks |
-| `proteins.fasta` | user-curated protein fasta (HD1, HD2, …); intron-free |
-| `contigs.fasta(k)` | SPAdes per-k contigs |
-| `gfa(k)` | `assembly_graph_after_simplification.gfa` for that k — segments (`S`) + links (`L`) |
-| `D_k` | genome diploid coverage at K (auto-estimated per-k as the median of SPAdes `contigs.fasta` `cov_` headers across contigs ≥ `--contig-depth-size-cut` bp; `--genome-coverage` overrides for all k's) |
-| `dp(s)` | per-segment depth tag (`DP:f:`, or `KC:i:` / length) |
+The top-level entrypoint is `MATdetangler-cli` (bash wrapper, ~770 lines).
+It runs 9 steps per sample; steps 1–5 are reads-free, step 6+ need reads
+(`--make-consensus`, default OFF). All Python invocations inherit
+`PYTHONHASHSEED=0` (locked at `MATdetangler-cli:21`) so set/dict iteration
+order is deterministic across runs.
 
 ---
 
-## 1. Input processing → query construction  (`input_process.py`)
+## Step 1 — `input_process` → queries/
 
-```
-inputs:
-    locus_fa     : single-record DNA reference
-    proteins_fa  : curated protein fasta (HD1, HD2, ...)
-    max_flank_len    = 2000          # bp per side, tunable (--max-flank-len)
-    envelope_padding = 500           # bp per side, tunable (--envelope-padding)
-    min_flank_len    = 100           # warn if trimmed flank is shorter (--min-flank-len)
-    tblastn_pid      = 30.0          # HSP filter, fixed (function default)
-    min_aa           = 50            # HSP filter, fixed (function default)
+**Code**: `matdetangler/input_process.py:tblastn_locate()`
 
-# 1.1 sanitize protein IDs — _sanitize_protein_ids() — first-token, illegal-chars→'_',
-#      and numeric suffix on collisions (blast requires unique sseqids)
-proteins_sanitized = _sanitize_protein_ids(proteins_fa)
+Builds the per-sample query set from the user-supplied locus reference and
+HD-protein FASTAs. Reads-free.
 
-# 1.2 tblastn(proteins -> locus), keep HSPs above (pid >= 30, aln >= 50 aa).
-#      tblastn_locate() runs the search + the confidence-ordered greedy below.
-all_hsps = tblastn(proteins_sanitized -> locus, min_pid=30.0, min_aa=50)
+1. `tblastn` proteins → locus_ref (evalue 1e-5).
+2. **Confidence-ordered greedy HSP acceptance**: rank HSPs by `pident × aln_aa` descending; accept each HSP unless it overlaps a previously-accepted HSP **from a different protein** by > 0.5 × shorter HSP length. This prevents weak partial HSPs of HD1 from leaking into HD2's reported span when the two proteins are paralogous.
+3. Per-protein span = `[min(start), max(end)]` over that protein's accepted HSPs.
+4. **HD envelope** = `[min(start), max(end))` across all proteins. Padded by 500 bp each side internally.
+5. **Flanks** = locus sequence OUTSIDE the envelope, trimmed to `--max-flank-len` (default 2000) per side.
+6. Sanitize protein IDs (alphanumeric + `_.-` only; auto-suffix on collision).
 
-# 1.3 CONFIDENCE-ORDERED greedy with cross-protein non-overlap. HD1 and HD2 are
-#      paralogs: each protein query has real strong HSPs in its own locus region AND
-#      weaker partial HSPs in the sister's region. Walk all HSPs in confidence order
-#      (score = pid * aln_aa, descending); accept each HSP UNLESS it overlaps an
-#      already-accepted HSP from a DIFFERENT protein by > 0.5 x shorter-HSP length.
-#      Same-protein HSPs never conflict — divergent N/C-terminus HSPs from the SAME
-#      protein still extend that gene's span.
-accepted = []
-for (qid, h) in sorted(all_hsps, key=lambda x: -x.score):
-    if not any(k.qid != qid and overlap(h, k) / shorter(h, k) > 0.5 for k in accepted):
-        accepted.append((qid, h))
+**Inputs**: `--locus-ref FA`, `--proteins FA`, `--max-flank-len 2000`.
 
-# 1.4 per-gene span = union of its accepted HSPs; annotation (pid, aln_aa, strand)
-#      from the BEST accepted HSP of that gene (NOT summed, so aln_aa never exceeds
-#      one HSP's contribution — the 643 aa HD1 protein no longer reports aln_aa=720).
-for each gene g:
-    g.start, g.end = min(h.s), max(h.e) for h in accepted with qid == g
-    g.pid, g.aln_aa, g.strand = best accepted HSP of g (by score)
+**Outputs** under `<outdir>/<sample>/queries/`:
+- `variable_proteins.fasta` — sanitized protein copy
+- `variable_nt.fasta` — nt sequence of each tblastn-accepted span (strand-corrected)
+- `flankL.fasta`, `flankR.fasta` — derived flank windows
+- `manifest.json` — metadata (envelope coords, per-gene spans, `derived_max_locus_len`)
 
-# 1.5 intergenic regions between adjacent gene spans are reported AS-IS — not split
-#      into either gene's territory. They live inside the HD envelope by virtue of
-#      being between gene starts/ends.
-intergenic = [(a.qid, a.end, b.qid, b.start, max(0, b.start - a.end - 1))
-              for adjacent (a, b) in sorted_by_start(genes)]
-
-# 1.6 HD envelope = union of all gene spans, padded
-env_start = max(1,        min(g.start for g in genes) - envelope_padding)
-env_end   = min(|locus|,  max(g.end   for g in genes) + envelope_padding)
-
-# 1.7 TRIM flanks
-flankL = locus[max(0, env_start - 1 - max_flank_len) : env_start - 1]
-flankR = locus[env_end : min(|locus|, env_end + max_flank_len)]
-
-# 1.8 derive the path-enumerator bp budget
-derived_max_locus_len = envelope_size + |flankL| + |flankR|
-
-# 1.9 emit
-write variable_proteins.fasta     (sanitized copy)
-write variable_nt.fasta            (per-gene NT span on locus, strand-corrected)
-write flankL.fasta, flankR.fasta   (trimmed)
-write manifest.json                (chrom, chrom_len, envelope_start/end/size,
-                                    derived_max_locus_len, variable_genes (per-gene
-                                    start/end/strand/pid/aln_aa/n_hsps_accepted),
-                                    intergenic_ranges, flankL/flankR locus coords +
-                                    len, fasta paths, and the input args
-                                    max_flank_len / envelope_padding / min_flank_len)
-```
-
-### Rationale
-
-- **Confidence-ordered greedy, NOT naive union.** Earlier versions took the union of all
-  HSPs per protein and got bitten twice: (a) cross-paralog leakage — HD1's weak HSPs in
-  the HD2 region pushed HD1's reported span into HD2's territory; (b) intra-protein
-  HSP overlap — naively summing aln_aa across overlapping same-protein HSPs inflated
-  HD1's reported `aln_aa` from its true 643 aa to 720 aa. Walking HSPs in confidence
-  order makes the high-quality real hits land their territorial claims first; the
-  low-quality paralog-leakage HSPs arrive later and are rejected because the range is
-  already claimed by a different protein. `aln_aa` is now reported as the BEST accepted
-  HSP's value rather than a sum, so it can never exceed the protein's true length.
-- **Intergenic regions are kept as intergenic.** We do NOT split the gap between adjacent
-  genes into either's territory. The space between HD1.end and HD2.start (e.g. 405 bp on
-  Pcub) is real intergenic sequence — it stays inside the envelope by virtue of being
-  bracketed by gene spans, and is reported explicitly as `intergenic_ranges` in the
-  manifest.
-- **Envelope padding (default 500 bp).** Even after the cleaned span, the very ends of a
-  CDS (divergent N/C-terminus) can fall below the pid cutoff and never appear as HSPs.
-  500 bp padding each side compensates. Because the cleaning step rejects cross-protein
-  overlap BEFORE padding, the 500 bp padding cannot cause HD1 and HD2 envelopes to
-  collide.
-- **Trimmed flanks.** A long flank is mostly wasted: 2000 bp on each side is enough for
-  reliable anchoring during BFS and blastn. Smaller `max_flank_len` ⇒ tighter
-  `derived_max_locus_len` ⇒ tighter path search.
-- **Manifest.** All downstream modules read derived values (`derived_max_locus_len`,
-  envelope coords, flank coords, intergenic ranges) from `<queries_dir>/manifest.json`
-  so the pipeline doesn't carry duplicate CLI state.
+**Defaults** (hardcoded in `tblastn_locate`): `tblastn_pid=30`, `tblastn_aa=50`, `flank_pid=85`, `flank_minlen=100`.
 
 ---
 
-## 2. Genome-coverage estimate  (MATdetangler wrapper, PER k inside the per-k loop)
+## Step 2 — Per-k genome coverage
 
-Run inside the per-k loop just before the per-K caller. Fires only when the user did
-NOT pass `--genome-coverage` explicitly (the user value, if supplied, overrides all k's).
-The estimate `D_k` is consumed by `matdetangler.run_per_k` (depth-filter band +
-per-allele depth) and by `matdetangler.pick_k` (diploid-balance tie-break).
+**Code**: `matdetangler/input_process.py:estimate_genome_cov_from_gfa()` (lines 67–97). Wired up by `MATdetangler-cli:~436`.
 
-```
-# 2.05  Median of the GFA's per-segment `DP:f:` (or KC:i:/RC:i: → count/length)
-#       across S-line segments >= L bp, where L = --contig-depth-size-cut
-#       (default 5000). Reads-free. Handles both .gfa and .gfa.gz transparently.
-gfa = "$SPADES_DIR/k${K}/assembly_graph_after_simplification.gfa[.gz]"
-depths = [DP for (seg_id, seq, tags) in S_lines(gfa)
-          if len(seq) >= --contig-depth-size-cut
-          for DP in [parse_depth_tag(tags)] if DP is not None]
-D_k = median(depths) if depths else 0.0
-write_to("genome_cov_spades_k${K}.txt", D_k)
-log("[k${K}] genome_cov = ${D_k} (median DP across GFA segments >= ${L} bp)")
-```
+Reads-free, **GFA-only** (no contigs.fasta dependency):
 
-### Rationale
+1. Parse S-lines of `assembly_graph_after_simplification.gfa[.gz]`.
+2. For each segment with sequence length ≥ `--contig-depth-size-cut` (default 5000 bp):
+   - Extract depth from `DP:f:` tag if present.
+   - Else `KC:i: / seg_length` or `RC:i: / seg_length`.
+3. **`D_k` = median(depths)** across qualifying segments. Median (not mean) is robust to the heavy right tail of collapsed-repeat segments.
+4. `D_k = 0.0` if no segment qualifies → disables coverage-based filtering downstream (graceful degrade).
 
-- **Reads-free.** SPAdes already computed segment coverage during assembly; there's no
-  reason to re-map reads with bowtie2 just to recover it. The pipeline is reads-free
-  through step 5 as a result; step 6 (`map_consensus`) is the first step that needs reads.
-- **GFA-only — no `contigs.fasta` dependency.** All depth information needed lives in
-  the GFA's `DP:f:` tag. This makes archival demo bundles (`examples/<dataset>/<s>/k<k>/`)
-  with just the GFA fully reproducible — no separate contigs.fasta or pre-computed
-  cov file needed. .gfa.gz is read transparently.
-- **Same scale as downstream segment depths.** The per-segment `DP:f:` we median is the
-  same per-segment depth the per-K caller uses for its filter band
-  (`[lo_mult × D_k, hi_mult × D_k]`).
-- **Median, not mean.** Segment depths have a heavy right tail from collapsed-repeat
-  short segments (`DP:f:` up to ~10⁷ on 46 bp tips in real fungal data). Median is robust
-  to those.
-- **Length filter at 5 kb.** Stays well within the noise-free regime; smaller segments
-  contribute too much variance from short-tip assembly artifacts. Tunable via
-  `--contig-depth-size-cut` if your assembly is unusually fragmented (flag name retained
-  for backward compatibility — applies to GFA segments now, not contigs).
-- **PER k, not once per sample.** SPAdes per-segment depth values are in
-  k-mer-multiplicity × `R/(R-k+1)` units, so they DIFFER across k's for the same sample.
-  The k=33 estimate is ~25% higher than k=53 for R=150 bp reads. Computing per-k means
-  the per-K caller's filter band is automatically scaled to that k's depth distribution.
-- **Cached as `genome_cov_spades_k<K>.txt`.** `--continue` reuses the cached value.
-- **What if no segment is long enough?** `D_k = 0.0`. The caller treats this as
-  "disable coverage-based filter" — BFS still runs, the depth filter just never fires.
-  The picker's diploid-balance tie-break becomes a no-op.
+`D_k` is bp-equivalent units — same scale as the per-segment `DP:f:` values the per-K caller uses for its depth filter band `[lo_mult × D_k, hi_mult × D_k]`. Cached to `<outdir>/<sample>/genome_cov_spades_k<K>.txt`.
+
+User can override globally with `--genome-coverage FLOAT` (skips the estimator for all k).
 
 ---
 
-## 3. Per-K allele caller  (`matdetangler.run_per_k`)
-
-For each K in `--ks`, a single self-contained driver pulls the entire per-(sample, K)
-result from `gfa(K)` + queries. Replaces the legacy `graph_path_search.py` +
-`pick_alleles.py` chain.
-
-The driver does three things in sequence: BLAST the GFA segments against the curated
-queries (§3.1), aggregate the hits into a per-segment label TSV (§3.2 labeler), then
-run the classifier + emission chain (§3.3 onward).
-
-### 3.1 Pipeline (driver)
-
-```
-for each K in --ks:
-
-    # 3.1.1 Extract S-line segments from gfa(K) → segs.fa (one record per segment)
-    write_each_S_line_as_fasta(gfa(K)) → segs.fa
-    makeblastdb -in segs.fa -dbtype nucl -out segs_db
-
-    # 3.1.2 Full outfmt-6 BLAST against GFA segments (12 cols incl. sstart/send)
-    blastn  -query flankL  -db segs_db -dust no -evalue 1e-5 -outfmt 6 → flankL_blastn.tsv
-    blastn  -query flankR  -db segs_db -dust no -evalue 1e-5 -outfmt 6 → flankR_blastn.tsv
-    tblastn -query HDs     -db segs_db          -evalue 1e-5 -outfmt 6 → HD_tblastn.tsv
-
-    # 3.1.3 Labeler — aggregate BLAST TSVs into per-segment label rows (§3.2)
-    seg_label_hits.tsv = emit_seg_label_hits(gfa(K),
-                          [(flankL_blastn.tsv, "flank"),
-                           (flankR_blastn.tsv, "flank"),
-                           (HD_tblastn.tsv,    "var")],
-                          min_alnlen=100)
-
-    # 3.1.4 Caller — full algorithm in §3.3 onward
-    res = find_alleles(seg_label_hits.tsv, gfa(K),
-                       genome_cov=D_k,
-                       init_nhop=3, max_nhop=8,
-                       lo_mult=0.2, hi_mult=2.0,
-                       var_proteins_ref=HDs.fasta,
-                       expected_var_tags={HD1, HD2, ...},
-                       locus_padding=1500,
-                       divergence_threshold=0.01)
-
-    write_fasta(res.alleles, <outdir>/<K>/alleles.fasta)
-    write_result_tsv(res,    <outdir>/<K>/result.tsv)
-```
-
-Per-K outputs under `<outdir>/<K>/`:
-
-| file | what |
-|---|---|
-| `flankL_blastn.tsv`, `flankR_blastn.tsv`, `HD_tblastn.tsv` | full 12-col outfmt-6 BLAST hits |
-| `seg_label_hits.tsv` | labeler output (one row per (seg, tag, region); §3.2) |
-| `alleles.fasta` | emitted allele/chimera records |
-| `result.tsv` | one row, 21 columns (§3.11) |
-
-**Rationale.** One BLAST DB per (sample, K) — the new caller blasts directly against
-GFA segments; the legacy anchor-search step is no longer in the default flow (its
-outputs were consumed by the retired picker chain). Full outfmt-6 is required because
-the labeler reads `sstart`/`send` to know where each hit lands on its segment.
-
-### 3.2 Labeler — `seg_label_hits.tsv` format
-
-`seg_label_hits.tsv` schema — one row per `(seg_id, sub-region, tag)`:
-
-```
-seg_id   seg_length   tag      kind    start   end    strand
-NODE_3   12450        flankL   flank   0       4310   +
-NODE_7   8200         HD1      var     0       1020   +
-NODE_7   8200         HD2      var     1450    2300   +
-NODE_9   3100         flankR   flank   200     1800   +
-```
-
-The unpacked format means a single segment with two var hits has two rows; the
-segment processor (§3.3) sorts by `start` and partitions the segment at midpoints.
-Multi-tag co-located hits (e.g. an HD1/HD2 fusion segment) are joined with `+` and
-emitted in **one** row whose `kind` is `var`.
-
-The labeler runs three merge stages before emission:
-
-- **Stage A — intra-tag merge**: overlapping/adjacent hits with the same tag on the
-  same segment collapse to their union.
-- **Stage B — sweepline same-kind merge**: among hits of the same `kind` (flank vs
-  var), contiguous regions are emitted as single intervals; a region covered by
-  multiple tags gets a `+`-joined label.
-- **Stage C — var-priority clip**: flank regions are clipped against var regions
-  (var wins). A segment carrying both `HD1` and `flankR` keeps the HD1 span pure-var
-  and only the residual non-overlap as flank.
-
-### 3.3 Segment preprocessing — P1 directional split + P2 bubble BFS
-
-The classifier consumes a graph with three node categories: **pure-flank** (label
-has flankL or flankR, no var-gene tag), **pure-var** (var-gene tag, no flank tag),
-and **unlabeled connector** (neither). The input may also contain **composite**
-nodes (a single GFA segment with BOTH flank and var tags, e.g. `HD1+flankL`). The
-preprocessing removes composites and identifies the bubble:
-
-**P1. Directional split — unique-label rule (one sub-segment per unique-tag run)**
-
-Each multi-hit segment becomes a chain of sub-segments, one per
-**unique-tag run** (a maximal consecutive group of hits sharing the same
-tag), ordered along the parent segment's stored strand:
-
-```
-n_runs = 0   →  1 piece (parent segment kept whole, no label)
-n_runs = 1   →  1 piece (parent kept whole, labeled with the run's tag)
-n_runs ≥ 2   →  one sub-segment per run, ordered by run start coordinate.
-                 Boundaries between adjacent sub-segments are placed at
-                 the midpoint of the inter-run gap (between the previous
-                 run's max end and the next run's min start). Each
-                 sub-segment carries exactly the run's tag.
-```
-
-A "run" merges consecutive same-tag hits into one labeled region. So a
-segment with hits `[flankL, HD1, HD1, HD2, HD2, flankR]` (6 raw hits)
-becomes 4 sub-segments `[flankL]#1 / [HD1]#2 / [HD2]#3 / [flankR]#4`,
-**not** 6 — there are no unlabeled "linker" sub-segments between adjacent
-fragments of the same gene. (Runs only merge consecutive hits with the
-same tag; a same-tag pair separated by a different-tag hit stays as two
-distinct sub-segments, preserving tandem-arrangement signal.)
-
-Sub-node IDs are coordinate-free: `{parent_seg}#1`, `{parent_seg}#2`, …
-(1-based, ordered by run start). The provenance dict
-`{sub_id: (parent_seg, start, end, strand)}` carries the actual
-coordinates for sequence materialization downstream — IDs stay clean for
-display in `bubble.txt` / `bubble.gfa` / `bubble.png`.
-
-Example (the IBUG-14475 k45 closed bubble, parent 18741825 with 6 raw hits):
-
-```
-input:  ─── flankL + 2×HD1 + 2×HD2 + flankR composite (6148 bp) ───
-              ↑ flankL hit at [0-421]
-              ↑ HD1    hits at [993-1986], [2404-3067]   (merged into one run)
-              ↑ HD2    hits at [3615-4284], [4498-5518]  (merged into one run)
-              ↑ flankR hit at [6024-6148]
-P1 out: ─── [flankL]#1 ─── [HD1]#2 ─── [HD2]#3 ─── [flankR]#4 ───
-            (4 pieces, one per unique-label run; boundaries at midpoints)
-```
-
-After P1, every node carries exactly one label (one tag per sub-segment).
-No composites remain. Each neighbor edge of the original segment attaches
-to the sub-segment whose run covers its connection end (GFA L-line
-orientation gives this).
-
-History note: earlier rules tried (a) `n_label`-based 3-piece-max
-(collapsed same-tag hits and absorbed middle labels into one piece) and
-(b) one piece per raw BLAST hit (the all-split rule). The current
-unique-label-run rule is the middle ground: each gene/flank contributes
-exactly one labeled sub-segment regardless of how many BLAST fragments it
-produced, but multiple genes stay separate. This keeps bubble visualization
-clean (no unlabeled linker pieces between adjacent same-tag fragments)
-while still letting the BFS / classifier distinguish multi-gene composites.
-
-**P2. Bubble BFS** — starting from every pure-var node, BFS through unlabeled-only
-neighbors. The set of nodes reached forms the **bubble**; everything else is
-**flank-region**:
-
-```
-Bubble       = pure-var nodes ∪ unlabeled connectors reachable from var
-                                  via unlabeled-only paths
-Flank-region = nodes - Bubble
-```
-
-P2 is one BFS — no iteration over rounds, no parameters. A long unlabeled spacer
-between var and a flank gets pulled INTO the bubble (it becomes part of the bubble
-interior); a noise chain dangling off a pure flank with no var-reachable path stays
-in flank-region. Flank-region naturally contains all pure flanks plus any "shoulder"
-connectors that only reach flank, not var.
-
-After preprocessing the bubble is a connected subgraph that may be: a linear chain
-(synthetic clean closed_bubble), a Y-fork at a Uvar joint (AG10), a cycle (AG17), a
-multi-fork hub (where one var node branches to 3+), or multiple disjoint components
-(when var content lives in separate locations). The classifier does NOT make
-structural assumptions about the bubble's internal shape. It just counts paths
-through it.
-
-### 3.4 Anchors (universal-leaf rule)
-
-An **anchor** is a bubble node that meets the outside world, defined purely by
-graph topology:
-
-```
-anchor = bubble node n such that
-            n has ≥1 neighbor OUTSIDE the bubble  (any label)
-        OR  n has bubble-degree ≤ 1               (dead-end leaf)
-```
-
-This generalizes the prior "flank-adjacent only" rule: flank-adjacent nodes still
-qualify (they have a flank-labeled neighbor outside the bubble), and Uvar dead-end
-leaves also qualify (they have ≤ 1 neighbor inside the bubble — bubble truncated by
-BFS hop limit, fragmented assembly, or chromosome end).
-
-L/R distinction is decorative — derived from flank labels when present — but does
-NOT gate arm enumeration:
-
-```
-flank_L_adj = anchors with a flankL-labeled outside neighbor
-flank_R_adj = anchors with a flankR-labeled outside neighbor
-```
-
-Anchors that are neither L- nor R-decorated are "bare leaves" — they get used as
-path endpoints with a different downstream label (dangling rather than closed; §3.5).
-
-### 3.5 Arms
-
-An **arm** is a var-bearing simple path between two distinct anchors, classified by
-its endpoint flank-status:
-
-```
-closed   = both anchors are flank-decorated, one on L side and
-           one on R side (a proper L→R locus walk)
-dangling = exactly one endpoint is flank-decorated (the other is a
-           bare leaf — one side anchored, other side dangling)
-ignored  = same-side (L→L, R→R) or leaf-only (no flank-adjacent
-           endpoint) — not biologically meaningful as arms
-```
-
-Single-node bridge: ONE var node that is adjacent to BOTH a flankL node AND a flankR
-node (a composite segment spanning the whole locus) counts as a closed arm of length 1.
-
-"Simple path" has its standard graph-theory meaning: no node revisit. This guarantees
-finite enumeration on cyclic bubbles.
-
-**No further dedup at the classifier.** If two arms route through shared Uvar hubs in
-substantially different combinations, those ARE distinct arms — that's structural
-complexity and it correctly drives the verdict toward 'complexed'. (Sequence-level
-dedup happens later in `_emit_result`; §3.8.)
-
-### 3.6 Verdict
-
-Precedence rule applied first:
-
-- Var nodes split across 2+ connected components of the **full graph** ⇒ `separate`
-
-Then by arm count:
-
-| arms | configuration | verdict |
-|------|---------------|---------|
-| 0    | no var-bearing route                    | complexed |
-| 1    | one arm                                  | single |
-| 2    | both closed                              | closed_bubble |
-| 2    | mixed (≥1 dangling)                      | open_bubble |
-| ≥3   | three or more                            | complexed |
-
-**Why the spec is deductive.** Every step is a single graph operation with no
-parameters: P1 rewrite (split nodes by label coordinate), P2 BFS (var through
-unlabeled), anchors (adjacency / degree test), arms (simple-path enumeration with
-endpoint-flank-status filter), verdict (count → table). No `MAX_LINKER_PADDING`
-parameter, no validity horizon, no clean-chain check, no var-series/flank-series
-special handling, no minimal-var-set dedup, no arm-membership consolidation. The
-composite mess is handled upstream by P1; the long-spacer mess is handled by P2;
-the rest is a single counting step.
-
-### 3.7 `find_alleles` BFS loop
-
-`find_alleles(seg_label_hits_tsv, gfa_path, genome_cov, init_nhop=3, max_nhop=8, var_proteins_ref=…, expected_var_tags=…, locus_padding=4000, lo_mult=0.2, hi_mult=2.0, divergence_threshold=0.01, queries_dir=…, out_candidate_fa=…, seeds_mode="both", cov_filter=True, max_paths=1000, max_path_length=50, max_bp_since_var=5000, min_allele_bp=0)`
-
-The orchestrator runs the BFS at increasing hop counts, collects per-network
-candidates from every iteration, optionally short-circuits when a fully
-complete-LOCUS candidate appears, then picks across the pool. Two axes:
-the outer cov-filter pass and the inner nhop range.
-
-**Cov-filter as a fallback**: `cov_filter=True` (default) means "cov-OFF
-main pass + cov-ON fallback if no short-circuit". `cov_filter=False`
-disables the fallback (cov-OFF only). Empirically cov-OFF rescues
-fragmented-flank samples that the depth band drops; cov-ON is held in
-reserve as a tightening pass.
-
-```python
-# Seeds — set ONCE from seeds_mode
-seeds = var_segs              if seeds_mode == "var"
-      | flank_segs            if seeds_mode == "flank"
-      | (var_segs|flank_segs) if seeds_mode == "both"          # default
-
-cov_passes = [False, True] if cov_filter else [False]
-
-candidates = []
-short_circuit = False
-
-for cov_pass in cov_passes:                       # cov-OFF first, cov-ON fallback
-    if short_circuit: break
-    for nhop in init_nhop..max_nhop:              # default 3..8
-        if short_circuit: break
-        res = _try_one_pass(seeds, nhop, apply_cov_filter=cov_pass,
-                            max_paths, max_path_length)
-        log(nhop, cov_pass, |nhood|, n_var, class, n_arms,
-            bfs_limits_hit)                       # logs cap hits when fired
-
-        if res.class == "no_var" or res.n_var == 0:
-            continue
-
-        pools = _emit_result(res, ..., return_pools=True)
-        for i, pool in enumerate(pools):
-            if not pool.alleles: continue
-            c = {
-                iter_id, net_in_iter=(i+1 if N>1 else 0),
-                verdict=pool.sub_verdict,         # NEVER 'separate' at pool level
-                complete_var,                      # tri-state 0/1/2 — per-allele MIN
-                complete_locus,                    # tri-state 0/1/2 — per-allele MIN
-                alleles, allele_cov, basepair, diploid_dist,
-                ...
-            }
-            candidates.append(c)
-
-            # Acceptance gate (α — hard short-circuit): complete_locus tri-state
-            # == 2 required. complete_var is NOT required — preserves diploid
-            # n=2 topology over single-allele collapses (see "Why drop cv from
-            # acceptance" below).
-            if (c.verdict == "closed_bubble"
-                    and c.n_dedup >= 2
-                    and c.complete_locus >= 2):
-                short_circuit = True
-
-write_candidate_fasta(candidates, out_candidate_fa)
-
-# === Unified 4-tier rank — COMPLETENESS-FIRST =====================
-# Tier order reflects the design that pre-dedup topology shape (the
-# classifier's "complexed"/"open_bubble" label) often DISAGREES with
-# what dedup actually emits after the BFS-joint extension and tblastn
-# trim. Ranking by completeness first picks the iteration that emits
-# the most-complete locus regardless of the classifier's label; bubble
-# shape only breaks ties between equally-complete candidates.
-best = min(candidates, key=lambda c: (
-    -c.complete_locus,                          # 0. tri-state DESC (2 > 1 > 0)
-    -c.complete_var,                            # 1. tri-state DESC
-    bubble_priority(c.verdict, c.n_dedup),     # 2. shape only as a tie-breaker
-    c.diploid_dist,                             # 3. |allele_cov/D_k − ½|  ASC
-))
-
-# === Cross-network sibling dedup (same iteration only) ============
-siblings = [c for c in candidates if c.iter_id == best.iter_id]
-final = dedup_ranked_cross_network(siblings, divergence_threshold)
-                                              # same 4-tier rank, RC-aware edlib HW
-
-# === Sample verdict ================================================
-surviving_nets = {c.net for c in final}
-sample_verdict = ("separate" if len(surviving_nets) >= 2
-                  else siblings[0].verdict)
-```
-
-#### Loop history
-
-Earlier the loop had `phase × nhop × cov_filter` = 24 iterations.
-Successive empirical sweeps on the 148-sample Suilu whitelist and
-Pcub40 reshaped it:
-
-| Loop axis | Wins on which samples | Decision |
-|---|---|---|
-| Phase 2 (`flank_fallback`) | 0 / 144 picks | dropped — moved to `seeds_mode` config |
-| `cov_filter=False` (later run as MAIN pass on Pcub40) | rescues fragmented-flank samples (e.g. FLAS-59250: `open_bubble` under cov-ON → `closed_bubble` under cov-OFF) | restored as the cov-filter MAIN pass; cov-ON kept as a fallback |
-| `max_nhop = 10` (legacy) | 0 short-circuits at nhop 7-10 on Pcub40 | cap reduced to 8 — empirically 53/53 short-circuits happen by nhop=6; nhops 9-10 just compounded ~1.5× neighborhood growth on samples like NY-1901145 that never short-circuit |
-
-Iteration count is now `(max_nhop − init_nhop + 1)` per cov pass × at
-most 2 cov passes = up to 12 (default `3..8` × `{cov-OFF, cov-ON}`).
-The cov-ON pass only runs when the cov-OFF pass exhausts without
-short-circuit.
-
-#### Why complete_var is NOT required at acceptance
-
-`complete_locus` and `complete_var` are **independent axes**, not nested:
-- `complete_locus` = both `flankL` and `flankR` BLAST hits present in the
-  allele (graph-label based, MIN across alleles for the pool tri-state).
-- `complete_var` = all expected HD-tag hits present in the allele
-  (also MIN-aggregated to the pool tri-state).
-
-A diploid sample can have **both flanks anchored on both alleles** (`cl=2`)
-while **one allele has a truncated HD tail** (`cv=1` after MIN aggregation).
-Requiring `cv == 2` at the short-circuit would force the picker to
-continue into the cov-ON fallback or higher nhops, where the next
-candidate it finds may be a `single n=1 cv=2` — a homozygote-collapsed
-answer that hides the second allele.
-
-Concrete case: NY-1593938 picks `closed_bubble n=2 cv=1 cl=2` (correct
-diploid) when complete_var is dropped from the gate, vs the prior
-`single n=1 cv=2 cl=2` (collapsed) when it was required. Preserving
-the 2-allele topology is the right call for diploid samples.
-
-#### Key invariants
-
-- **Acceptance (α) is a hard short-circuit**, not a fallback. Fires the
-  moment ANY candidate is `closed_bubble`, `n_dedup ≥ 2`, AND
-  `complete_locus = 2` (both flanks present in every emitted allele of
-  the candidate's pool — the per-allele MIN aggregation prevents the
-  "two single-HD fragments union to look complete" pathology). The
-  candidate's `complete_var` can be 1 — see the note above.
-- **No candidate ever carries `verdict="separate"`.** When the classifier
-  returns `class="separate"`, each network's sub-classification
-  (`closed_bubble`/`open_bubble`/`single`/`complexed`) becomes its
-  candidate's verdict. The `separate` label is applied AT THE SAMPLE LEVEL
-  only — after dedup, if ≥ 2 distinct networks survived.
-- **Cross-iteration mixing is disallowed**: the picker chooses ONE
-  candidate, and only its same-`iter_id` siblings join it for the
-  cross-network dedup.
-- **`candidate_allele.fasta`** captures every emitted sequence across the
-  loop, with headers tagging `(iter_id, network, cov, verdict)` — purely
-  for audit / debugging.
-
-#### `_try_one_pass` (single iteration)
-
-Each `_try_one_pass` BFS-expands seeds by `nhop` hops, optionally applies a
-depth filter `[lo_mult × D_k, hi_mult × D_k]` (default `[0.2, 2.0]`),
-restricts edges, runs P1 directional split (§3.3), runs the classifier
-(§3.4–3.6), and stashes `_provenance` + `_var_per_node` + `_bfs_limits` on
-the result. Self-loop GFA edges (where source == target) are skipped.
-
-The classifier's `class="separate"` recursion (per-network sub-classification)
-also happens here — sub_results are attached to `res` and consumed by
-`_emit_result(return_pools=True)` to produce per-network pools.
-
-#### BFS path enumeration — shortest-first, with hard caps
-
-The classifier's arm enumeration uses **BFS by path length** (not DFS). At
-each iteration of the outer BFS, all simple paths of length L are emitted
-before any path of length L+1 starts. So when `max_paths` fires, the
-SHORTEST `max_paths` paths survive — the real diploid pair (typically 2–6
-nodes) always makes it into the cap even on fork-explosion samples where
-DFS would plunge deep on one branch and miss the other arms.
-
-Three hard caps:
-- `max_paths = 1000` — total number of simple paths per starting anchor
-- `max_path_length = 50` — drop any path whose node count exceeds this
-- `max_bp_since_var = 5000` — drop any partial path whose accumulated bp
-  since the last var-bearing node exceeds this (set 0 to disable). Cap
-  check is PRE-extension: if the path's current `bp_since_var` is already
-  over the threshold, no further extension; if it's still within the
-  threshold, the next hop is allowed regardless of its own size (so a
-  productive final anchor of any size can still be reached). Var nodes
-  reset the counter to 0. Bp values come from each post-P1 sub-node's
-  `(end − start)` in provenance. Targets long unlabeled-connector chains
-  that wander far from var content — saves search effort with no loss
-  on real-data Pcub40 picks (sweep confirmed identical output at
-  bp_cap=5000 vs disabled).
-
-Each iteration's log line shows `⚠ limits: max_paths_hit=N max_path_length_hit=M max_bp_hit=K`
-when any cap fired (suppressed when all three = 0).
-
-#### Completeness — graph-level flank check
-
-Flank presence per allele is detected by a single blastn pass over the
-candidate FASTA (`queries/flankL.fasta` + `queries/flankR.fasta`, pid ≥ 85%,
-aln ≥ 100 bp). Per-allele `cl_level = int(has_flankL) + int(has_flankR)` ∈
-{0, 1, 2}. The pool-level `complete_locus` is the MIN across surviving
-alleles — see §3.8.
-
-### 3.8 Emission rule (trim → dedup → emit)
-
-`_emit_result(return_pools=False)` produces ONE merged sample-level emission
-(legacy path, used when the orchestrator finalizes a single picked iteration).
-`_emit_result(return_pools=True)` returns the raw per-pool list (new path, used
-by `find_alleles` to collect candidates across iterations — §3.7).
-
-Per pool (= per network when classifier is "separate", or single global pool
-otherwise), the pipeline is:
-
-```
-candidate paths from classifier
-    │  closed_arms + dangling_arms + var_components
-    ▼
-[node-level path-trim]              ← always (uses var_per_node, no BLAST)
-    │  ordered paths    → subpath [first_var, last_var]
-    │  var_components   → only var-labeled nodes
-    │
-    │  (pre-trim path kept SEPARATELY — used by the emission step below
-    │   and by graph-level flank-presence check — §3.7 "Completeness")
-    ▼
-build var-trimmed sequences via provenance (orig_seg, start, end, strand)
-    │  → used for DEDUP RANKING + HD-only divergence compare ONLY
-    │
-    ▼
-[tblastn locus-trim] for dedup compare   ← when var_proteins_ref provided
-    │  one tblastn pass: var_proteins → all candidates as multi-fasta
-    │  per candidate: trim to [min(sstart)−padding, max(send)+padding]
-    │  drop candidates with no HD hits
-    │  collect found_var_tags per surviving candidate
-    ▼
-[completeness-first dedup]              ← runs on var-trimmed → HD-only slice
-    │  RANK candidates by (smaller = better):
-    │    (−cl_level, −cv_level, diploid_dist)
-    │  where cl_level/cv_level are PER-CANDIDATE tri-states (0/1/2):
-    │    cv_level = how many expected_var_tags found in THIS candidate
-    │               (0=none, 1=some, 2=all)
-    │    cl_level = how many of {flankL, flankR} present in THIS candidate
-    │  WALK in rank order:
-    │    keep s iff is_divergent(s, k, threshold) for every already-kept k
-    │    where is_divergent uses RC-aware edlib HW edit-distance:
-    │      ed_fwd = edlib.align(q, t,         mode=HW, task=distance)
-    │      ed_rc  = edlib.align(q, RC(t),     mode=HW, task=distance)
-    │      identity = 1 − min(ed_fwd, ed_rc) / |q|
-    │    threshold default = 1% (collapse if identity ≥ 99%)
-    ▼
-[EMIT-time joint extension + non-joint slice + tblastn-trim]
-    │  For each dedup-surviving candidate (separately from the dedup compare):
-    │    1. JOINTS via multi-source BFS in the post-P1 graph (label-blind):
-    │       a. For each surviving arm's endpoints, BFS outward in adj_pp
-    │          excluding that arm's own internal nodes.
-    │       b. A node is a JOINT CANDIDATE if it's reached by BFS from ≥ 2
-    │          distinct arms (and is not in any arm's internal set).
-    │    2. PAIR-SEARCH for the shared-joint pair: enumerate up to the top-20
-    │       candidates (sorted by min max_dist across arms) and pick the pair
-    │       that maximizes (n_arms_pairable, −total_walk_length). For each
-    │       pair, an arm "pairs" the pair when both joints are reachable from
-    │       its two endpoints; the chosen orientation minimizes that arm's
-    │       walk. CLOSED-BUBBLE samples typically have both arms pair the
-    │       same (j_a, j_b) → bubble.* shows SHARED nodes at both ends.
-    │    3. PER-ARM-SIDE FALLBACK: arms that didn't pair (e.g. open_bubble's
-    │       dangling arm whose leaf end can't reach any shared joint) extend
-    │       each endpoint independently to its closest reachable joint
-    │       (preferring the pair-search joints when one is reachable); sides
-    │       with NO reachable joint fall back to flank_extend (closest
-    │       flank-labeled neighbor).
-    │    4. FULL WALK = [j_left_or_flank, ..., arm internal, ..., j_right_or_flank]
-    │       — written to result.tsv's `allele_segments` and used by bubble.*
-    │       rendering. This is the "fullwalk" view including shared joints.
-    │    5. NON-JOINT SLICE: trim the full walk to its first-non-joint and
-    │       last-non-joint nodes (end-joints stripped; internal joints kept).
-    │    6. Build emitted sequence from the sliced path via provenance.
-    │    7. Apply tblastn locus-trim (same padding as the dedup-compare trim).
-    │       Fallback: keep the raw non-joint sequence if tblastn drops it.
-    │  Rationale: dedup decides WHICH alleles survive (on the var-window
-    │  content where the biology lives); emission decides WHAT we write to
-    │  primary_alleles.fasta (the arm-unique content of each surviving
-    │  allele, with flank-adjacent joint nodes excluded but the
-    │  HD-flanking padding preserved). The joint-detection lets bubble.*
-    │  show the topologically-shared graph nodes between alleles regardless
-    │  of how they're labeled (flank, var, or unlabeled).
-    ▼
-emit: allele1 / allele1+allele2 / chimera1..N (by post-dedup count)
-    │
-    ▼
-[per-allele depth + tri-state completeness + extend_bounds]
-    allele_cov = length-weighted DP:f: mean per allele path
-    surviving_tags = union of found_var_tags across survivors (info-only)
-    per-allele cv_level = 0/1/2  (this allele's tblastn vs expected_var_tags)
-    per-allele cl_level = 0/1/2  (this allele's blastn vs flankL+flankR)
-    pool-level complete_var  = MIN(per-allele cv_level across surviving)
-    pool-level complete_locus = MIN(per-allele cl_level across surviving)
-    diploid_dist = |Σ(allele_cov)/D_k − 1| ... actually we use
-                   |mean(allele_cov)/D_k − ½| per pool
-    extend_bounds = per allele, (innermost_flankL_node,
-                    innermost_flankR_node)
-```
-
-#### Why per-allele MIN aggregation (not union)
-
-A naive union — "pool is complete iff the surviving alleles' tag sets UNION
-to expected_var_tags" — has a pathology: two single-HD fragments (one allele
-with HD1 only, another with HD2 only) union to look fully complete, even
-when neither allele individually covers the locus. This was the KYH069 n1
-case: two 308 bp single-HD fragments in a disjoint network scored
-`complete_var = 2` under union aggregation.
-
-Per-allele MIN aggregation requires EVERY surviving allele to score at the
-same level — a pool scores `complete_var = 2` only when every emitted
-allele individually has all expected var tags. KYH069 n1's per-allele
-levels become {1, 1} → pool MIN = 1, demoted below true diploid networks.
-
-#### Pool-level outputs the orchestrator consumes
-
-Each pool returns (used both by the legacy single-merge path and by the new
-per-iteration candidate collection):
-
-```python
-{
-  alleles, allele_cov, extend_bounds, allele_segments,
-  n_raw, n_dedup, found_tags_surviving,
-  verdict,                                  # per-pool sub-verdict (NOT "separate")
-  complete_var, complete_locus,
-  basepair, diploid_dist,                   # for cross-iteration ranking
-  raw_dedup,                                # surviving (name, seq) pre-merge
-}
-```
-
-| post-dedup `n` | emitted records           | naming inside pool |
-|----------------|---------------------------|--------------------|
-| 1              | `allele1`                 | (prefix + `allele1`) |
-| 2              | `allele1`, `allele2`      | (prefix + `allele{i}`) |
-| ≥ 3            | `chimera1`, `chimera2`, … | (prefix + `chimera{i}`) |
-
-(prefix is `""` for non-separate, `n{i}_` for separate's i-th network — so
-output is e.g. `n2_allele1`, `n2_allele2`, …)
-
-A `closed_bubble` whose two arms collapse to one (dedup→1) is reported as
-`verdict=closed_bubble` with one `allele1`, NOT downgraded to `single`.
-`n_after_dedup` tells the consumer how many distinct sequences came out.
-
-#### Why completeness-first ranking, not length-first
-
-The old rule kept the LONGEST representative of each dedup equivalence class.
-Problem: in transitive clusters where A↔B and B↔C are within 5% but A↔C is
-above 5%, length-first kept A and C (both endpoints), giving 2 alleles.
-Completeness-first picks B (the central more-complete representative), whose
-5% radius now covers BOTH A and C → 1 allele.
-
-Empirical: switching from length-first to completeness-first reduced total
-allele count from 407 → 395 across the 148-sample whitelist, with the
-biggest reductions in the 5–7 kb and ≥ 7 kb buckets (long chimeras that
-were keeping their length-tied tail variants). The 4–5 kb diploid bucket
-was untouched.
-
-#### RC-aware divergence — why both strands
-
-`_identity()` aligns the shorter sequence (as query) against BOTH the target
-and `RC(target)`, taking the better edit-distance. This is needed because
-graph walks through the same bubble can be emitted in either orientation
-depending on which anchor BFS started from. Without RC-awareness, two arms
-that are reverse-complements of the same allele would survive dedup as
-distinct (forward HW edit-distance between them would be near-zero on the
-shared part, but the orientation flip looks like total dissimilarity to
-infix-anchored alignment if the target is shorter than the query).
-
-#### HD-only divergence — comparing the var region, not the flanks
-
-The dedup comparison uses only the **HD-only span** of each candidate, not
-the full padded sequence. Two alleles whose HD cores diverge 30% but whose
-flanks are 100% identical would look ~85% identical at the whole-allele
-level — the flanks dominate the length. Restricting the comparison to the
-var region surfaces the biologically-meaningful divergence signal.
-
-Mechanics:
-- `_tblastn_trim_each(seqs, ref, padding)` returns `(padded_seqs,
-  found_tags, hd_span)`. The third value records the HD-only coords
-  `(lo, hi)` *within each padded slice*, so the caller can do `seq[lo:hi]`
-  to get the un-padded HD region.
-- `_dedup_named_ranked(seqs, threshold, key_fn, compare_seqs=…)` takes an
-  optional `compare_seqs={name: hd_only_seq}` dict. Sort order still uses
-  the full rank, but `is_divergent()` is computed on the HD-only slice.
-- Emitted alleles remain the full padded ~9 kb sequences — only the
-  divergence metric narrows to the var region.
-
-#### Hard minimum-length floor (`min_allele_bp`, default 0 — disabled)
-
-Three-stage filter that drops sub-X-bp fragment candidates when X > 0:
-1. **Pre-locus-trim** — applied to raw walk content before tblastn, so
-   fragment-network walks (e.g. KYH069 n1's 308 bp single-HD segments)
-   never reach the tblastn step.
-2. **Post-locus-trim** — second pass after the trim window narrows
-   sequences, catches any survivor that fell below the floor.
-3. **Cross-network sibling dedup** — same floor applied when gathering
-   per-iteration siblings, catches fragments that came in via a sibling
-   network's emission.
-
-The floor was previously set to 3000 to drop sub-HD fragments (e.g.
-KYH069 n1's 308 bp pair). It is now **disabled by default (0)** so the
-pipeline surfaces alternative HD-bearing arms — open_bubble samples
-whose dangling end carries a var node in the tail (e.g. FLAS-59250's
-flankL-anchored HD1-only arm at ~2700 bp var-trimmed / 4022 bp emitted)
-represent a real second HD-bearing region in the graph (paralog or
-alternative allele), not noise. The 3000 floor would have hidden that
-biology. Set `--min-allele-bp 3000` to restore the legacy filter when
-you want only "complete" picks. The Pcub40 sweep at default settings:
-- `min_bp=0` (default): surfaces 5 alternative HD-bearing arms alongside
-  22 closed-bubble diploid pairs — more graph information per sample
-- `min_bp=3000`: hides the 5 alternative arms; reports 24 closed-bubble
-  diploid pairs only
-
-The current `_blastn_flank_presence()` helper still exists for fallback /
-diagnostic use but is NOT consulted during normal emission — the
-graph-level path check (§3.7) replaces it. Calling code that wants
-sequence-level confirmation can still invoke it.
-
-#### Why two layers of trim
-
-Node-level path-trim is cheap (no BLAST, uses graph-level `var_per_node`
-membership) and strips most of the conserved flank. The tblastn locus-trim
-then catches cases where the labeler missed a var hit or the node-trim
-left extra context; it is the content-based safety net.
-
-### 3.9 Arm-sequence reconstruction
-
-Each arm is a path of post-P1 node IDs. The seg-processor supplies
-`provenance[node] = (orig_seg, start, end, strand)` for each sub-segment. The
-reconstructor walks the path, slices the stored-strand DNA at `[start:end]` per
-node, applies reverse-complement where `strand == "-"`, and concatenates.
-`arm_sequences.py` exposes a joint-skipping variant (for diagnostics);
-`_emit_result` uses full-path reconstruction since its trim chain owns boundary logic.
-
-### 3.10 Module layout
-
-The classifier + driver live under `matdetangler/graph_classifier/` and
-`matdetangler/`. Each module has a single responsibility:
-
-| module | role | key function |
-|---|---|---|
-| `graph_classifier/labeler.py` | Aggregator: BLAST TSVs + GFA → `seg_label_hits.tsv` (unpacked, one row per tag) | `emit_seg_label_hits(gfa_path, blast_tsvs, out_tsv)` |
-| `graph_classifier/seg_processor.py` | P1 directional split; emits provenance `{sub_id: (orig_seg, start, end, strand)}` | `directional_split(seg_labels, seg_length, edges, edge_endpoints)` |
-| `graph_classifier/bubble_bfs.py` | P2 Bubble BFS from var through unlabeled | `bubble_bfs(adj, var_nodes, unlabeled)` |
-| `graph_classifier/bubble_classifier.py` | Anchors + arms + verdict over the post-P1 graph | `classify(nodes, edges, label_per_node, var_per_node)` |
-| `graph_classifier/arm_sequences.py` | Reconstruct allele DNA per arm; skip joint/fork nodes (shared between arms) | `reconstruct_arms(arms, provenance, gfa_seqs, skip_joints=True)` |
-| `graph_classifier/per_k_caller.py` | End-to-end caller: BFS loop + trim → dedup → emit | `find_alleles(seg_label_hits_tsv, gfa_path, genome_cov, …)` |
-| `run_per_k.py` | Per-(sample, K) driver: extract segs → BLAST → labeler → find_alleles | `main()` (CLI) |
-
-Test suite: `test/graph_classifier/directional_test.py` covers the classifier with
-8 hand-built synthetic cases — composites, long unlabeled spacers, Y-fork bubbles,
-dangling arms, multi-arm complexity, disjoint var subgraphs, and the AG10 / AG17 /
-AJB36 / SA93 / AG5 shapes. All 8 pass. AG17 real-data run emits 2 divergent alleles
-(5217 bp + 5045 bp, verdict `closed_bubble`) end-to-end through
-`per_k_caller.find_alleles`.
-
-### 3.11 Output: result.tsv + caller dict
-
-Each `find_alleles()` call produces the **best allele set for one GFA at one k**.
-The output dict:
-
-```python
-{
-    # Classification
-    "verdict":         "closed_bubble" | "open_bubble" | "single" |
-                       "separate" | "complexed",
-    "bubble_type":     alias for `verdict` (clarity in TSV columns),
-    "k":               the K label passed in (e.g. "k53"),
-
-    # Allele records (post-trim, post-dedup)
-    "alleles":         [("allele1", "ACGT..."), ("allele2", "ACGT..."), ...]
-                       OR
-                       [("chimera1", "ACGT..."), ("chimera2", "ACGT..."), ...],
-    "component_list":  list of emitted names (parallel to alleles),
-    "allele_cov":      list[float],  # length-weighted DP:f: mean per allele
-    "extend_bounds":   list[(str|None, str|None)],
-                       # per allele, (innermost_flankL_node,
-                       # innermost_flankR_node). Either side is None if
-                       # no flank-labeled neighbor was found on that side.
-    "basepair":        sum of emitted allele lengths,
-
-    # Completeness (post-trim tblastn over surviving candidates,
-    #               graph-level flank-presence check — §3.7)
-    "complete_var":    bool | None,   # all expected_var_tags hit? [HD coverage]
-    "complete_locus":  bool | None,   # both flankL AND flankR hit?
-                                       # [pure flank presence — INDEPENDENT
-                                       # of complete_var, NOT nested. A
-                                       # candidate can be cl=2 cv=1
-                                       # (both flanks, missing one HD) or
-                                       # cl=1 cv=2 (one flank, all HDs).]
-    "locus_coverage":  float | None,  # fraction of expected_var_tags found
-    "found_var_tags":  sorted list[str],
-
-    # Diagnostics
-    "n_candidates":    int,           # before dedup (post-trim)
-    "n_after_dedup":   int,           # final emitted count
-    "divergent":       bool,          # n_after_dedup >= 2
-    "n_hops_used":     int,           # BFS hop count at acceptance/exhaustion
-    "phase":           "main" | "flank_fallback",
-    "cov_filter_used": bool,          # was the depth filter on at this iteration
-
-    # Segment provenance
-    "segments":        sorted list[str],   # union of orig-seg IDs across alleles
-    "segments_labeled": list[(seg_id, "tag1+tag2+...")],
-    "allele_segments": list[list[str]],    # PER allele, sub-node IDs along the
-                                            # FULL anchor-to-anchor walk: the
-                                            # closed_arm path PLUS the
-                                            # flank-bearing anchor neighbors on
-                                            # either end. ({parent}#N format —
-                                            # see §3.3.) This is the "fullwalk"
-                                            # view used by bubble.txt / bubble.gfa
-                                            # / bubble.png; it is INTENTIONALLY
-                                            # longer than the emitted FASTA
-                                            # sequence (which is the non-joint
-                                            # slice + tblastn-trim — see §3.8).
-    "subnode_seqs":    {sub_id: dna_seq},  # materialized sub-node sequences
-                                            # for IDs referenced by emitted
-                                            # alleles; run_per_k writes to
-                                            # <k>/subnode_seqs.fasta
-    "genome_cov":      float,         # echoed from input
-
-    "info":            { ...classifier stats (n_arms, n_closed, anchors, etc.) },
-}
-```
-
-`run_per_k.py` flattens this dict into a 22-column `result.tsv`:
-
-```
-sample  k  bubble_type  components  complete_var  complete_locus  locus_coverage
-basepair  genome_cov  allele_cov  n_cand  n_dedup  divergent  n_hops_used  phase
-cov_filter_used  allele_lens  segments  segments_labeled  found_var_tags
-extend_bounds  allele_segments
-```
-
-`extend_bounds` is encoded as `L:R;L:R;…` (one `L:R` pair per emitted allele,
-`;`-joined). `-` placeholder where no flank was reached on that side.
-`allele_segments` is `;`-joined per allele, `,`-joined within an allele.
-
-#### Side files written by `run_per_k.py` per (sample, k):
-
-| file | content |
-|---|---|
-| `alleles.fasta` | post-dedup picked alleles, FASTA. `min_allele_bp` floor is disabled by default (set 3000 to restore the legacy sub-HD-fragment filter). |
-| `longest_alleles.fasta` | length-first RC-aware dedup over the full candidate pool — keeps the LONGEST representative of each edit-distance equivalence class (HD-only divergence, 5%). Wider net than `alleles.fasta`; the bash wrapper unions per-k versions into a sample-level `<sample>/longest_alleles.fasta` with `k{NN}_` prefixed headers. |
-| `result.tsv` | the 22-column row above. `complete_var` and `complete_locus` are now tri-state integers (0=none, 1=some, 2=all). |
-| `seg_label_hits.tsv` | labeler output (§3.2) |
-| `subnode_seqs.fasta` | one record per unique `{parent}#N` sub-node ID, with the materialized sub-region DNA (RC'd if post-P1 strand was `-`). Consumed by `graph_paths.py` to draw `bubble.gfa` / `bubble.png` with coord-free IDs. |
-| `candidate_allele.fasta` | forensic record — every emitted sequence across all BFS iterations (post `min_allele_bp` filter). Headers carry `cand{id}_h{nhop}_n{net}_c{cov}_{verdict}_{allele_name}`. Not consumed by downstream stages. |
-| `flankL_blastn.tsv`, `flankR_blastn.tsv`, `HD_tblastn.tsv` | raw BLAST inputs to the labeler |
-
-Cross-K integration (picking the best K across the per-k results) lives in
-`matdetangler.pick_k`, documented in §4. `per_k_caller`'s contract is **one k in,
-one verdict + allele set out**.
-
-### 3.12 Upstream plumbing notes
-
-P1 (§3.3) needs per-end label coordinates on each GFA segment. The labeler
-(§3.2) produces these from BLAST output (`sstart`/`send` of each hit on a segment)
-and writes them to `seg_label_hits.tsv`.
-
-If per-end coordinates are absent (e.g. when a third-party tool feeds this
-classifier without sstart/send), the fallback is to retain the composite node
-as-is and use a simpler anchor rule (composite carrying a flank tag is also an
-anchor). This is less crisp but still correct for common shapes; the production
-classifier should use directional input.
+## Step 3 — `run_per_k` → per-K caller
+
+**Code**: `matdetangler/run_per_k.py:main()` → `matdetangler/graph_classifier/per_k_caller.py:find_alleles()`. The classifier itself lives in `matdetangler/graph_classifier/`.
+
+This step has four sub-stages.
+
+### 3a — Per-segment BLAST + label aggregation
+
+**Code**: `run_per_k.py` lines 121–144 (BLAST) + `matdetangler/graph_classifier/labeler.py:emit_seg_label_hits()`.
+
+1. Extract S-line sequences from the GFA → temp FASTA → `makeblastdb`.
+2. `blastn flankL/flankR.fasta` and `tblastn variable_proteins.fasta` against the segment DB.
+3. `labeler.py` aggregates the three BLAST TSVs into `seg_label_hits.tsv` via a 3-stage merge:
+   - **Stage A**: merge overlapping same-tag intervals per (seg_id, tag).
+   - **Stage B**: sweepline across tags of the same kind (flank or var), producing contiguous regions with constant active tag-set.
+   - **Stage C**: var wins on overlapping bases (clip flank regions against var regions).
+4. Output `seg_label_hits.tsv`: `seg_id, seg_length, tag, kind, start, end, strand`. Multi-tag regions are emitted as multiple rows (one per tag) at the same (start,end).
+
+### 3b — Directional split (P1)
+
+**Code**: `matdetangler/graph_classifier/seg_processor.py:directional_split()`.
+
+A SPAdes segment can carry multiple BLAST labels (e.g. flankL on the left end, HD1 in the middle, HD2 on the right). The classifier needs each post-P1 node to play **at most one role** (pure flank, pure var, or pure unlabeled connector).
+
+Algorithm — for each GFA segment:
+
+1. **No hits** → stays as one node with empty label. `provenance[seg] = (seg, 0, slen, "+")`.
+2. **Hits** → sort by `start`, then merge consecutive **same-tag** hits into "runs" (multiple HD1 fragments collapse into one HD1 run). After merging, `runs` is the list of distinct-label spans on the segment.
+3. **One run** → stays as one node with that tag. `label_per_node[seg] = tag`. If `kind == "var"`, `var_per_node[seg] = {tag pieces}`.
+4. **Multi-run** (composite) → split into N sub-nodes `<seg>#1, #2, …, #N` indexed L→R on the segment's stored strand. Boundaries are at MIDPOINTS between adjacent runs' end/start. Each sub-node gets one tag. New within-segment edges connect consecutive sub-nodes (`#i — #(i+1)`).
+5. **Re-attach original GFA L-edges**: each L-line has `edge_endpoints[(a,b)] = (side_a, side_b)` recording which END of seg a/b the edge touched (L or R). Map to `subs[0]` (L side of the parent) or `subs[-1]` (R side).
+
+Provenance: `provenance[sub_id] = (parent_seg_id, start, end, strand)` — for each post-P1 node, the original GFA segment ID and the sub-region on its stored strand. Used by `_arm_sequence_for` downstream to materialize allele sequences.
+
+Returns `(nodes, edges, label_per_node, var_per_node, provenance)`.
+
+### 3c — Two-pass BFS + classify loop
+
+**Code**: `per_k_caller.py:find_alleles()` (lines 306–571).
+
+The orchestrator iterates over **(cov_pass × nhop)** combinations and collects every candidate emission, then ranks across the pool. Two key design choices control the search:
+
+**Cov-pass dimension** (`cov_filter` arg, default `"on"`):
+- Pass 1 — **cov-OFF main pass**: BFS neighborhood is NOT depth-filtered (more permissive — recovers fragmented-flank samples where SPAdes broke a flank into too-short segments).
+- Pass 2 — **cov-ON fallback**, only if pass 1 didn't short-circuit: BFS neighborhood is filtered to `[lo_mult × D_k, hi_mult × D_k]` (defaults 0.2× to 2.0×) — tightens when cov-off neighborhoods are too noisy.
+- `--cov-filter off` → only cov-OFF pass; no fallback.
+
+**Nhop dimension** (`init_nhop=3`, `max_nhop=8`):
+- For each cov pass, iterate `nhop` from 3 to 8.
+- `nhop` is the BFS hop count radius around seed segments.
+
+**Inner loop body** (per `(cov_pass, nhop)`):
+1. **Seed** the BFS from the set determined by `seeds_mode` (default `"both"` = var-labeled + flank-labeled segments).
+2. **Expand** N hops → neighborhood node set.
+3. If `cov_pass=True`: apply depth filter.
+4. **Restrict subgraph** to neighborhood + reachable edges.
+5. **Apply P1** (Step 3b) → post-P1 nodes/edges/labels/var/provenance.
+6. **Classify** (Step 3d).
+7. If verdict has `class != "no_var"` and emission produces a `closed_bubble n>=2 complete_locus=2` candidate → **short-circuit** the entire loop.
+
+### 3d — Bubble classification (R1–R4)
+
+**Code**: `matdetangler/graph_classifier/bubble_classifier.py:classify()`. Helpers: `_enum_paths()`, `_enum_dangling()`, `bubble_bfs()` (in `bubble_bfs.py`).
+
+Inputs (post-P1):
+- `nodes` (set), `edges` (frozensets), `label_per_node` (str per node — `"flankL"`, `"flankR"`, gene names, or empty), `var_per_node` (per-node set of var-gene tags)
+- From these the classifier derives:
+  - `var_nodes = {n : var_per_node[n] is non-empty}`
+  - `flankL = {n : "flankL" in label_per_node[n].split("+")}` ; `flankR` similarly
+  - `unlabeled = {n : label_per_node[n] empty AND not in var_nodes}`
+  - `adj` — undirected adjacency from edges
+
+**R1 — separate.** If `var_nodes` live in ≥2 disjoint full-graph components (`connected_components(nodes, adj)`), recurse `classify()` on each network's induced subgraph and return `{class: "separate", sub_results: [...], var_components: [...]}`.
+
+**P2 — bubble BFS.** `bubble_bfs(adj, var_nodes, unlabeled)`:
+- Start with `bubble = set(var_nodes)`.
+- DFS through neighbors that are in `unlabeled` (not in bubble yet); add them, continue from there.
+- Stops at any flank-labeled node (flanks are NOT in `unlabeled`, so the walk can't cross them).
+- Result: `bubble = var_nodes ∪ (unlabeled connectors transitively reachable from var via unlabeled-only steps)`. Everything else is "outside" (flank or unreachable).
+
+**R2 — anchors.** Anchors are bubble nodes that "meet the outside world":
+- `flank_L_adj = {n ∈ bubble : any neighbor m ∈ flankL}` — bubble nodes whose outside-the-bubble neighbor is a flankL node. Symmetric for `flank_R_adj`.
+- **Rule (a)** anchor: `n ∈ bubble` with `deg_out(n) > 0`, where `deg_out = #{m ∈ adj[n] : m ∉ bubble}`. The common case — a bubble node with at least one neighbor outside the bubble (typically the flank-labeled neighbor itself).
+- **Rule (b)** anchor (FALLBACK, only if rule (a) gives `< 2` anchors): admit bubble-leaves — nodes with `deg_in(n) ≤ 1` where `deg_in = #{m ∈ adj[n] : m ∈ bubble}`. Dead-end leaves of the bubble subgraph. Necessary to recover anchors when the assembly broke the flank into short segments that didn't BLAST (lost-label case).
+
+  Rule (b) is gated to avoid spurious anchors on clean closed bubbles. A 90 bp leaf hanging off a Y-fork in a sample with two healthy flank anchors should NOT become a third anchor — that would add a spurious dangling arm.
+
+**R3 — arms.** For each ordered pair of distinct anchors `(s, e)`, enumerate simple paths from `s` to any `e ∈ anchors - {s}` that stay within `bubble`. The path enumerator is `_enum_paths(adj, start=s, ends, allowed=bubble, …)` — see "Path enumeration algorithm" below.
+
+After enumeration, filter each path:
+
+- **Drop** paths that don't carry any var node (`any(n in var_nodes for n in p)` must be true).
+- **Closed arm** — both endpoints are flank-adjacent on OPPOSITE sides: `{p[0], p[-1]} ∩ flank_L_adj ≠ ∅ AND ∩ flank_R_adj ≠ ∅`. A proper L↔R walk through the bubble.
+- **Dangling arm** — one endpoint is flank-adjacent (L or R), the OTHER is a bare leaf (not flank-adjacent). One side anchored, the other dangling into the bubble interior.
+- **Dropped** otherwise — same-side (both endpoints L-adj or both R-adj) and pure leaf-leaf paths.
+
+Canonicalized via `_canonical(p)` (orient so first node-id < last node-id) to dedupe reversed-equivalent walks.
+
+Also handled:
+
+- **Single-node bridge**: a var node that's an anchor with BOTH flankL AND flankR adjacency (a single composite segment spanning the whole locus) → counts as a closed arm with the 1-element path `[n]`.
+- **`_enum_dangling` extension**: from each flank-anchored start, enumerate paths that **dead-end inside the bubble** (no neighbor in `bubble` left to extend to) carrying var content NOT entirely covered by the closed arms' var union. Adds to `dangling`. Dedupe via canonical ordering. This catches arms whose other endpoint isn't an anchor at all — assembly truly ends inside the bubble.
+
+**R4 — verdict.**
+- `n_arms = n_closed + n_dangling`
+- `n_arms == 0` → `complexed` (no var-bearing arm)
+- `n_arms == 1` → `single`
+- `n_arms == 2 AND n_closed == 2` → `closed_bubble`
+- `n_arms == 2` (else) → `open_bubble` (one or both dangling)
+- `n_arms ≥ 3` → `complexed`
+
+Note: `n_closed` and `n_dangling` are kept as diagnostic fields in the verdict dict (`closed_arms`, `dangling_arms`); both feed into the picker's "complete_locus" tri-state via flank-presence checks.
+
+### 3d.1 — Path enumeration algorithm (`_enum_paths`)
+
+**Shortest-first BFS by path length.** Frontier is a list of `(path, vis_set, bp_since_var)` triples; iterate until frontier empty or `max_paths` reached.
+
+Initial frontier:
+- `start_bp = 0` if `start ∈ var_nodes`, else `node_bp[start]`
+- frontier = `[([start], {start}, start_bp)]`
+
+Step (each iteration expands one frontier into next_frontier):
+
+For each `(path, vis, bp_acc)` in frontier, for each `nxt ∈ adj[path[-1]]`:
+
+1. **Simple-path guard**: skip if `nxt ∈ vis` (no revisits).
+2. **Allowed set**: skip if `nxt ∉ allowed AND nxt ∉ ends` (only walk through the bubble or land on an anchor).
+3. **Path-length cap**: if `len(path) + 1 > max_path_length` → drop the extension (and increment `max_path_length_hit`). The partial path is also pruned from `next_frontier`.
+4. **BP-aware cap** (when `node_bp` + `var_nodes` are supplied AND `max_bp_since_var > 0`):
+   - If `nxt ∈ var_nodes` → ALWAYS extend; reset `new_bp = 0` (reaching var resets the budget).
+   - Else if `bp_acc > max_bp_since_var` → drop (and increment `max_bp_hit`). **Pre-extension check on the CURRENT accumulator, not `bp_acc + bp(nxt)`.** A path that hasn't yet blown the budget can still grab one MORE node of any size (e.g. a final 10 kb anchor); the cap only kicks in for further extensions afterward.
+   - Else `new_bp = bp_acc + node_bp[nxt]`.
+5. **Termination vs continuation**:
+   - If `nxt ∈ ends AND nxt ≠ start` → emit `path + [nxt]` into `paths` list; if `len(paths) ≥ max_paths` → set `max_paths_hit` and abort the whole enumeration.
+   - Else → push `(path + [nxt], vis ∪ {nxt}, new_bp)` onto `next_frontier`.
+
+Returns `paths` — a list of node-ID lists, each a simple bubble-internal walk from `start` to some `e ∈ ends`.
+
+### 3d.2 — Dead-end enumeration (`_enum_dangling`)
+
+Similar BFS-by-length, but:
+
+- **No `ends` set** — instead, enumerate paths that DEAD-END (no extending neighbor in `allowed`).
+- Per step, track `extended` (bool): set True if any `nxt` was accepted onto `next_frontier`. If a path body had NO valid extension AND `len(path) > 1`:
+  - Check var content: `vs = set(path) ∩ var_nodes` must be non-empty AND NOT a subset of `exclude_var_subset` (the closed arms' var union — passed in by the caller). Drops dangling arms whose var content is wholly redundant with already-found closed arms.
+  - Canonicalize `tuple(path)` (orient by endpoints), insert into `seen` set, append to `paths`.
+- Same three caps: `max_paths`, `max_path_length`, `max_bp_since_var`.
+
+Used in R3 to catch arms whose "outer" endpoint isn't actually another anchor — it's just where the bubble runs out.
+
+### 3e — Emission + dedup + ranking
+
+**Code**: `per_k_caller.py:_emit_result()` + `_finalize_candidates()`.
+
+1. Each `(cov_pass, nhop)` iteration emits a list of "pools" (one per sub_result of a `separate` verdict, otherwise one global pool).
+2. Per pool:
+   - **Trim each arm to its var span** (first var → last var), then extend through joint-detection BFS to recover the full allele walk (joints = nodes visited by ≥ 2 arms' outward BFS from arm endpoints — see §3.8 of legacy METHODS.md for the multi-source detail).
+   - **`samtools consensus`-style sequence reconstruction** from provenance: for each post-P1 sub-node, slice the original GFA segment.
+   - **tblastn-trim** with `locus_padding=4000` to clean up flanks beyond the HD envelope.
+   - **Dedup** RC-aware via edlib HW edit distance — collapse pairs with identity ≥ (1 − `divergence_threshold`), default threshold 0.01 (1% edit distance).
+   - **Min-bp floor**: drop alleles shorter than `min_allele_bp` (default 0 = disabled).
+   - Compute per-allele `complete_var` (HD-tag coverage tri-state 0/1/2), `complete_locus` (flank-presence tri-state).
+3. **Cross-iteration ranking** (line 506) — 4-tier `_rank_key`, smaller-is-better:
+   - 0. `-complete_locus` — both flanks present in EVERY emitted allele (tri-state 2) wins
+   - 1. `-complete_var` — all expected HD tags in EVERY allele (tri-state 2) wins
+   - 2. `bubble_priority` — `closed_bubble:1 > open_bubble:2 > separate_div2:3 > single:4 > complexed_div2:5 > separate_other:6 > complexed_other:7 > no_var:8`
+   - 3. `diploid_dist` — `|mean(allele_cov) / D_k − 0.5|` (closer to 0.5 = better diploid balance)
+4. **Short-circuit acceptance** (line 516): the moment any candidate hits `closed_bubble + n_dedup ≥ 2 + complete_locus ≥ 2`, break the (cov_pass, nhop) loop. `complete_var` is NOT required for short-circuit — `complete_locus` is the gate (both flanks reached) and `complete_var` is a secondary tier in ranking.
+   - Rationale: a diploid sample with one allele truncated mid-HD (cv=1) is the correct answer, NOT a homozygote-collapsed `single n=1 cv=2`. Forcing cv=2 collapses the diploid signal. See `diploid-preserve-over-cv` memory.
+
+**Outputs** under `<outdir>/<sample>/<k>/`:
+- `result.tsv` (22 cols) — sample, k, bubble_type, n_dedup, complete_var, complete_locus, basepair, allele_cov, etc.
+- `alleles.fasta` — emitted sequences (`<sample>_<k>_allele1`, `_allele2`, or `_chimera1+` when n > 2)
+- `seg_label_hits.tsv`, `flankL_blastn.tsv`, `flankR_blastn.tsv`, `HD_tblastn.tsv` — labeling caches
+- `subnode_seqs.fasta` — materialized sub-segment sequences when P1 split anything
 
 ---
 
-## 4. Cross-K consolidation  (`matdetangler.pick_k`)
+## Step 4 — `pick_k` cross-K consolidation
 
-After the per-K caller has run on every K, `pick_k` reads each sample's per-K result
-files and picks the best K.
+**Code**: `matdetangler/pick_k.py:pick_for_sample()` (lines 127–141), scoring at `_score()` (lines 104–124).
 
-```
-for each sample dir <outdir>/:
-    candidates = []
-    for each <outdir>/<K>/result.tsv:
-        row = parse(result.tsv)
-        candidates.append(row)
-    if not candidates: emit NO_RESULT row; continue
+Runs only when `--no-skip-pick` is set (default is `--skip-pick`, which leaves the candidate pool from step 3 untouched for QC inspection).
 
-    candidates.sort(key=_score)
-    winner = candidates[0]
+1. Load all per-k `result.tsv` rows + `alleles.fasta` records.
+2. Apply the same 4-tier rank key as `per_k_caller._rank_key` (see 3e).
+3. Pick the winning k. All alleles from that k get emitted; alleles from losing k's are discarded.
 
-    # emit:
-    write_legacy_picks_row(winner)              → picks.tsv          (one row per emitted allele)
-    write_summary_row(winner)                   → picks_summary.tsv   (one row per sample)
-    cp <outdir>/<K_winner>/alleles.fasta        → primary_alleles.fasta
-```
-
-### Priority order (preferred K first)
-
-```
-1. closed_bubble                                              (the ideal — 2 closed arms)
-2. open_bubble                                                (1 closed + 1 dangling)
-3. separate            (only if n_dedup == 2)                 (disjoint var components, but only 2 alleles distinct)
-4. single                                                     (haploid / homozygous: 1 emitted allele)
-5. complexed           (only if n_dedup == 2)                 (diploid behind a complex bubble)
-6. separate            (n_dedup != 2 — chimeric emission)
-7. complexed           (n_dedup != 2)
-8. no_var
-9. error / no result
-```
-
-### Tie-break within the same priority class (lower is better)
-
-1. `complete_var` (True > False > None)
-2. higher `locus_coverage`
-3. closer to ½ × `D_k` (diploid signature: `|mean(allele_cov) / D_k − 0.5|`)
-4. higher total `basepair`
-5. lower `n_candidates`
-
-### Outputs
-
-| file | what |
-|---|---|
-| `picks.tsv` | legacy 12-column schema, one row per emitted allele (compatible with downstream `graph_paths` + `summary_table`) |
-| `picks_summary.tsv` | sample-level new schema, one row per sample — verdict, n_dedup, allele_cov, extend_bounds, k_chosen, all_k_tried |
-| `primary_alleles.fasta` | concatenated allele records from the chosen K per sample; headers `<sample>_<k>_<allele_name>` |
-
-`picks.tsv` schema (12 cols):
-
-```
-sample  allele  origin  k  type  len  from_contig  segments
-cov     n_variable_genes  has_both_flanks  is_degHD
-```
-
-`picks_summary.tsv` schema (14 cols):
-
-```
-sample  k_chosen  bubble_type  n_dedup  complete_var  complete_locus
-locus_coverage  basepair  genome_cov  allele_cov  n_cand
-extend_bounds  components  all_k_tried
-```
-
-### Rationale
-
-- **Priority by topology + dedup count, not by sequence score.** The new caller's
-  classifier already states what the bubble looks like; `n_dedup` says how many
-  distinct sequences fell out of the trim+dedup chain. The cross-K winner is the K
-  where the bubble is cleanest (closed > open > separate > single > complexed) AND
-  the dedup landed on the expected ploidy (2 for diploid).
-- **A diploid `complexed` with `n_dedup == 2` still wins over a tangled `separate`.**
-  Complexed-with-2-survivors means the bubble was structurally tangled but the
-  sequence content collapsed to two — that's a real allele pair behind graph noise.
-  We prefer it over a `separate` call with > 2 chimeras.
-- **Legacy-compatible picks.tsv schema.** Downstream stages (`graph_paths`,
-  `summary_table.py`) read picks.tsv with the column order they always expected;
-  the new pipeline preserves that column order so no downstream code needs to change.
-  Some legacy columns (`from_contig`, `is_degHD`) are placeholder values.
-- **`picks_summary.tsv` carries the new fields.** Anything specific to the per-K
-  caller (extend_bounds, n_dedup, k_chosen, all_k_tried) goes here so the legacy
-  format isn't bloated.
+**Outputs**:
+- `picks.tsv` — one row per picked allele (legacy 12-col schema: sample, allele, origin, k, type, len, from_contig, segments, cov, n_variable_genes, has_both_flanks, is_degHD)
+- `picks_summary.tsv` — sample-level (k_chosen, bubble_type, n_dedup, complete_var, complete_locus, locus_coverage, basepair, genome_cov, allele_cov, n_cand, extend_bounds, components, all_k_tried)
+- `primary_alleles.fasta` — concatenated picks (1–N records)
+- `longest_alleles.fasta` — length-first dedup of the candidate pool (broader net for downstream cluster work)
 
 ---
 
-## 5. Annotated allele walks  (`graph_paths.py`)
+## Step 5 — `graph_paths` annotated bubble views
 
-Each picked allele has a recorded segment walk in `picks.tsv` (col 8, `segments`).
-`graph_paths` reads the walk verbatim, labels each segment by content (tblastn proteins
-+ blastn flanks), and emits per-sample plots + walks.
+**Code**: `matdetangler/graph_paths.py:run()` (entry at the `_cli` block, lines 1000+).
 
-Inputs the wrapper supplies: `--primary-alleles`, `--picks-tsv`, `--spades-dir`. (The
-legacy `--cand-ann` input is no longer required — the new pipeline doesn't write
-`bubble_alleles.ann.tsv`.)
+Renders each picked allele's walk on the GFA. Reads-free.
 
-### Performance: labels only the segments in the recorded paths
+1. For each picked allele:
+   - Either use the recorded `segments` from `picks.tsv:segments` verbatim (preferred), or fall back to BLAST-trace alignment.
+   - Build the ordered node list through the GFA.
+2. **Joint detection**: multi-source BFS from each arm's endpoints (`adj_pp` post-P1) — a node visited by ≥ 2 arms' BFS frontiers is a candidate joint. Pair-search picks the globally-best (j_a, j_b) pair shared between the two alleles.
+3. Render five views of the same bubble:
+   - `bubble.txt` — ASCII walk (one row per allele)
+   - `bubble.gfa` — sub-GFA (loads in Bandage; only the segments + edges that touch the walks)
+   - `bubble.dot` — Graphviz DOT
+   - `bubble.tsv` — edge list (node_a, node_b, arm, label_a, label_b)
+   - `bubble.png` — matplotlib figure
+4. **PNG coverage annotation**: below each segment box, a normalized depth tag is drawn — `×<DP:f: / genome_cov>` (e.g. `×0.48`, `×1.02`, `×2.07`). `genome_cov` is read from `<outdir>/genome_cov_spades_k<k>.txt` (or `--genome-cov` override). For a low-het diploid the median GFA depth ≈ 2× haploid coverage, so `×0.5` ≈ a unique bubble-allele segment (only one haploid's reads), `×1.0` ≈ shared-between-alleles or homozygous background, `×2.0` ≈ collapsed two-copy repeat. Helpful for spotting low-coverage tail noise vs real content.
 
-Earlier versions ran `label_nodes` on **every segment of the whole GFA** (100k–
-300k segs per call) for each allele in `primary_alleles.fasta`. With 24 candidate
-alleles under `--skip-pick`, that was 24× redundant whole-GFA labeling — step 5
-could take 30–60 minutes per sample.
-
-Now `graph_paths.run` (via the `_per_allele_gfas_and_paths` helper + a per-GFA cache):
-- **per-GFA cache**: parses each unique GFA only once, even when multiple alleles
-  share it (the `gfa_cache` dict inside `run`).
-- **recorded-path subset**: the union of all alleles' recorded segments (from
-  picks.tsv) is the only set of segments labeled — ~tens of segments instead of
-  100k–300k. blast queries run on tiny temp DBs.
-
-Combined effect: step 5 now completes in **~0.5–2 seconds** (zero new blast work
-when the cache is warm; all hits are USE).
-
-| output | what |
-|---|---|
-| `bubble.txt` | `allele1: <walk>` / `allele2: <walk>` (or one row per candidate under `--skip-pick`) |
-| `bubble.gfa` | sub-GFA of just the walks' segments + L-links (loads in Bandage) |
-| `bubble.dot` | Graphviz DOT |
-| `bubble.tsv` | edge list |
-| `bubble.png` | matplotlib: one row per allele. **Node coloring**: yellow = carries any variable gene (e.g. HD1/HD2; flank tag, if any, ignored for color); blue = flank-only (label is purely flankL/flankR, no variable gene); white = pure-number / unlabeled. **Normalized coverage tag** below each node box: `×<seg_cov / genome_cov>` (e.g. `×0.97`, `×2.11`) — drawn whenever the GFA carries a `DP:f:` / `KC:i:` depth tag for that segment and `genome_cov` is known. genome_cov is auto-read from `<outdir>/genome_cov_spades_k<k>.txt` (or passed via `--genome-cov`). `×1.0` = haploid depth (one allele expected); `×2.0` = collapsed double allele or repeat. Useful for spotting low-coverage tails that may be assembly noise vs real allele content. **Solid black cross-arm lines**: one per GFA sub-node ID that's literally shared between the two arms (the cycle-joint shared nodes surfaced by `_emit_result`'s BFS-joint extension — see §3.8). Dashed flank-side lines were removed (visual clutter without topological information). **Row x-alignment**: x-coords are computed in a unified per-row coordinate system honoring all shared-anchor constraints, then rescaled globally to [0, 1] — so a shared joint at one row's END and the other row's START doesn't collapse the longer row's tail (the rows extend in opposite directions in unified coords, then fit proportionally after rescale). **Row direction**: each row is reversed if its var-tag sequence is the exact reverse of the locus-position order from `queries/manifest.json` (or for single-HD rows: if the row's flank endpoints come out flankR-then-flankL, flip). Capped at 4 rows displayed (extras dropped from the picture; the title notes `[showing 4 of N]`). |
-
-When both alleles came from the same K, node IDs are bare. When they came from
-different K's (cross-K pair), node IDs are prefixed `K33:` / `K55:` etc. so the user
-can tell at a glance which graph each allele lives in.
-
-**Row orientation — canonical to the protein query order.** Each row's
-var-tag sequence (e.g. `[HD2, HD1]` or `[HD1, HD2]`) is compared to the
-order tags appear in `queries_dir/variable_proteins.fasta` (or
-`Suilu4_HDs.fasta`). Rows whose order is the exact reverse of the
-reference order get walked backwards before drawing, so HD2/HD1 ends align
-consistently L→R across rows AND across samples. The title shows
-`{sample}: {bubble_type} (N alleles)`.
+Row layout in the PNG: cross-row solid black lines mark sub-nodes literally shared between rows (the cycle joints). Node face colors: yellow = var-bearing, blue = flank-only, white = unlabeled. Up to 4 rows displayed (extras dropped; title notes truncation).
 
 ---
 
-## 6. Mapping + read-derived consensus  (`map_consensus.sh`)
+## Step 6 — `map_consensus` (`--make-consensus` only)
 
-```
-bowtie2-build idx ← primary_alleles.fasta
-bowtie2 --end-to-end --very-sensitive -k 1 --no-unal -1 R1 -2 R2 → reads.sam
-samtools sort reads.sam → reads.sorted.bam (+ samtools index; used only as internal
-                                              intermediate for coverage + consensus,
-                                              deleted at end-of-step)
-# one samtools consensus call per allele record. Record IDs are PRESERVED from the
-# input reference (e.g. >SAMPLE_kNN_allele1) so consensus_alleles.fasta can be used
-# as a drop-in replacement reference without remapping naming conventions.
-samtools consensus -r <allele_i> -f fasta -o tmp reads.sorted.bam → append to consensus_alleles.fasta
+**Code**: `matdetangler/map_consensus.sh` (50 lines).
 
-# coverage_core.py: per-allele depth restricted to HD-core
-hd_iv(a)          = positions in any variable-gene tblastn hit on a
-                    (tblastn variable_proteins → allele, pid >= 25, aa >= 50)
-core_meandepth(a) = mean depth over hd_iv(a)
-```
+Skipped by default (`SKIP_CONSENSUS=1` in the wrapper). Enable with `--make-consensus` (also requires `--reads-r1`/`--reads-r2`).
 
-Persisted outputs: `reads.sam`, `consensus_alleles.fasta`, `coverage.tsv`.
-The intermediate BAM is dropped — SAM is the human-readable artifact users typically
-want for downstream inspection. To re-derive the BAM:
-`samtools sort -o reads.sorted.bam reads.sam && samtools index reads.sorted.bam`.
+1. `bowtie2-build` index ← `primary_alleles.fasta` (the picked references).
+2. `bowtie2 --end-to-end --very-sensitive -k 1 --no-unal -q -p <threads>` → `reads.sam`. Competitive mapping: one best hit per read pair, no unmapped records written.
+3. `samtools sort reads.sam → reads.sorted.bam` + `samtools index`. The BAM is an **internal intermediate** — used by steps 6.b–6.c and deleted at end of step 6.
+4. **Per-allele coverage** via `matdetangler/coverage_core.py` if `queries_dir` has `variable_proteins.fasta` (computes both whole-allele and HD-core-only depths, with optional `--repeats` masking); else fall back to `samtools coverage` (whole-allele only).
+5. **Per-allele consensus**: for each record in `primary_alleles.fasta`, run `samtools consensus -r <allele> -f fasta`. Record IDs are **preserved verbatim** from the input reference (`<sample>_<k>_allele1`, etc.) — NOT renamed to `allele_1/2/3`.
+6. Cleanup: delete `reads.sorted.bam[.bai]` and the bowtie2 index files. Keep `reads.sam` (human-readable artifact).
 
-`coverage.tsv` columns: `whole_meandepth` (raw) **and** `core_meandepth` (HD-core only).
-Summary reports the core depth — it's what tells you whether a real dikaryon allele is
-at ≈ D/2.
+**Persisted outputs**:
+- `reads.sam` — alignments (re-derive BAM with `samtools sort + index` if needed)
+- `consensus_alleles.fasta` — concatenated per-allele consensus
+- `coverage.tsv` — `#allele, len, mapped_reads, whole_breadth_pct, whole_meandepth, core_bp, core_meandepth, repeat_bp`
 
 ---
 
-## 7. Consensus QC  (`pairwise_identity.py` re-run + `consensus_qc.py`)
+## Step 7 — Identity + consensus QC (`--make-consensus` only)
 
-The pick-level numbers from steps 3–4 are based on the graph-derived allele sequences.
-The read-derived consensus can drift (low-coverage stretches become N's, etc.), so we
-**re-check** divergence and completeness on the consensus. The wrapper runs three
-sub-steps:
+Three parallel sub-steps, all reads-derived (require step 6's outputs).
 
-- **7a — pairwise identity on PICKS.** `pairwise_identity` on
-  `primary_alleles.fasta`. HD-core MAFFT protocol via `_align_cores`: trim each
-  candidate + locus reference to HD-core ± pad, ONE MAFFT alignment, score identity
-  only over HD-core columns projected from the reference's ungapped HD-protein span.
-  Writes `identity.tsv`.
-- **7b — pairwise identity on CONSENSUS.** Same `pairwise_identity` module
-  with the same HD-core MAFFT protocol, fed `consensus_alleles.fasta` instead.
-  Writes `identity_consensus.tsv`. Skipped when the consensus has < 2 records.
-- **7c — consensus completeness re-check.** `consensus_qc.py`: per-allele
-  tblastn(variable_proteins) + blastn(flankL/R) on every consensus record.
+### 7a — Pairwise identity on the picks
 
-```
-# 7c body — for each record in consensus_alleles.fasta:
-vars_hit     = { gene : tblastn(variable_proteins → consensus, pid >= 30, aa >= 50) hit on gene }
-aa_cov       = sum of length(aa) across qualifying tblastn hits on this record
-has_flankL   = blastn(flankL → consensus, pid >= 85, len >= 100) has any hit
-has_flankR   = blastn(flankR → consensus, pid >= 85, len >= 100) has any hit
-has_all_vars = (|vars_hit| == nvar_total)
-complete     = has_all_vars ∧ has_flankL ∧ has_flankR
-```
+**Code**: `matdetangler/pairwise_identity.py`.
 
-Output: `consensus_qc.tsv` with columns
-`allele, len, vars_hit, vars_total, has_all_vars, aa_cov, has_flankL, has_flankR, complete`.
+MAFFT-aligns the picked allele pair (`primary_alleles.fasta`):
+- `mafft --auto --adjustdirection` — RC-aware alignment.
+- `id_pct` = matched aligned columns / total aligned columns (excluding pure-gap columns).
+- `aln_frac` = aligned columns / shorter input sequence length.
+- `distinct` (bool) = `NOT (id_pct ≥ 95 AND aln_frac ≥ 0.80)`.
 
-Both numbers land in `summary.tsv` alongside the pick-level versions:
-`cons_allele{1,2}_complete`, `cons_allele1_vs_allele2_id_pct`, `cons_allele1_vs_allele2_aln_frac`.
+Output: `identity.tsv` + `_identity.json`.
+
+### 7b — Pairwise identity on the consensus
+
+Same logic, against `consensus_alleles.fasta` (skipped if < 2 records). Output: `identity_consensus.tsv` + `_identity_consensus.json`.
+
+### 7c — Consensus completeness re-check
+
+**Code**: `matdetangler/consensus_qc.py:_qc_one_consensus()` (lines 41–77).
+
+For each consensus record:
+1. `tblastn variable_proteins.fasta → consensus` (pid ≥ 30, aln ≥ 50 aa). Track which HD genes hit.
+2. `blastn flankL.fasta → consensus` (pid ≥ 85, aln ≥ 100 bp). Track flankL presence.
+3. `blastn flankR.fasta → consensus`. Track flankR presence.
+4. `complete` = `(all expected HD genes hit) AND (flankL present) AND (flankR present)`.
+
+Output: `consensus_qc.tsv` — per-allele complete flag + per-gene/flank presence.
 
 ---
 
-## 8. Cross-sample mating-type clustering  (`MATdetangler-cli cluster`)
+## Step 8 — `summary_table` → `summary.tsv`
 
-Run after `batch`. Phase A is expensive (one MAFFT alignment of all picked alleles);
-phase B is cheap (single-linkage cut on the saved matrix) and re-runnable at any threshold.
+**Code**: `matdetangler/summary_table.py:write_row()` (lines 49–120).
 
-```
-# A: align (matdetangler/cluster.py :: align)
-#    - pool every allele from every results/<sample>/primary_alleles.fasta
-#    - for each allele, tblastn the curated variable proteins to find the HD-core
-#      span (leftmost-to-rightmost HD-protein hit) and pad by +/- 50 bp
-#    - ONE MAFFT --auto run on all cores
-#    - emit:
-#       cores.fasta        per-allele HD-core +/- 50 bp
-#       cores.aln.fasta    MAFFT MSA
-#       cores_pairs.tsv    pairwise (a, b, sim, alnid); sim = matches / shorter-core length
-#       cores_meta.tsv     (allele, core_len) per record
+Reads everything from steps 4–7 and emits one wide-format TSV row per sample.
 
-# B: cut (matdetangler/cluster.py :: cut)
-#    - load cores_pairs.tsv + cores_meta.tsv (no re-alignment -- cheap, re-runnable
-#      with different --thresh values)
-#    - single-linkage union-find: join (a, b) when sim >= --thresh (default 0.90)
-#    - clusters numbered 1, 2, ... by size (largest first); singletons keep their own id
-#    - emit:
-#       allele_classification.tsv  columns: allele, sample, cluster
-#       allele_distance_matrix.tsv symmetric matrix of (1 - sim)
-```
+**Columns** (17 columns):
+`sample, used_k, bubble_type, genome_coverage, allele1_complete, allele2_complete, allele1_coverage, allele2_coverage, allele1_vs_allele2_id_pct, allele1_vs_allele2_aln_frac, cons_allele1_complete, cons_allele2_complete, cons_allele1_vs_allele2_id_pct, cons_allele1_vs_allele2_aln_frac, allele1_path, allele2_path` (cons_* columns are `"-"` when `--make-consensus` is OFF).
+
+Written twice:
+- `<outdir>/<sample>/summary.tsv` — per-sample (single row)
+- `<outdir>/summary.tsv` — aggregate (appended)
 
 ---
 
-## Performance levers
+## Step 9 — `summarize` → `summary.json` (cross-run JSON)
 
-| concern | knob | effect |
-|---|---|---|
-| HD envelope too tight (left or right) | `--envelope-padding` (default 500 bp) | widens envelope each side |
-| Flank too short for downstream anchoring | `--max-flank-len` (default 2000) | also raises `derived_max_locus_len` |
-| Near-identical paths surviving as distinct emitted candidates | `divergence_threshold` (default 0.05, edlib HW edit-distance in `find_alleles`) | raise → keep more variants as distinct; lower → merge more |
-| BFS blowing up the bubble at a high-copy hub | `lo_mult` / `hi_mult` (defaults 0.25 / 2.0 in `find_alleles`) | per-pass coverage filter band `[lo × D_k, hi × D_k]`; tighter band → fewer noisy segments enter the bubble |
-| Caller wall-time blowing up on tangled k=33 graphs | `max_nhop` (default 8 in `find_alleles`, reduced from 10 in 2026-06 after Pcub40 sweep) | tighter cap; BPL1195-shape combinatorial blow-ups still possible — see TODO `_enum_paths` node-visit budget |
-| Locus-trim too aggressive or too loose | `locus_padding` (default 1500 bp in `find_alleles`) | bp pad each side of the tblastn HD-hit envelope before sequence emission |
-| Cross-K picks the wrong K | `pick_k` priority order + tie-break vector | adjustable (see §4); typically k53 wins for Suilu, k77 for Pcub |
-| BLAST wall-time on iterative dev | per-K cached BLAST TSVs in `<outdir>/<K>/` | first run blasts; downstream stages re-read; wipe the per-K dir to force re-blast |
+**Code**: `matdetangler/summarize.py`. Two CLI modes.
+
+### Per-sample mode (wrapper Step 9)
+
+Invoked as `python -m matdetangler.summarize --sample-dir <SDIR> --out <SDIR>/summary.json` after Step 8.
+
+Walks `<SDIR>` and parses:
+- `picks_summary.tsv` (sample-level: k_chosen, bubble_type, complete_var/locus, etc.)
+- `summary.tsv` (pairwise identity, allele_path strings)
+- `picks.tsv` (per-allele segments, cov, has_both_flanks, etc.)
+- `logs/03_run_per_k_k<K>.log` — per-iteration BFS trace via regex (`nhop, seeds, cov_pass, nhood, n_var, cls, n_arms`), `finished_nhop` from `[accept]` lines, `per_k_pick` from `[pick]` lines.
+
+Output: a single JSON with `{args, version, sample}` keys. See `test/Pcub40/known_results.json` for the schema in action.
+
+### Cross-sample aggregate mode (test harness)
+
+Invoked as `python -m matdetangler.summarize --results-dir <outdir> --out aggregate.json`. Walks each `<outdir>/<sample>/` and packs all per-sample entries under `samples: {…}`.
+
+Used by `test/Pcub40/installation_run_test.sh` and `test/Pcub40/analysis_run_test.sh` to diff a fresh run against `test/Pcub40/known_results.json`.
 
 ---
 
-## Failure modes the algorithm protects against
+## Cross-sample clustering — `MATdetangler-cli cluster`
 
-| failure | guard |
-|---|---|
-| Intronic stops in user proteins | rejected at input by `_validate_fasta` (expected to be protein, not NT) |
-| Duplicate protein IDs (blast unique-sseqid constraint) | sanitizer suffixes them `_1`, `_2` |
-| HD envelope shrunken because tblastn missed divergent ends | union over ALL accepted HSPs + padding |
-| Flank too long → search blowup | `--max-flank-len` trim |
-| Decoration-variant paths surviving as separate candidates | edlib HW edit-distance dedup at 5% inside `find_alleles` (sequences ≥ 95% identical collapse) |
-| GFA self-loop edges (`L\tA\t+\tA\t+\t...`) crashing adjacency build | skipped in `bubble_bfs.build_adj` and `seg_processor.directional_split` (1-element frozenset case) |
-| Two GFA components disjoint but both var-bearing | classifier returns `separate`; cross-K picker may pick a K where they connect |
-| No flank labels in the BFS-expanded subgraph | universal-leaf anchor rule (§3.4): bubble dead-end Uvars qualify as anchors |
-| Long conserved flank diluting k-mer similarity | replaced with edlib HW edit-distance after tblastn locus-trim |
-| Picks not actually divergent | `is_divergent` check in `_emit_result` |
-| Consensus drift from pick after read mapping | `consensus_qc.py` re-check + consensus divergence pass |
-| Read-derived gap in HD body | `core_meandepth` at the HD-core positions |
-| Cross-k pair makes a confusing bubble | per-K node-ID prefix in `bubble.png` |
+Standalone, post-`batch`. Two subcommands.
 
+### `cluster align`
 
-## See also
+**Code**: `matdetangler/cluster.py:align()` (lines 52–96).
 
-- `TODO.md` — open algorithmic improvements (per-iteration timeout,
-  depth-weighted decomposition for n>2 cases, Uvar-leaf-only emission,
-  label/text gene order)
-- `METHODS.legacy.md` — preserved methods for the retired
-  `graph_path_search.py` + `pick_alleles.py` chain and the synthetic
-  test-bench classifier (Appendix A of the legacy file)
-- `README.md` — installation + quickstart
+1. Walk `--results-dir`, pull each sample's `primary_alleles.fasta`.
+2. For each allele, identify the HD-core via `tblastn variable_proteins → allele` and extract a window of `core ± 50 bp` (configurable via `--core-pad`).
+3. Run **one** MAFFT alignment over the union of all sample cores (`cores.fasta` → `cores.aln.fasta`).
+4. Compute pairwise similarity from the alignment: `sim_ij = # identical aligned columns between i and j / min(core_len_i, core_len_j)`.
+5. Emit `cores_pairs.tsv` (every pair: `a, b, sim, alnid`), `cores_meta.tsv` (per-allele core span + sample).
+
+### `cluster cut`
+
+**Code**: `matdetangler/cluster.py:cut()`.
+
+Reads cached `cores_pairs.tsv` (no realignment) and applies **single-linkage clustering** at `--thresh` (default 0.90): two alleles join a cluster if `sim ≥ thresh`. Clusters are numbered by size (1 = largest); singletons get their own ID.
+
+Outputs:
+- `allele_classification.tsv` — `allele, sample, cluster`
+- `allele_distance_matrix.tsv` — symmetric `1 - sim` matrix
+
+`cut` is cheap → re-run at any `--thresh` value without redoing `align`.
+
+---
+
+## Determinism + reproducibility
+
+- **`PYTHONHASHSEED=0`** is exported by `MATdetangler-cli` (line 21). Locks Python set/dict iteration order. Two independent runs of the Pcub40 demo on the same install are byte-identical at the level the `installation_run_test.sh` test checks (including the exact graph segments per allele).
+- **`test/Pcub40/`** has the canonical reproducibility harness:
+  - `installation_run_test.sh` — strict tolerance, exits 1 on any divergence; verifies "same code + env + seed = same output".
+  - `analysis_run_test.sh` — biology-focused report, always exits 0; structured per-sample + per-category change log; used when changing the implementation to assess which Pcub40 samples got called differently.
+  - `known_results.json` — 32-sample baseline regenerated from the canonical `MATdetangler` conda env (BLAST 2.17.0, MAFFT v7.525).
+  - `run_args.json` — canonical run configuration.
+
+---
+
+## Defaults table
+
+| param | default | module | role |
+|---|---|---|---|
+| `init_nhop` | 3 | per_k_caller | BFS starting hop count |
+| `max_nhop` | 8 | per_k_caller | BFS max hop count (reduced from 10) |
+| `lo_mult` | 0.2 | per_k_caller | cov filter lower band × D_k |
+| `hi_mult` | 2.0 | per_k_caller | cov filter upper band × D_k |
+| `divergence_threshold` | 0.01 | per_k_caller | RC-aware HW edit-distance dedup threshold |
+| `max_paths` | 1000 | bubble_classifier | cap on simple paths per anchor |
+| `max_path_length` | 50 | bubble_classifier | cap on per-path node count |
+| `max_bp_since_var` | 5000 | bubble_classifier | bp-aware path enumeration cap |
+| `min_allele_bp` | 0 | per_k_caller | hard min-bp floor (0 disables) |
+| `locus_padding` | 4000 | per_k_caller | tblastn boundary padding |
+| `contig_depth_size_cut` | 5000 | input_process | min seg length for genome_cov median |
+| `seeds_mode` | "both" | per_k_caller | BFS seed source: var, flank, or both |
+| `cov_filter` | "on" | per_k_caller | cov-OFF main + cov-ON fallback |
+| `tblastn_pid` / `tblastn_aa` | 30 / 50 | input_process | HD protein BLAST thresholds |
+| `flank_pid` / `flank_minlen` | 85 / 100 | input_process | flank BLAST thresholds |
+| `ks` | "k45,k53" | MATdetangler-cli | k subdirs to try |
+| `expected_count` | 2 | MATdetangler-cli | 1 = haploid, 2 = dikaryon |
+| `SKIP_PICK` | 1 (ON) | MATdetangler-cli | step 4 skipped by default; opt in via `--no-skip-pick` |
+| `SKIP_CONSENSUS` | 1 (ON) | MATdetangler-cli | step 6 skipped by default; opt in via `--make-consensus` |
+| cluster `--thresh` | 0.90 | cluster.py | single-linkage join threshold |
