@@ -283,7 +283,9 @@ def _try_one_pass(seeds: set[str], all_edges: set[frozenset],
     res = classify(nodes, edges_pp, labels, var_per,
                     max_paths=max_paths, max_path_length=max_path_length,
                     node_bp=node_bp,
-                    max_bp_since_var=max_bp_since_var)
+                    max_bp_since_var=max_bp_since_var,
+                    depths=depths, genome_cov=genome_cov,
+                    provenance=provenance)
     res["_bfs_limits"] = res.get("bfs_limits", {})
     res["_provenance"] = provenance
     res["_nhood"] = nhood

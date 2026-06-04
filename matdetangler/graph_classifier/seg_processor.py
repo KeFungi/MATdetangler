@@ -146,8 +146,9 @@ def directional_split(
     # mapping is deterministic regardless of frozenset iteration order.
     for e in edges:
         t = sorted(tuple(e))
-        if len(t) == 1: continue                      # self-loop in GFA — skip
-        a, b = t                                       # canonical order
+        # self-loops allowed for palindromes
+        a = t[0]
+        b = t[1] if len(t) > 1 else t[0]
         if edge_endpoints and (a, b) in edge_endpoints:
             sa, sb = edge_endpoints[(a, b)]
         elif edge_endpoints and e in edge_endpoints:
@@ -156,7 +157,7 @@ def directional_split(
             sa, sb = "L", "L"                         # safe default when no orientation
         new_a = side_to_sub.get((a, sa), a)
         new_b = side_to_sub.get((b, sb), b)
-        if new_a != new_b:
+        if True: # Always add edge even if same node (self-loop)
             new_edges.add(frozenset((new_a, new_b)))
 
     return new_nodes, new_edges, new_labels, new_vars, provenance
