@@ -22,7 +22,8 @@ from .bubble_bfs import bubble_bfs, build_adj, connected_components
 
 def _enum_paths(adj, start, ends, allowed, max_paths=1000, max_path_length=50,
                  limit_counter=None,
-                 node_bp=None, var_nodes=None, max_bp_since_var=5000):
+                 node_bp=None, var_nodes=None, max_bp_since_var=5000,
+                 depths=None, genome_cov=None, provenance=None):
     """Simple paths from `start` to any node in `ends`, using only `allowed`.
 
     SHORTEST-FIRST enumeration (BFS by path length). Three hard limits:
@@ -42,22 +43,34 @@ def _enum_paths(adj, start, ends, allowed, max_paths=1000, max_path_length=50,
 
     `limit_counter` (optional dict) tallies each cap hit so callers can log:
         {"max_paths_hit": int, "max_path_length_hit": int, "max_bp_hit": int}
+
+    REPEAT UNROLLING: uses `depths` and `genome_cov` to allow a node to be
+    visited multiple times if its coverage suggests it is a collapsed repeat.
+    max_visits = max(1, round(depth / genome_cov)).
     """
     bp_enabled = (max_bp_since_var > 0 and node_bp is not None
                   and var_nodes is not None)
     def _bp(n): return node_bp.get(n, 0) if node_bp else 0
+
+    def _get_max_visits(n):
+        if not depths or not genome_cov or not provenance: return 1
+        # provenance[n] = (parent_seg, start, end, strand)
+        parent = provenance.get(n, (n,))[0]
+        d = depths.get(parent, genome_cov)
+        return max(1, round(d / genome_cov))
+
     paths = []
-    # State: (path, vis, bp_since_var). bp_since_var starts at start's own
-    # bp if start is not var, else 0.
+    # State: (path, vis_counts, bp_since_var).
     start_bp = 0 if (bp_enabled and start in var_nodes) else _bp(start)
-    frontier = [([start], frozenset({start}), start_bp)]
+    frontier = [([start], {start: 1}, start_bp)]
     while frontier and len(paths) < max_paths:
         next_frontier = []
-        for path, vis, bp_acc in frontier:
+        for path, vis_counts, bp_acc in frontier:
             if len(paths) >= max_paths: break
             curr = path[-1]
             for nxt in adj.get(curr, ()):
-                if nxt in vis: continue
+                count = vis_counts.get(nxt, 0)
+                if count >= _get_max_visits(nxt): continue
                 if nxt not in allowed and nxt not in ends: continue
                 if len(path) + 1 > max_path_length:
                     if limit_counter is not None:
@@ -65,16 +78,6 @@ def _enum_paths(adj, start, ends, allowed, max_paths=1000, max_path_length=50,
                             limit_counter.get("max_path_length_hit", 0) + 1
                     continue
                 # BP-aware cap, PRE-extension check:
-                #   * Var nodes always extend and reset the tail to 0.
-                #   * Non-var nodes extend ONLY when the CURRENT accumulated
-                #     bp (bp_acc, NOT bp_acc + size of nxt) is within the
-                #     cap. This means a path that hasn't blown the budget
-                #     yet can still pick up one MORE node of any size —
-                #     e.g., a final 10 kb anchor — and the cap only kicks
-                #     in for FURTHER extensions afterward. Stops chain
-                #     extension once the path has clearly wandered too far
-                #     from var content, but doesn't lose paths that reach
-                #     a productive target on the next hop.
                 if bp_enabled:
                     if nxt in var_nodes:
                         new_bp = 0
@@ -88,6 +91,8 @@ def _enum_paths(adj, start, ends, allowed, max_paths=1000, max_path_length=50,
                 else:
                     new_bp = 0
                 new_path = path + [nxt]
+                new_vis = vis_counts.copy()
+                new_vis[nxt] = count + 1
                 if nxt in ends and nxt != start:
                     paths.append(new_path)
                     if len(paths) >= max_paths:
@@ -96,30 +101,39 @@ def _enum_paths(adj, start, ends, allowed, max_paths=1000, max_path_length=50,
                                 limit_counter.get("max_paths_hit", 0) + 1
                         break
                 else:
-                    next_frontier.append((new_path, vis | {nxt}, new_bp))
+                    next_frontier.append((new_path, new_vis, new_bp))
         frontier = next_frontier
     return paths
 
 
 def _enum_dangling(adj, start, allowed, var_nodes, exclude_var_subset,
                     max_paths=1000, max_path_length=50, limit_counter=None,
-                    node_bp=None, max_bp_since_var=5000):
+                    node_bp=None, max_bp_since_var=5000,
+                    depths=None, genome_cov=None, provenance=None):
     """Var-bearing simple paths from `start` that dead-end inside `allowed`.
     Drop a path if its var content is wholly inside `exclude_var_subset`.
-    Same three caps as `_enum_paths` (incl. BP-since-var)."""
+    Same caps as `_enum_paths` (incl. BP-since-var and repeat unrolling)."""
     bp_enabled = max_bp_since_var > 0 and node_bp is not None
     def _bp(n): return node_bp.get(n, 0) if node_bp else 0
+
+    def _get_max_visits(n):
+        if not depths or not genome_cov or not provenance: return 1
+        parent = provenance.get(n, (n,))[0]
+        d = depths.get(parent, genome_cov)
+        return max(1, round(d / genome_cov))
+
     paths, seen = [], set()
     start_bp = 0 if (bp_enabled and start in var_nodes) else _bp(start)
-    frontier = [([start], frozenset({start}), start_bp)]
+    frontier = [([start], {start: 1}, start_bp)]
     while frontier and len(paths) < max_paths:
         next_frontier = []
-        for path, vis, bp_acc in frontier:
+        for path, vis_counts, bp_acc in frontier:
             if len(paths) >= max_paths: break
             curr = path[-1]
             extended = False
             for nxt in adj.get(curr, ()):
-                if nxt in vis: continue
+                count = vis_counts.get(nxt, 0)
+                if count >= _get_max_visits(nxt): continue
                 if nxt not in allowed: continue
                 if len(path) + 1 > max_path_length:
                     if limit_counter is not None:
@@ -139,10 +153,13 @@ def _enum_dangling(adj, start, allowed, var_nodes, exclude_var_subset,
                 else:
                     new_bp = 0
                 extended = True
-                next_frontier.append((path + [nxt], vis | {nxt}, new_bp))
+                new_vis = vis_counts.copy()
+                new_vis[nxt] = count + 1
+                next_frontier.append((path + [nxt], new_vis, new_bp))
             if not extended and len(path) > 1:
                 vs = set(path) & var_nodes
                 if vs and not (vs <= exclude_var_subset):
+                    # For palindromes/repeats, path identity matters for dedup.
                     k = tuple(path) if path[0] < path[-1] else tuple(reversed(path))
                     if k not in seen:
                         seen.add(k); paths.append(list(path))
@@ -165,7 +182,10 @@ def classify(nodes: set[str], edges: set[frozenset],
              max_paths: int = 1000,
              max_path_length: int = 50,
              node_bp: dict[str, int] | None = None,
-             max_bp_since_var: int = 5000) -> dict:
+             max_bp_since_var: int = 5000,
+             depths: dict[str, float] | None = None,
+             genome_cov: float | None = None,
+             provenance: dict[str, tuple] | None = None) -> dict:
     """Appendix-B classifier. Returns verdict dict.
 
     BP-aware path enumeration: when `node_bp` (per-node bp lengths from
@@ -173,7 +193,10 @@ def classify(nodes: set[str], edges: set[frozenset],
     enumeration drops any extension whose accumulated bp since the last
     var node would exceed the threshold. Saves search effort on chains
     of long unlabeled connectors that have already moved far from
-    productive content."""
+    productive content.
+
+    REPEAT UNROLLING: uses `depths` and `genome_cov` to allow multiple
+    visits to the same node if its coverage suggests it is collapsed."""
     var_nodes = {n for n in nodes if var_per_node.get(n)}
     flankL = {n for n in nodes if "flankL" in (label_per_node.get(n, "")).split("+")}
     flankR = {n for n in nodes if "flankR" in (label_per_node.get(n, "")).split("+")}
@@ -206,7 +229,9 @@ def classify(nodes: set[str], edges: set[frozenset],
             sub = classify(comp_nodes, comp_edges, comp_labels, comp_var_per,
                             max_paths=max_paths, max_path_length=max_path_length,
                             node_bp=node_bp,
-                            max_bp_since_var=max_bp_since_var)
+                            max_bp_since_var=max_bp_since_var,
+                            depths=depths, genome_cov=genome_cov,
+                            provenance=provenance)
             sub_results.append(sub)
         return {"class": "separate", **info,
                 "n_var_components": len(var_full),
@@ -282,7 +307,9 @@ def classify(nodes: set[str], edges: set[frozenset],
                               max_paths=max_paths, max_path_length=max_path_length,
                               limit_counter=limits,
                               node_bp=node_bp, var_nodes=var_nodes,
-                              max_bp_since_var=max_bp_since_var):
+                              max_bp_since_var=max_bp_since_var,
+                              depths=depths, genome_cov=genome_cov,
+                              provenance=provenance):
             if not any(n in var_nodes for n in p): continue
             if _is_closed_endpoints(p):
                 closed.setdefault(_canonical(p), p)
@@ -307,7 +334,9 @@ def classify(nodes: set[str], edges: set[frozenset],
                                   max_paths=max_paths, max_path_length=max_path_length,
                                   limit_counter=limits,
                                   node_bp=node_bp,
-                                  max_bp_since_var=max_bp_since_var):
+                                  max_bp_since_var=max_bp_since_var,
+                                  depths=depths, genome_cov=genome_cov,
+                                  provenance=provenance):
             if p[-1] in flank_anchored and p[-1] != s: continue
             dangling.setdefault(_canonical(p), p)
 
