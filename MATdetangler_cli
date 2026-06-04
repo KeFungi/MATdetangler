@@ -1,0 +1,750 @@
+#!/bin/bash
+# MATdetangler — main CLI wrapper.
+#
+# Subcommands:
+#   MATdetangler run       ...  run the per-sample pipeline (one sample)
+#   MATdetangler batch     ...  loop `run` over a samplesheet (TSV: sample r1 r2 spades_dir)
+#   MATdetangler consensus ...  run only steps 6+7 (map reads → samtools consensus → QC)
+#                              on a sample whose `primary_alleles.fasta` is already on disk
+#   MATdetangler cluster   ...  multi-sample mating-type clustering (align once + cut [thresh])
+#
+# This is a thin Bash wrapper; the heavy lifting is in matdetangler/*.py and map_consensus.sh.
+set -uo pipefail
+HERE="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+export PYTHONPATH="$HERE:${PYTHONPATH:-}"
+PY="${PYTHON:-python3}"
+
+usage(){
+cat <<EOF
+MATdetangler — recover the two alleles of a mating-type-like locus from short reads.
+
+Usage:
+  MATdetangler run       [options]
+  MATdetangler batch     --samplesheet samples.tsv [common options]
+  MATdetangler consensus --sample S --reads-r1 R1 --reads-r2 R2 --outdir D [--locus-ref FA] [--threads N]
+                          (runs only steps 6+7 — sample dir must already contain primary_alleles.fasta + queries/)
+  MATdetangler cluster align --results-dir DIR --queries-dir DIR --out-dir DIR
+  MATdetangler cluster cut   --align-dir DIR    --results-dir DIR --out-dir DIR [--thresh 0.90]
+
+\`MATdetangler run\` options:
+  --sample NAME                  sample name (used in output paths + allele headers)
+  --reads-r1 FILE                trimmed R1 fastq.gz (OPTIONAL — only needed
+                                 when --make-consensus is set; the pipeline
+                                 is reads-free through step 5 by default)
+  --reads-r2 FILE                trimmed R2 fastq.gz (OPTIONAL — see --reads-r1)
+  --spades-dir DIR               directory containing kXX/{contigs.fasta,assembly_graph_after_simplification.gfa}
+  --locus-ref FASTA              locus DNA reference (HD region + both flanks; single record)
+  --proteins FASTA               curated protein fasta (HD1, HD2, ...) — flanks are auto-derived
+                                 as everything outside the tblastn HD-hit envelope on locus-ref
+  --outdir DIR                   output root (per-sample dir created underneath)
+
+Optional inputs:
+  --genome-coverage FLOAT        genome mean depth (bp-equivalent units); if omitted,
+                                 estimated per-k from SPAdes contigs.fasta cov_ headers
+                                 (median across contigs >= --contig-depth-size-cut bp).
+  --ks LIST                      k subdirs to consider (default: k45)
+  --threads N                    threads for blast/bowtie2/mafft (default: 4)
+  --expected-count {1,2}         1=haploid, 2=dikaryon (default: 2)
+  --debug                        trace every shell command (set -x with timestamps),
+                                 unbuffer python stdout, and skip .pyc creation.
+  --re-blast                     Wipe the per-sample cached blast result TSVs
+                                 (<outdir>/<sample>/blast_*.tsv) before running.
+                                 Invoke whenever you've CHANGED blast parameters
+                                 (pid/minlen/threshold cutoffs) — otherwise the
+                                 named result files on disk are reused as-is
+                                 (file-existence check only; no input hashing).
+  --asymmetric-bfs               step-3 BFS may ABSORB repeat segments (depth >
+                                 2.0 x genome-cov) into the neighborhood but
+                                 does NOT expand neighbors from them. Default OFF
+                                 (symmetric BFS — repeats expand normally). Turn
+                                 on to dampen combinatorial blow-up at high-copy
+                                 regions.
+  --skip-pick                    QC/dev mode: skip step 4 (pick_alleles) AND
+                                 step 8 (summary row); alias bubble_alleles.fasta
+                                 as primary_alleles.fasta so steps 5, 6, 7 run
+                                 on the full candidate pool from step 3 without
+                                 picker collapse.
+                                 Default ON for now.
+  --no-skip-pick                 disable --skip-pick; run the full pipeline
+                                 including steps 4 and 8.
+  --skip-consensus               Skip step 6 (competitive mapping + samtools
+                                 consensus) and the consensus-derived parts of
+                                 step 7 (identity_consensus, consensus_qc).
+                                 Default ON — pipeline is reads-free through
+                                 step 5. --reads-r1/--reads-r2 NOT required.
+  --make-consensus            Opt in to step 6. Requires --reads-r1/--reads-r2.
+  --continue                     re-run with additional k's, REUSING existing
+                                 sample-level outputs:
+                                  - step 1 (input_process): skipped if
+                                    queries/manifest.json exists
+                                  - step 2.05 (genome cov): reuses cached
+                                    _genome_cov.txt (else recomputes)
+                                  - per-k step 2.1/2.2/3: skipped for any k
+                                    whose bubble_alleles_<k>.fasta is on disk;
+                                    new k's run normally
+                                  - steps 4-8 then run on the combined pool
+                                 Also sets --no-skip-pick by default so the
+                                 picker + downstream run. To still QC instead
+                                 of picking, pass --skip-pick AFTER --continue.
+
+Thresholds (override the defaults at your own risk):
+  --blastn-pid 80   --blastn-minlen 100
+  --tblastn-pid 30  --tblastn-aa 50
+  --tblastx-pid 30  --tblastx-aa 50
+  --flank-pid 85    --flank-minlen 100
+  --max-locus-len AUTO  --min-allele-len 2000
+     AUTO (default) = envelope + 2*flank from manifest.json (typically ~10-15 kb on
+     Pcub at --max-flank-len 2000). Tighter budget -> step 4 pairwise MAFFT is much
+     faster because raw whole-contig anchors get tblastn-trimmed before scoring.
+     Pass `--max-locus-len 0` to disable the cap (historical no-trim behavior).
+  --ks k45                      (single k; was k21,k33,k55 before)
+  --contig-depth-size-cut 5000  min contig length (bp) used by the per-k
+                                genome-cov estimator (median cov_ from SPAdes
+                                contigs.fasta). Lower -> more contigs but more
+                                short-tip noise. Bp-equivalent units (matches
+                                GFA DP:f: segment depths used downstream).
+
+Per-K caller pass-through (forwarded to matdetangler.run_per_k; defaults applied
+there if a flag is omitted):
+  --min-allele-bp 0             hard min-bp floor on the dedup pool; 0 disables (default)
+  --divergence-threshold 0.01   RC-aware HW edit-distance dedup threshold (1% default)
+  --seeds   {var,flank,both}    BFS seed source (default "both")
+  --cov-filter {on,off}         depth filter on BFS neighborhood (default "on")
+  --max-paths 1000              cap on simple paths per anchor in classifier
+  --max-path-length 50          cap on per-path length (# post-P1 nodes)
+  --max-bp-since-var 5000       bp-aware path enumeration cap; drop partial paths
+                                whose accumulated bp since the last var-bearing node
+                                exceeds this. 0 disables.
+  --locus-padding 4000          tblastn-trim padding around HD envelope (bp)
+  --lo-mult 0.2                 cov filter lower band (× per-k haploid cov D_k)
+  --hi-mult 2.0                 cov filter upper band (× D_k)
+  --init-nhop 3                 initial BFS hop count
+  --max-nhop 10                 maximum BFS hop count
+
+\`MATdetangler batch\` requires --samplesheet plus the common shared options above (locus-ref, proteins,
+outdir, threads, etc.). The samplesheet is a 4-column TSV (no header): sample r1 r2 spades_dir.
+r1 / r2 may be "-" when --make-consensus is off.
+
+\`MATdetangler cluster\` is for multi-sample mating-type assignment. Run 'align' once to extract HD-cores
+and build the pairwise similarity matrix; run 'cut' as often as you like with different --thresh values
+on the cached matrix (no re-alignment).
+EOF
+}
+
+[ $# -lt 1 ] && { usage; exit 1; }
+SUB="$1"; shift
+
+case "$SUB" in
+  -h|--help) usage; exit 0;;
+  run) ;;
+  batch) ;;
+  cluster) ;;
+  consensus) ;;
+  *) usage; exit 1;;
+esac
+
+# ----- arg parsing (shared) -----
+SAMPLE=""; R1=""; R2=""; SPADES_DIR=""; LOCUS_REF=""; PROTEINS=""; OUTDIR=""
+REPEATS=""; GENOMECOV=""; KS="k45"
+INIT_HOPS=""; MAX_HOPS=""    # blank = use graph_path_search defaults (5, 10)
+# KNOWN_DEGHD removed 2026-05-30 — degHD detection is no longer plumbed by the wrapper.
+# Python modules still accept --known-degHD if invoked manually.
+# QC/dev mode: SKIP_PICK=1 (default) skips step 4 (pick_alleles)
+# and 8 (summary), aliasing bubble_alleles.fasta as primary_alleles.fasta so steps 5-7
+# run on the full candidate pool. Pass --no-skip-pick for the full pipeline.
+SKIP_PICK=1
+# CONTINUE=1 reuses existing per-k bubble_alleles_<k>.fasta files (skips 2.1/2.2/3 for
+# k's already done) and runs through to the picker + downstream. Sets SKIP_PICK=0 by
+# default so the picker runs; pass --skip-pick AFTER --continue to keep QC mode.
+CONTINUE=0
+THREADS=4; EXPECTED=2
+BLASTN_PID=80; BLASTN_MINLEN=100; TBLASTN_PID=30; TBLASTN_AA=50; TBLASTX_PID=30; TBLASTX_AA=50
+FLANK_PID=85; FLANK_MINLEN=100; DEGHD_ID=95; DEGHD_MINLEN=1000
+MAX_LOC="auto"; MIN_AL=2000; SAMPLESHEET=""; MAX_FLANK_LEN=2000
+MAX_WALK_BP="0"      # DFS walk-bp cap (graph_path_search step 3, independent of --max-locus-len);
+                     # default 0 = no cap. Empirically the simple-path rule + max_nodes=15
+                     # already bound DFS enumeration on real GFAs; bp budget is redundant.
+# MAX_LOC sentinel:
+#   "auto" or "" (default) = read manifest.json's derived_max_locus_len
+#   "0"                    = DISABLE the cap (historical no-trim behavior)
+#   <integer>              = use that explicit budget
+# MAX_WALK_BP sentinel:
+#   "0" (default)          = no DFS walk-bp cap
+#   <integer>              = explicit cap (rarely needed)
+CONTIG_DEPTH_CUT=5000   # --contig-depth-size-cut : min contig length (bp) used by
+                        #   the per-k genome-cov estimator (median cov_ from
+                        #   SPAdes contigs.fasta). Lower -> more contigs, more
+                        #   short-tip noise. 5000 is the default that matched
+                        #   bp-equivalent units on the vietnam_BD1394 test set.
+SKIP_CONSENSUS=1        # --skip-consensus / --make-consensus : skip step 6
+                        #   (map_consensus.sh) and the consensus-derived parts
+                        #   of step 7 (identity-on-consensus, consensus_qc).
+                        #   Default ON — keeps the pipeline reads-free through
+                        #   step 5 (graph_paths annotation). When OFF, --reads-r1
+                        #   and --reads-r2 become required.
+CLUSTER_ACTION=""; CLUSTER_THRESH=0.90; ALIGN_DIR=""; RESULTS_DIR=""; QUERIES_DIR=""; CL_OUT=""
+DEBUG=0       # --debug enables: set -x for every command, $PS4 timestamps,
+              # PYTHONDONTWRITEBYTECODE=1, and unbuffered Python stdout.
+RE_BLAST=0      # --re-blast     : wipe <sample_dir>/blast_*.tsv first so all cached
+                #                  blast searches re-run. Invoke when blast params change.
+ASYM_BFS=0      # --asymmetric-bfs : step-3 BFS absorbs repeats but doesn't expand FROM them
+
+# Per-K caller tunables — passed through to matdetangler.run_per_k.
+# Each defaults to empty here, meaning "let run_per_k apply its own default".
+MIN_ALLELE_BP=""        # hard min-bp floor on the dedup pool          (default 3000)
+DIV_THRESHOLD=""        # RC-aware edlib HW divergence threshold       (default 0.01)
+SEEDS_MODE=""           # BFS seed source: var | flank | both          (default both)
+COV_FILTER=""           # depth filter on BFS neighborhood: on | off   (default on)
+MAX_PATHS=""            # cap on simple paths per anchor in classifier (default 50)
+MAX_PATH_LENGTH=""      # cap on per-path length (# post-P1 nodes)     (default 15)
+MAX_BP_SINCE_VAR=""     # bp-aware path enumeration cap; 0 disables    (default 0)
+LOCUS_PADDING=""        # tblastn-trim padding around HD envelope (bp) (default 4000)
+LO_MULT=""              # cov filter lower band as multiple of D_k     (default 0.2)
+HI_MULT=""              # cov filter upper band as multiple of D_k     (default 2.0)
+INIT_NHOP=""            # initial BFS hop count                        (default 3)
+MAX_NHOP=""             # maximum BFS hop count                        (default 10)
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --sample)         SAMPLE="$2"; shift 2;;
+    --reads-r1)       R1="$2"; shift 2;;
+    --reads-r2)       R2="$2"; shift 2;;
+    --spades-dir)     SPADES_DIR="$2"; shift 2;;
+    --locus-ref)      LOCUS_REF="$2"; shift 2;;
+    --proteins)       PROTEINS="$2"; shift 2;;
+    --outdir)         OUTDIR="$2"; shift 2;;
+    --repeats)        REPEATS="$2"; shift 2;;
+    --genome-coverage) GENOMECOV="$2"; shift 2;;
+    --ks)             KS="$2"; shift 2;;
+    --threads)        THREADS="$2"; shift 2;;
+    --expected-count) EXPECTED="$2"; shift 2;;
+    --skip-pick)      SKIP_PICK=1; shift;;
+    --no-skip-pick)   SKIP_PICK=0; shift;;
+    --skip-consensus)    SKIP_CONSENSUS=1; shift;;
+    --make-consensus) SKIP_CONSENSUS=0; shift;;
+    --continue)       CONTINUE=1; SKIP_PICK=0; shift;;
+    --blastn-pid)     BLASTN_PID="$2"; shift 2;;
+    --blastn-minlen)  BLASTN_MINLEN="$2"; shift 2;;
+    --tblastn-pid)    TBLASTN_PID="$2"; shift 2;;
+    --tblastn-aa)     TBLASTN_AA="$2"; shift 2;;
+    --tblastx-pid)    TBLASTX_PID="$2"; shift 2;;
+    --tblastx-aa)     TBLASTX_AA="$2"; shift 2;;
+    --flank-pid)      FLANK_PID="$2"; shift 2;;
+    --flank-minlen)   FLANK_MINLEN="$2"; shift 2;;
+    --degHD-id)       DEGHD_ID="$2"; shift 2;;
+    --degHD-minlen)   DEGHD_MINLEN="$2"; shift 2;;
+    --max-locus-len)  MAX_LOC="$2"; shift 2;;
+    --max-walk-bp)    MAX_WALK_BP="$2"; shift 2;;
+    --min-allele-len) MIN_AL="$2"; shift 2;;
+    --max-flank-len)  MAX_FLANK_LEN="$2"; shift 2;;
+    --init-hops)      INIT_HOPS="$2"; shift 2;;
+    --max-hops)       MAX_HOPS="$2"; shift 2;;
+    # Per-K caller pass-through tunables (forwarded to matdetangler.run_per_k):
+    --min-allele-bp)        MIN_ALLELE_BP="$2"; shift 2;;
+    --divergence-threshold) DIV_THRESHOLD="$2"; shift 2;;
+    --seeds)                SEEDS_MODE="$2"; shift 2;;
+    --cov-filter)           COV_FILTER="$2"; shift 2;;
+    --max-paths)            MAX_PATHS="$2"; shift 2;;
+    --max-path-length)      MAX_PATH_LENGTH="$2"; shift 2;;
+    --max-bp-since-var)     MAX_BP_SINCE_VAR="$2"; shift 2;;
+    --locus-padding)        LOCUS_PADDING="$2"; shift 2;;
+    --lo-mult)              LO_MULT="$2"; shift 2;;
+    --hi-mult)              HI_MULT="$2"; shift 2;;
+    --init-nhop)            INIT_NHOP="$2"; shift 2;;
+    --max-nhop)             MAX_NHOP="$2"; shift 2;;
+    --contig-depth-size-cut) CONTIG_DEPTH_CUT="$2"; shift 2;;
+    --samplesheet)    SAMPLESHEET="$2"; shift 2;;
+    align|cut)        CLUSTER_ACTION="$1"; shift;;
+    --results-dir)    RESULTS_DIR="$2"; shift 2;;
+    --queries-dir)    QUERIES_DIR="$2"; shift 2;;
+    --align-dir)      ALIGN_DIR="$2"; shift 2;;
+    --out-dir)        CL_OUT="$2"; shift 2;;
+    --thresh)         CLUSTER_THRESH="$2"; shift 2;;
+    --debug)          DEBUG=1; shift;;
+    --re-blast)       RE_BLAST=1;       shift;;
+    --asymmetric-bfs) ASYM_BFS=1;       shift;;
+    -h|--help)        usage; exit 0;;
+    *) echo "unknown option: $1" >&2; usage; exit 1;;
+  esac
+done
+
+if [ "$DEBUG" -eq 1 ]; then
+  export PS4='+[\D{%H:%M:%S}] ${BASH_SOURCE##*/}:${LINENO}: '
+  export PYTHONDONTWRITEBYTECODE=1
+  export PYTHONUNBUFFERED=1
+  set -x
+  echo "[debug] DEBUG=1 — every shell command is traced; python stdout is line-buffered. Cached blast TSVs live in <outdir>/<sample>/blast_*.tsv; --re-blast wipes them. DEEP_SEARCH env var (auto|always|never) is independent."
+fi
+
+# ----- cluster -----
+if [ "$SUB" = "cluster" ]; then
+  case "$CLUSTER_ACTION" in
+    align)
+      [ -z "$RESULTS_DIR" ] || [ -z "$QUERIES_DIR" ] || [ -z "$CL_OUT" ] && { echo "cluster align needs --results-dir --queries-dir --out-dir" >&2; exit 1; }
+      "$PY" -m matdetangler.cluster align --results-dir "$RESULTS_DIR" --queries-dir "$QUERIES_DIR" --out-dir "$CL_OUT" --threads "$THREADS"
+      exit $?;;
+    cut)
+      [ -z "$ALIGN_DIR" ] || [ -z "$RESULTS_DIR" ] || [ -z "$CL_OUT" ] && { echo "cluster cut needs --align-dir --results-dir --out-dir" >&2; exit 1; }
+      "$PY" -m matdetangler.cluster cut --align-dir "$ALIGN_DIR" --results-dir "$RESULTS_DIR" --out-dir "$CL_OUT" --thresh "$CLUSTER_THRESH"
+      exit $?;;
+    *) echo "cluster needs 'align' or 'cut'" >&2; exit 1;;
+  esac
+fi
+
+# ----- consensus: run only step 6 (map_consensus) + step 7 (consensus QC) on
+# a sample whose primary_alleles.fasta is already on disk from a prior `run`.
+# Useful when the reads-free run was done first and you now want the read-derived
+# consensus + QC without rerunning steps 1-5.
+if [ "$SUB" = "consensus" ]; then
+  [ -z "$SAMPLE" ] || [ -z "$R1" ] || [ -z "$R2" ] || [ -z "$OUTDIR" ] && {
+    echo "consensus needs --sample --reads-r1 --reads-r2 --outdir" >&2; exit 1; }
+  SDIR="$OUTDIR/$SAMPLE"
+  LDIR="$SDIR/logs"; mkdir -p "$LDIR"
+  PRIMARY="$SDIR/primary_alleles.fasta"
+  QDIR="${QUERIES_DIR:-$SDIR/queries}"
+  [ -s "$PRIMARY" ] || { echo "[$SAMPLE] no primary_alleles.fasta at $PRIMARY — run \`MATdetangler run\` first" >&2; exit 1; }
+  [ -d "$QDIR" ] || { echo "[$SAMPLE] queries dir not found: $QDIR" >&2; exit 1; }
+  # locus-ref: required for HD-core MAFFT in step 7; allow override or fall back to queries-dir sibling
+  if [ -z "$LOCUS_REF" ]; then
+    [ -s "$SDIR/queries/locus.fasta" ] && LOCUS_REF="$SDIR/queries/locus.fasta" || {
+      echo "--locus-ref required (or place locus.fasta in $SDIR/queries/)" >&2; exit 1; }
+  fi
+
+  echo "=== [$SAMPLE] 6) competitive mapping + consensus ==="
+  bash "$HERE/matdetangler/map_consensus.sh" "$SAMPLE" "$PRIMARY" "$R1" "$R2" "$SDIR" "$THREADS" "$QDIR" "${REPEATS:-}" 2>&1 | tee "$LDIR/06_map_consensus.log"
+
+  echo "=== [$SAMPLE] 7a) pairwise identity on PICKS (graph-derived allele1 vs allele2) ==="
+  "$PY" -m matdetangler.pairwise_identity --primary-alleles "$PRIMARY" \
+    --queries-dir "$QDIR" --locus-ref "$LOCUS_REF" \
+    --out-tsv "$SDIR/identity.tsv" 2>&1 | tee "$LDIR/07a_identity_picks.log"
+
+  echo "=== [$SAMPLE] 7b) pairwise identity on CONSENSUS (read-derived allele1 vs allele2) ==="
+  CONS_FA="$SDIR/consensus_alleles.fasta"
+  if [ -s "$CONS_FA" ] && [ "$(grep -c '^>' "$CONS_FA")" -ge 2 ]; then
+    "$PY" -m matdetangler.pairwise_identity --primary-alleles "$CONS_FA" \
+      --queries-dir "$QDIR" --locus-ref "$LOCUS_REF" \
+      --out-tsv "$SDIR/identity_consensus.tsv" 2>&1 | tee "$LDIR/07b_identity_consensus.log"
+  else
+    echo "  skipped: need >= 2 records in consensus_alleles.fasta" | tee "$LDIR/07b_identity_consensus.log"
+  fi
+
+  echo "=== [$SAMPLE] 7c) consensus completeness re-check (tblastn proteins + blastn flanks on consensus) ==="
+  if [ -s "$CONS_FA" ]; then
+    "$PY" -m matdetangler.consensus_qc --consensus "$CONS_FA" \
+      --queries-dir "$QDIR" --out-tsv "$SDIR/consensus_qc.tsv" \
+      --threads "$THREADS" 2>&1 | tee "$LDIR/07c_consensus_qc.log"
+  else
+    echo "  skipped: consensus_alleles.fasta not produced" | tee "$LDIR/07c_consensus_qc.log"
+  fi
+
+  exit 0
+fi
+
+# ----- batch -----
+if [ "$SUB" = "batch" ]; then
+  [ -s "$SAMPLESHEET" ] || { echo "--samplesheet required for batch" >&2; exit 1; }
+  while IFS=$'\t' read -r S r1 r2 sp || [ -n "$S" ]; do
+    [ -z "$S" ] && continue
+    case "$S" in \#*) continue;; esac
+    echo ">>> $S"
+    "$0" run --sample "$S" --reads-r1 "$r1" --reads-r2 "$r2" --spades-dir "$sp" \
+      --locus-ref "$LOCUS_REF" --proteins "$PROTEINS" --outdir "$OUTDIR" \
+      \
+      ${REPEATS:+--repeats "$REPEATS"} \
+      ${GENOMECOV:+--genome-coverage "$GENOMECOV"} \
+      --ks "$KS" --threads "$THREADS" --expected-count "$EXPECTED"
+  done < "$SAMPLESHEET"
+  exit 0
+fi
+
+# ----- run (per-sample) -----
+[ -z "$SAMPLE" ]   && { echo "--sample required"   >&2; exit 1; }
+# R1/R2 are only required when consensus mapping will run (step 6).
+# With --skip-consensus (default ON), the pipeline is reads-free through step 5.
+if [ "$SKIP_CONSENSUS" -eq 0 ]; then
+  [ -z "$R1" ] || [ -z "$R2" ] && { echo "--reads-r1 and --reads-r2 required when --make-consensus is set" >&2; exit 1; }
+fi
+[ -z "$SPADES_DIR" ] && { echo "--spades-dir required" >&2; exit 1; }
+[ -s "$LOCUS_REF" ] || { echo "--locus-ref required" >&2; exit 1; }
+[ -s "$PROTEINS" ]  || { echo "--proteins required (curated protein fasta — see annotation.py)" >&2; exit 1; }
+[ -z "$OUTDIR" ]   && { echo "--outdir required"   >&2; exit 1; }
+
+SDIR="$OUTDIR/$SAMPLE"; QDIR="$SDIR/queries"; LDIR="$SDIR/logs"
+mkdir -p "$SDIR" "$QDIR" "$LDIR"
+
+# Per-sample blast cache — descriptive-name model: heavy "search contigs/GFA"
+# blasts write their hit tables as <sample_dir>/blast_<...>.tsv. File existence
+# is the ONLY freshness check; the user invokes --re-blast to force a redo
+# when blast parameters have changed.
+if [ "$RE_BLAST" -eq 1 ]; then
+  n=$(find "$SDIR" -maxdepth 1 -name 'blast_*.tsv' -type f 2>/dev/null | wc -l)
+  if [ "$n" -gt 0 ]; then
+    echo "[--re-blast] removing $n cached blast TSV(s) under $SDIR"
+    find "$SDIR" -maxdepth 1 -name 'blast_*.tsv' -type f -delete
+  fi
+fi
+
+if [ "$CONTINUE" -eq 1 ] && [ -s "$QDIR/manifest.json" ]; then
+  echo "=== [$SAMPLE] 1) input_process -> SKIPPED (--continue: queries/manifest.json exists) ==="
+else
+  echo "=== [$SAMPLE] 1) input_process -> queries (tblastn proteins on locus -> trim flanks) ==="
+  "$PY" -m matdetangler.input_process --locus-ref "$LOCUS_REF" --proteins "$PROTEINS" \
+    --max-flank-len "$MAX_FLANK_LEN" \
+    --cache-dir "$SDIR" \
+    --outdir "$QDIR" --threads "$THREADS" 2>&1 | tee "$LDIR/01_input_process.log"
+fi
+# Resolve --max-locus-len:
+#   "auto" or unset -> manifest's derived budget (envelope + 2 trimmed flanks)
+#   "0"             -> DISABLE the cap (historical no-trim behavior)
+#   <int>           -> use that explicit budget
+if [ "$MAX_LOC" = "auto" ] || [ -z "$MAX_LOC" ]; then
+  if [ -s "$QDIR/manifest.json" ]; then
+    MAX_LOC=$("$PY" -c "
+import json
+m = json.load(open('$QDIR/manifest.json'))
+print(int(m.get('derived_max_locus_len') or 0))
+")
+    echo "  max_locus_len = $MAX_LOC bp (default: derived from manifest = envelope + 2x flank)"
+  else
+    MAX_LOC=0
+    echo "  max_locus_len = 0 (no bp cap; manifest.json missing -- cannot derive default)"
+  fi
+elif [ "$MAX_LOC" = "0" ]; then
+  echo "  max_locus_len = 0 (cap DISABLED — user-supplied --max-locus-len 0)"
+else
+  echo "  max_locus_len = $MAX_LOC bp (user-supplied)"
+fi
+
+# Resolve --max-walk-bp (DFS walk-length cap, used by graph_path_search step 3).
+# Default 0 = no cap; max_nodes + simple-path rule already bound DFS enumeration.
+if [ "$MAX_WALK_BP" = "0" ] || [ -z "$MAX_WALK_BP" ]; then
+  echo "  max_walk_bp   = 0 (no DFS walk-bp cap — default)"
+  MAX_WALK_BP=0
+else
+  echo "  max_walk_bp   = $MAX_WALK_BP bp (user-supplied)"
+fi
+
+echo "=== [$SAMPLE] 2) candidate contigs (from SPAdes contigs.fasta) ==="
+# Step 2.05 (bowtie2-based genome coverage from locus-flank windows) has been
+# REMOVED — it required reads, which steps 1-6 are now reads-free of. Genome
+# coverage is now derived per-k from SPAdes contigs.fasta `cov_` headers
+# (median across contigs >= 5000 bp; bp-equivalent units; same scale as the
+# GFA DP:f: segment depths used in repeat detection). Per-k value is cached
+# to genome_cov_spades_k<K>.txt and computed inside the per-k loop below.
+if [ -n "$GENOMECOV" ]; then
+  echo "[genome_cov] user-supplied = ${GENOMECOV} (--genome-coverage), used for ALL k's"
+fi
+
+# ----- Per-k outer loop: do step 2 + step 3 ONE k at a time. As soon as a single
+#       k delivers >= --expected-count divergent complete alleles, break — there
+#       is no need to keep paying tblastn cost on the remaining ks.
+# Per-k outputs (cand_*_<k>.fasta) are accumulated into cand_*.fasta as we go.
+[ "$CONTINUE" -eq 1 ] && echo "  --continue: reusing per-k outputs where present; cumulative pools rebuilt from per-k files"
+: > "$SDIR/bubble_alleles.fasta"
+: > "$SDIR/bubble_alleles.ann.tsv"
+DONE_K=""
+for K_ONE in ${KS//,/ }; do
+  echo "=== [$SAMPLE] processing $K_ONE ==="
+
+  # --- --continue short-circuit: this k already attempted? ---
+  # Use -e (exists) not -s (non-empty): a 0-byte bubble_alleles_${k}.fasta means
+  # "this k was tried, produced nothing" — still no need to re-run.
+  # Cumulative pools get rebuilt after the loop (see below), so no in-loop cat here.
+  if [ "$CONTINUE" -eq 1 ] && [ -e "$SDIR/bubble_alleles_${K_ONE}.fasta" ]; then
+    nrec=$(grep -c '^>' "$SDIR/bubble_alleles_${K_ONE}.fasta" 2>/dev/null || echo 0)
+    echo "  [$K_ONE] --continue: bubble_alleles_${K_ONE}.fasta exists (${nrec} records) -> reusing (skip 2.1/2.2/3)"
+    continue
+  fi
+
+  # --- 2.05: per-k genome coverage from SPAdes contigs.fasta ---
+  # Median cov_ across contigs >= 5000 bp (bp-equivalent units, matches GFA DP:f:).
+  # User --genome-coverage overrides for all k's. Cached as genome_cov_spades_k<K>.txt.
+  K_COV_FILE="$SDIR/genome_cov_spades_${K_ONE}.txt"
+  if [ -n "$GENOMECOV" ]; then
+    K_GENOMECOV="$GENOMECOV"
+  elif [ "$CONTINUE" -eq 1 ] && [ -s "$K_COV_FILE" ]; then
+    K_GENOMECOV=$(cat "$K_COV_FILE")
+    echo "  [$K_ONE] --continue: reusing cached genome_cov = ${K_GENOMECOV} (from $K_COV_FILE)"
+  else
+    K_CONTIGS="$SPADES_DIR/$K_ONE/contigs.fasta"
+    if [ ! -s "$K_CONTIGS" ]; then
+      echo "  [$K_ONE] WARN: $K_CONTIGS missing/empty; genome_cov = 0 (repeat detection disabled this k)"
+      K_GENOMECOV="0"
+    else
+      K_GENOMECOV=$( "$PY" -c "
+from matdetangler.input_process import estimate_genome_cov_from_contigs
+v = estimate_genome_cov_from_contigs('$K_CONTIGS', min_len=$CONTIG_DEPTH_CUT)
+print(f'{v:.4f}')
+" )
+      echo "  [$K_ONE] genome_cov = ${K_GENOMECOV} (median cov_ across contigs >= ${CONTIG_DEPTH_CUT} bp in $K_CONTIGS)"
+    fi
+    echo "$K_GENOMECOV" > "$K_COV_FILE"
+  fi
+
+  # --- 3: per-K allele caller (replaces graph_path_search + pick_alleles) ---
+  # The legacy step-2 anchor_search (contigs + segment-fallback) was a
+  # diagnostic-only BLAST pass — its outputs were never consumed by the
+  # caller. Removed: run_per_k.py does its own GFA-segment BLAST from
+  # scratch and uses labels to seed the BFS.
+  echo "  [$K_ONE] step 3 run_per_k (new caller)"
+  GFA_HERE="$SPADES_DIR/$K_ONE/assembly_graph_after_simplification.gfa"
+  GS_RC=0
+  # Per-K caller pass-through tunables — only forwarded when set (so
+  # run_per_k.py's own defaults remain authoritative when the wrapper
+  # is invoked without these flags).
+  PERK_EXTRA=()
+  [ -n "$MIN_ALLELE_BP"   ] && PERK_EXTRA+=(--min-allele-bp        "$MIN_ALLELE_BP")
+  [ -n "$DIV_THRESHOLD"   ] && PERK_EXTRA+=(--divergence-threshold "$DIV_THRESHOLD")
+  [ -n "$SEEDS_MODE"      ] && PERK_EXTRA+=(--seeds                "$SEEDS_MODE")
+  [ -n "$COV_FILTER"      ] && PERK_EXTRA+=(--cov-filter           "$COV_FILTER")
+  [ -n "$MAX_PATHS"       ] && PERK_EXTRA+=(--max-paths            "$MAX_PATHS")
+  [ -n "$MAX_PATH_LENGTH" ] && PERK_EXTRA+=(--max-path-length      "$MAX_PATH_LENGTH")
+  [ -n "$MAX_BP_SINCE_VAR" ] && PERK_EXTRA+=(--max-bp-since-var    "$MAX_BP_SINCE_VAR")
+  [ -n "$LOCUS_PADDING"   ] && PERK_EXTRA+=(--locus-padding        "$LOCUS_PADDING")
+  [ -n "$LO_MULT"         ] && PERK_EXTRA+=(--lo-mult              "$LO_MULT")
+  [ -n "$HI_MULT"         ] && PERK_EXTRA+=(--hi-mult              "$HI_MULT")
+  [ -n "$INIT_NHOP"       ] && PERK_EXTRA+=(--init-nhop            "$INIT_NHOP")
+  [ -n "$MAX_NHOP"        ] && PERK_EXTRA+=(--max-nhop             "$MAX_NHOP")
+  "$PY" -u -m matdetangler.run_per_k --sample "$SAMPLE" --k "$K_ONE" \
+    --gfa "$GFA_HERE" \
+    --queries-dir "$QDIR" \
+    --hd-proteins "$PROTEINS" \
+    --cov-file "$K_COV_FILE" \
+    --outdir "$SDIR" --threads "$THREADS" \
+    "${PERK_EXTRA[@]}" \
+    2>&1 | tee "$LDIR/03_run_per_k_${K_ONE}.log" || GS_RC=$?
+  # Backward-compat alias: bubble_alleles_${K_ONE}.fasta points to the new alleles.fasta
+  if [ -s "$SDIR/$K_ONE/alleles.fasta" ]; then
+    cp -f "$SDIR/$K_ONE/alleles.fasta" "$SDIR/bubble_alleles_${K_ONE}.fasta"
+  fi
+
+  if [ "$GS_RC" -eq 0 ]; then
+    echo "[$SAMPLE] $K_ONE caller produced result.tsv (verdict pending cross-K pick)"
+    [ -z "$DONE_K" ] && DONE_K="$K_ONE"
+  else
+    echo "[$SAMPLE] $K_ONE caller exit=$GS_RC; continuing next k"
+  fi
+done
+if [ -z "$DONE_K" ]; then
+  echo "[$SAMPLE] no k produced a per-k result; downstream may fail"
+fi
+
+# Rebuild cumulative bubble_alleles pool from every per-k file that exists.
+: > "$SDIR/bubble_alleles.fasta"
+: > "$SDIR/bubble_alleles.ann.tsv"
+for K_ONE in ${KS//,/ }; do
+  [ -s "$SDIR/bubble_alleles_${K_ONE}.fasta" ] && cat "$SDIR/bubble_alleles_${K_ONE}.fasta" >> "$SDIR/bubble_alleles.fasta"
+done
+echo "[$SAMPLE] cumulative bubble_alleles.fasta rebuilt from per-k files: $(grep -c '^>' "$SDIR/bubble_alleles.fasta") records"
+
+PRIMARY="$SDIR/primary_alleles.fasta"
+
+if [ "$SKIP_PICK" -eq 1 ]; then
+  echo "=== [$SAMPLE] 4) pick alleles    -> SKIPPED (--skip-pick) ==="
+  echo "  QC/dev mode: aliasing bubble_alleles.fasta as primary_alleles.fasta so steps 6+ run on the full candidate pool."
+  if [ -s "$SDIR/bubble_alleles.fasta" ]; then
+    cp "$SDIR/bubble_alleles.fasta" "$PRIMARY"
+  else
+    echo "[$SAMPLE] step 3 produced no bubble_alleles.fasta; nothing to QC; aborting" >&2; exit 1
+  fi
+else
+  # ----- Step 4: cross-K pick (NEW — replaces pick_alleles) -----
+  # pick_k consolidates the per-K result.tsv files under $SDIR/<k>/ into a
+  # single picks.tsv (legacy schema, one row per allele) + picks_summary.tsv
+  # (sample-level new schema) + primary_alleles.fasta (concatenated FASTA).
+  echo "=== [$SAMPLE] 4) pick_k cross-K consolidation ==="
+  "$PY" -u -m matdetangler.pick_k --outdir "$SDIR" \
+    --picks-tsv "$SDIR/picks.tsv" \
+    --primary-fasta "$PRIMARY" \
+    2>&1 | tee "$LDIR/04_pick_k.log"
+fi
+
+[ -s "$PRIMARY" ] || { echo "[$SAMPLE] no primary_alleles.fasta (step 4 picked nothing or step 3 yielded nothing); aborting downstream" >&2; exit 1; }
+
+# Final dedup pass on PRIMARY before sam mapping.
+# RUN ONLY UNDER --skip-pick (2026-05-30): when the picker is on it has
+# ALREADY enforced divergence via mafft_pair (whole-allele) inside _is_dup,
+# and this step's cluster_alleles uses a DIFFERENT metric (HD-core-only MAFFT)
+# which can disagree and collapse the picker's chosen pair. Under --skip-pick
+# the primary pool is bubble_alleles.fasta straight from step 3 — possibly with
+# byte-distinct walk variants of the same allele — so the dedup IS useful there.
+NREC_BEFORE=$(grep -c '^>' "$PRIMARY")
+if [ "$NREC_BEFORE" -ge 2 ] && [ "$SKIP_PICK" -eq 1 ]; then
+  echo "=== [$SAMPLE] 4.5) defensive MAFFT-dedup PRIMARY (--skip-pick only) ==="
+  "$PY" -c "
+import sys, os, shutil
+sys.path.insert(0, '$HERE')
+from matdetangler.graph_path_search import cluster_alleles
+from matdetangler.GFA_search import _rc
+
+def load(fa):
+    recs=[]; name=None; buf=[]
+    for ln in open(fa):
+        if ln.startswith('>'):
+            if name: recs.append((name, ''.join(buf)))
+            name = ln[1:].strip().split()[0]; buf=[]
+        else: buf.append(ln.strip())
+    if name: recs.append((name, ''.join(buf)))
+    return recs
+
+recs = load('$PRIMARY')
+qd = '$QDIR'
+named = [(n, s) for n, s in recs]
+clusters = cluster_alleles(named, queries_dir=qd, locus_ref_fa='$LOCUS_REF',
+                            id_thresh=0.95, frac_thresh=0.80)
+sz = dict(named)
+kept = [max(cl, key=lambda n: len(sz[n])) for cl in clusters]
+print(f'[5.5] {len(recs)} primary records -> {len(clusters)} MAFFT cluster(s); keeping {len(kept)} representative(s)')
+keep = set(kept)
+with open('$PRIMARY', 'w') as o:
+    for n, s in recs:
+        if n in keep:
+            o.write(f'>{n}\n')
+            for i in range(0, len(s), 80): o.write(s[i:i+80] + '\n')
+" 2>&1 | tee "$LDIR/04_5_primary_dedup.log"
+  NREC_AFTER=$(grep -c '^>' "$PRIMARY")
+  echo "  primary_alleles.fasta: $NREC_BEFORE -> $NREC_AFTER records after dedup"
+fi
+
+# also emit "graph fasta" copies of the picked alleles (the bubble-graph sequences)
+i=0
+for nm in $(grep '^>' "$PRIMARY" | awk '{print $1}' | sed 's/^>//'); do
+  i=$((i + 1))
+  "$PY" -c "
+import sys
+from matdetangler.input_process import read_fasta
+s = read_fasta('$PRIMARY')['$nm']
+print('>$nm')
+for j in range(0, len(s), 80): print(s[j:j+80])
+" > "$SDIR/allele_${i}.graph.fasta"
+done
+
+# Choose the "used_k" from the picks (most common k among picked alleles);
+# bubble_type from that k. Both downstream steps (new 6: graph_paths annotation,
+# new 7: map_consensus) need primary_alleles.fasta; only new 6 needs USED_K.
+USED_K=$(awk -F'\t' 'NR>1{print $4}' "$SDIR/picks.tsv" | sort | uniq -c | sort -rn | awk 'NR==1{print $2}')
+[ -z "$USED_K" ] || [ "$USED_K" = "-" ] && USED_K=$(echo "$KS" | cut -d, -f1)
+BTYPE=$(awk -F'\t' 'NR==1{print $3}' "$SDIR/bubble_${USED_K}.tsv" 2>/dev/null || echo "NA")
+
+# ===== Step 6 (was 7): graph paths annotation — READS-FREE =====
+# Renders the picked alleles back onto the GFA at USED_K. ASCII + GFA + DOT + PNG.
+echo "=== [$SAMPLE] 5) graph paths (ASCII + GFA + DOT + PNG) ==="
+# resolve the GFA for USED_K via the same paths.spades_k_paths logic (k or K subdir)
+USED_GFA=$("$PY" -c "
+from matdetangler.paths import spades_k_paths
+_, gfa = spades_k_paths('$SPADES_DIR', '$USED_K')
+print(gfa or '')
+")
+"$PY" -m matdetangler.graph_paths --sample "$SAMPLE" \
+  --gfa "$USED_GFA" \
+  --primary-alleles "$PRIMARY" --queries-dir "$QDIR" --outdir "$SDIR" \
+  --picks-tsv "$SDIR/picks.tsv" \
+  --cand-ann "$SDIR/bubble_alleles.ann.tsv" \
+  --spades-dir "$SPADES_DIR" \
+  \
+  ${REPEATS:+--repeats "$REPEATS"} 2>&1 | tee "$LDIR/05_graph_paths.log"
+
+# ===== Step 7 (was 6): competitive mapping + consensus — NEEDS READS =====
+# Maps R1/R2 to picked alleles, calls consensus per allele. Skipped by
+# --skip-consensus (default ON; opt in via --make-consensus).
+if [ "$SKIP_CONSENSUS" -eq 0 ]; then
+  echo "=== [$SAMPLE] 6) competitive mapping + consensus ==="
+  bash "$HERE/matdetangler/map_consensus.sh" "$SAMPLE" "$PRIMARY" "$R1" "$R2" "$SDIR" "$THREADS" "$QDIR" "${REPEATS:-}" 2>&1 | tee "$LDIR/06_map_consensus.log"
+else
+  echo "=== [$SAMPLE] 6) competitive mapping + consensus -> SKIPPED (--skip-consensus; default) ==="
+fi
+
+echo "=== [$SAMPLE] 7a) pairwise identity on PICKS (graph-derived allele1 vs allele2) ==="
+"$PY" -m matdetangler.pairwise_identity --primary-alleles "$PRIMARY" \
+  --queries-dir "$QDIR" --locus-ref "$LOCUS_REF" \
+  --out-tsv "$SDIR/identity.tsv" 2>&1 | tee "$LDIR/07a_identity_picks.log"
+
+echo "=== [$SAMPLE] 7b) pairwise identity on CONSENSUS (read-derived allele1 vs allele2) ==="
+# consensus_alleles.fasta already contains both records (allele_1, allele_2, ...).
+CONS_FA="$SDIR/consensus_alleles.fasta"
+if [ -s "$CONS_FA" ] && [ "$(grep -c '^>' "$CONS_FA")" -ge 2 ]; then
+  "$PY" -m matdetangler.pairwise_identity --primary-alleles "$CONS_FA" \
+    --queries-dir "$QDIR" --locus-ref "$LOCUS_REF" \
+    --out-tsv "$SDIR/identity_consensus.tsv" 2>&1 | tee "$LDIR/07b_identity_consensus.log"
+else
+  echo "  skipped: need >= 2 records in consensus_alleles.fasta" | tee "$LDIR/07b_identity_consensus.log"
+fi
+
+echo "=== [$SAMPLE] 7c) consensus completeness re-check (tblastn proteins + blastn flanks on consensus) ==="
+if [ -s "$CONS_FA" ]; then
+  "$PY" -m matdetangler.consensus_qc --consensus "$CONS_FA" \
+    --queries-dir "$QDIR" --out-tsv "$SDIR/consensus_qc.tsv" \
+    --threads "$THREADS" 2>&1 | tee "$LDIR/07c_consensus_qc.log"
+else
+  echo "  skipped: consensus_alleles.fasta not produced" | tee "$LDIR/07c_consensus_qc.log"
+fi
+
+_prefix_key_outputs() {
+  # Build sample-level longest_alleles.fasta = union of all per-k
+  # <k>/longest_alleles.fasta, prefixing each header with the source k so
+  # entries from different k's stay distinguishable.
+  : > "$SDIR/longest_alleles.fasta"
+  for K_ONE in ${KS//,/ }; do
+    LF="$SDIR/$K_ONE/longest_alleles.fasta"
+    [ -s "$LF" ] || continue
+    awk -v k="$K_ONE" '/^>/{print ">" k "_" substr($0,2); next} {print}' "$LF" \
+        >> "$SDIR/longest_alleles.fasta"
+  done
+
+  # Copy key per-sample outputs to sample-name-prefixed names so they're
+  # self-identifying when shared/aggregated. Originals stay in place.
+  local files=(
+    primary_alleles.fasta
+    longest_alleles.fasta
+    consensus_alleles.fasta
+    reads.sam
+    identity.tsv identity_consensus.tsv
+    consensus_qc.tsv coverage.tsv
+    bubble.txt bubble.gfa bubble.dot bubble.tsv bubble.png
+    summary.tsv
+  )
+  for f in "${files[@]}"; do
+    [ -s "$SDIR/$f" ] && cp -f "$SDIR/$f" "$SDIR/${SAMPLE}.${f}"
+  done
+  echo "[$SAMPLE] key outputs copied with sample-name prefix (${SAMPLE}.*)"
+}
+
+if [ "$SKIP_PICK" -eq 1 ]; then
+  echo "=== [$SAMPLE] 8) summary row -> SKIPPED (--skip-pick) ==="
+  _prefix_key_outputs
+  echo "[$SAMPLE] done -> $SDIR/  (QC mode; no picks → no summary row)"
+else
+  echo "=== [$SAMPLE] 8) summary row ==="
+  # graph_paths already wrote $SDIR/_graph.json. Stash the identity JSONs we need.
+  "$PY" -c "
+import json
+from matdetangler.pairwise_identity import run as id_run
+json.dump(id_run('$PRIMARY', queries_dir='$QDIR', locus_ref_fa='$LOCUS_REF'),
+          open('$SDIR/_identity.json','w'))
+" 2>&1 | tee -a "$LDIR/08_summary.log"
+  if [ -s "$SDIR/_consensus_pair.fasta" ] && [ "$(grep -c '^>' "$SDIR/_consensus_pair.fasta")" -ge 2 ]; then
+    "$PY" -c "
+import json
+from matdetangler.pairwise_identity import run as id_run
+json.dump(id_run('$SDIR/_consensus_pair.fasta', queries_dir='$QDIR', locus_ref_fa='$LOCUS_REF'),
+          open('$SDIR/_identity_consensus.json','w'))
+" 2>&1 | tee -a "$LDIR/08_summary.log"
+  fi
+
+  # write a per-sample summary.tsv inside the sample folder (overwrite) and append to the
+  # aggregate at $OUTDIR/summary.tsv
+  SUM_ARGS=( --sample "$SAMPLE" --used-k "$USED_K" --bubble-type "$BTYPE"
+             --coverage-tsv "$SDIR/coverage.tsv" --picks-tsv "$SDIR/picks.tsv"
+             --identity-json "$SDIR/_identity.json"
+             --graph-paths-json "$SDIR/_graph.json" )
+  [ -n "$GENOMECOV" ] && SUM_ARGS+=( --genome-coverage "$GENOMECOV" )
+  [ -s "$SDIR/_identity_consensus.json" ] && SUM_ARGS+=( --consensus-identity-json "$SDIR/_identity_consensus.json" )
+  [ -s "$SDIR/consensus_qc.tsv" ]         && SUM_ARGS+=( --consensus-qc-tsv "$SDIR/consensus_qc.tsv" )
+  "$PY" -m matdetangler.summary_table "${SUM_ARGS[@]}" \
+        --out-tsv "$SDIR/summary.tsv" --no-append 2>&1 | tee    "$LDIR/08_summary.log"
+  "$PY" -m matdetangler.summary_table "${SUM_ARGS[@]}" \
+        --out-tsv "$OUTDIR/summary.tsv"               2>&1 | tee -a "$LDIR/08_summary.log"
+
+  _prefix_key_outputs
+  echo "[$SAMPLE] done -> $SDIR/  (per-sample summary in $SDIR/summary.tsv; aggregate row appended to $OUTDIR/summary.tsv)"
+fi
