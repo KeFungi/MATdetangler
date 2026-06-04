@@ -16,7 +16,7 @@ import os, sys, subprocess, argparse, tempfile, collections, re
 from .input_process import read_fasta
 from . import blast_utils as bu
 
-MAFFT = "/home/yihongke/miniconda3/envs/genomics/bin/mafft"
+MAFFT = os.environ.get("MAFFT", "mafft")
 
 def _all_picked_alleles(results_dir: str) -> dict[str, str]:
     """Collect every per-sample primary_alleles.fasta under results/<sample>/ and pool them."""
