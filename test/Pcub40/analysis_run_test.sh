@@ -131,90 +131,160 @@ python - "$NEW_JSON" "$KNOWN" <<'PY'
 import json, sys
 new = json.load(open(sys.argv[1])); known = json.load(open(sys.argv[2]))
 
-# Verdict-level fields — when these change, the analysis answer changed.
-VERDICT_FIELDS = ["bubble_type", "k_chosen", "complete_var", "complete_locus",
-                   "n_dedup", "locus_coverage"]
-# Per-allele biological fields — when these change, the allele identity
-# changed (different flank/HD content or different source k).
+# Each change-type catalogs samples it touched. A single sample can appear
+# in multiple categories (e.g. bubble_type AND n_dedup AND bp can all
+# shift together when an allele gets added/dropped).
+CHANGE_TYPES = [
+    "bubble_type",      # verdict label
+    "k_chosen",         # which k won
+    "n_dedup",          # allele count
+    "complete_var",     # HD-tag completeness (tri-state)
+    "complete_locus",   # flank completeness (tri-state)
+    "locus_coverage",   # numerical locus coverage
+    "allele_bp",        # per-allele or total bp shifted
+    "allele_structure", # has_both_flanks / is_degHD / n_variable_genes / k / type / origin per allele
+    "finished_nhop",    # accepting nhop (BFS depth at acceptance) shifted
+    "search_nhood",     # |nhood| at the accept iteration shifted
+    "search_arms",      # n_arms at the accept iteration shifted
+    "bfs_limits",       # bfs_limits counters (max_paths / max_path_length / max_bp hits) shifted
+    "segment_drift",    # same biology, different graph walk (set-equality of segments differs)
+]
 ALLELE_BIO_FIELDS = ["has_both_flanks", "is_degHD", "n_variable_genes",
                       "k", "type", "origin"]
+# Run-level args (NOT per-sample — these are the global config; if these
+# differ, EVERYTHING downstream is on a different footing).
+ARG_FIELDS = ["max_paths", "max_path_length", "max_bp_since_var",
+              "cov_filter", "init_nhop", "max_nhop", "lo_mult", "hi_mult",
+              "divergence_threshold", "locus_padding", "min_allele_bp",
+              "seeds", "expected_count", "ks"]
 
-verdict_changes = []
-completeness_changes = []
-allele_structure_changes = []
-segment_drift = []
+per_sample_changes = {}        # sample -> ordered list of (category, k_val, n_val)
+change_buckets = {c: [] for c in CHANGE_TYPES}
 identical = []
 
 for s in sorted(set(new["samples"]) | set(known["samples"])):
     if s not in new["samples"]:
-        verdict_changes.append((s, "REMOVED", None, None)); continue
-    if s not in known["samples"]:
-        verdict_changes.append((s, "NEW", None, None)); continue
-    n = new["samples"][s]; k = known["samples"][s]
-
-    # Verdict-tier diffs
-    vd = [(f, k.get(f), n.get(f)) for f in VERDICT_FIELDS if k.get(f) != n.get(f)]
-    if vd:
-        # Split: bubble_type / n_dedup / k_chosen → "verdict change"
-        # complete_var / complete_locus / locus_coverage → "completeness change"
-        bubble_diffs = [f for f, _, _ in vd if f in ("bubble_type", "k_chosen", "n_dedup")]
-        compl_diffs  = [f for f, _, _ in vd if f in ("complete_var", "complete_locus", "locus_coverage")]
-        if bubble_diffs:
-            verdict_changes.append((s, "VERDICT", bubble_diffs, vd))
-        if compl_diffs:
-            completeness_changes.append((s, compl_diffs, vd))
+        per_sample_changes[s] = [("REMOVED_FROM_RUN", None, None)]
         continue
+    if s not in known["samples"]:
+        per_sample_changes[s] = [("NEW_SAMPLE", None, None)]
+        continue
+    n = new["samples"][s]; k = known["samples"][s]
+    changes = []
 
-    # Allele-structure diffs (per-allele biology)
+    # Top-level categorical fields
+    for f in ("bubble_type", "k_chosen"):
+        if n.get(f) != k.get(f):
+            changes.append((f, k.get(f), n.get(f)))
+            change_buckets[f].append(s)
+    # Numeric / tri-state
+    for f in ("n_dedup", "complete_var", "complete_locus", "locus_coverage"):
+        if n.get(f) != k.get(f):
+            changes.append((f, k.get(f), n.get(f)))
+            change_buckets[f].append(s)
+
+    # bp: sample-level basepair OR any per-allele len
     n_a = n.get("alleles", []) or []
     k_a = k.get("alleles", []) or []
-    bio_changed = False
-    if len(n_a) != len(k_a):
-        bio_changed = True
-    else:
+    bp_shift = False
+    if n.get("basepair") != k.get("basepair"):
+        bp_shift = True
+    if len(n_a) == len(k_a):
+        for an, ak in zip(n_a, k_a):
+            if an.get("len") != ak.get("len"):
+                bp_shift = True; break
+    if bp_shift:
+        n_bp = n.get("basepair", "?"); k_bp = k.get("basepair", "?")
+        changes.append(("allele_bp", f"total={k_bp} per_allele={[a.get('len') for a in k_a]}",
+                                       f"total={n_bp} per_allele={[a.get('len') for a in n_a]}"))
+        change_buckets["allele_bp"].append(s)
+
+    # Allele-structure: bool flags + per-allele identity
+    struct_changed = False
+    if len(n_a) == len(k_a):
         for an, ak in zip(n_a, k_a):
             for f in ALLELE_BIO_FIELDS:
                 if an.get(f) != ak.get(f):
-                    bio_changed = True
-                    break
-            if bio_changed: break
-    if bio_changed:
-        allele_structure_changes.append(s); continue
+                    struct_changed = True; break
+            if struct_changed: break
+    if struct_changed:
+        changes.append(("allele_structure",
+                          [{f: a.get(f) for f in ALLELE_BIO_FIELDS} for a in k_a],
+                          [{f: a.get(f) for f in ALLELE_BIO_FIELDS} for a in n_a]))
+        change_buckets["allele_structure"].append(s)
 
-    # Segment-set drift (graph-isomorphic walks)
-    seg_n = [sorted(a.get("segments", []) or []) for a in n_a]
-    seg_k = [sorted(a.get("segments", []) or []) for a in k_a]
-    if seg_n != seg_k:
-        segment_drift.append(s); continue
+    # Search-state diffs (BFS internals at the accepting iteration).
+    if n.get("finished_nhop") != k.get("finished_nhop"):
+        changes.append(("finished_nhop", k.get("finished_nhop"), n.get("finished_nhop")))
+        change_buckets["finished_nhop"].append(s)
+    # Compare per_k_trace at the chosen k — last iteration's nhood / n_arms
+    n_kc = n.get("k_chosen"); k_kc = k.get("k_chosen")
+    n_trace = (n.get("per_k_trace") or {}).get(n_kc) or []
+    k_trace = (k.get("per_k_trace") or {}).get(k_kc) or []
+    n_last = n_trace[-1] if n_trace else {}
+    k_last = k_trace[-1] if k_trace else {}
+    if n_last.get("nhood") != k_last.get("nhood"):
+        changes.append(("search_nhood", k_last.get("nhood"), n_last.get("nhood")))
+        change_buckets["search_nhood"].append(s)
+    if n_last.get("n_arms") != k_last.get("n_arms"):
+        changes.append(("search_arms", k_last.get("n_arms"), n_last.get("n_arms")))
+        change_buckets["search_arms"].append(s)
+    # BFS limits (if either side recorded them in the last iter)
+    n_lim = n_last.get("bfs_limits") or {}
+    k_lim = k_last.get("bfs_limits") or {}
+    if any(n_lim.get(L, 0) != k_lim.get(L, 0)
+            for L in ("max_paths_hit", "max_path_length_hit", "max_bp_hit")):
+        changes.append(("bfs_limits", k_lim, n_lim))
+        change_buckets["bfs_limits"].append(s)
 
-    identical.append(s)
+    # Segment-set drift (only flag if nothing above changed AND segments differ)
+    if not changes:
+        seg_n = [sorted(a.get("segments", []) or []) for a in n_a]
+        seg_k = [sorted(a.get("segments", []) or []) for a in k_a]
+        if seg_n != seg_k:
+            changes.append(("segment_drift", None, None))
+            change_buckets["segment_drift"].append(s)
 
+    if changes:
+        per_sample_changes[s] = changes
+    else:
+        identical.append(s)
+
+# ----- args-block (run-level) diff -----
+n_args = new.get("args") or {}; k_args = known.get("args") or {}
+args_diff = [(f, k_args.get(f), n_args.get(f))
+              for f in ARG_FIELDS if k_args.get(f) != n_args.get(f)]
+
+# ----- per-sample report -----
 print(f"\n========== Pcub40 ANALYSIS REPORT ==========")
-print(f"compared {len(new['samples'])} samples vs {len(known['samples'])} in baseline")
+print(f"baseline:  {len(known['samples'])} samples in {sys.argv[2]}")
+print(f"this run:  {len(new['samples'])} samples")
 print()
-print(f"identical (bit-for-bit on biology + segments): {len(identical)}")
-print(f"  {', '.join(identical) if identical else '(none)'}")
+print(f"--- RUN-LEVEL ARGS DIFF ({len(args_diff)}) ---")
+if args_diff:
+    print("  (these are GLOBAL; if any differ, every per-sample result is on a different config)")
+    for f, kv, nv in args_diff:
+        print(f"  {f}: {kv} -> {nv}")
+else:
+    print("  (identical — same args/config as baseline)")
 print()
-print(f"VERDICT changes ({len(verdict_changes)})  — bubble_type / k_chosen / n_dedup shifted:")
-for s, tag, fields, vd in verdict_changes:
-    print(f"  {s} [{tag}]: {fields}")
-    if vd:
-        for f, kv, nv in vd:
-            print(f"      {f}: {kv} -> {nv}")
+print(f"--- PER-SAMPLE CHANGES ({len(per_sample_changes)} samples differ) ---")
+if not per_sample_changes:
+    print("  (all identical)")
+else:
+    for s in sorted(per_sample_changes):
+        cats = per_sample_changes[s]
+        names = [c[0] for c in cats]
+        print(f"  {s:25s}  changed: {', '.join(names)}")
+        for cat, kv, nv in cats:
+            if cat in ("REMOVED_FROM_RUN", "NEW_SAMPLE", "segment_drift"):
+                continue
+            sk = str(kv); sn = str(nv)
+            if len(sk) > 70: sk = sk[:67] + "..."
+            if len(sn) > 70: sn = sn[:67] + "..."
+            print(f"      {cat}: {sk} -> {sn}")
 print()
-print(f"COMPLETENESS changes ({len(completeness_changes)})  — complete_var/locus/lc shifted, same verdict:")
-for s, fields, vd in completeness_changes:
-    print(f"  {s}: {fields}")
-    for f, kv, nv in vd:
-        if f in fields: print(f"      {f}: {kv} -> {nv}")
-print()
-print(f"ALLELE-structure changes ({len(allele_structure_changes)})  — has_both_flanks / k / etc:")
-for s in allele_structure_changes:
-    print(f"  {s}")
-print()
-print(f"Segment-set DRIFT only ({len(segment_drift)})  — same biology, different graph walk:")
-print(f"  {', '.join(segment_drift) if segment_drift else '(none)'}")
-print()
+
 print(f"==============================================")
 PY
 
