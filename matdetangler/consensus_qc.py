@@ -14,7 +14,7 @@ A consensus is `complete` iff:
     (every variable gene has at least one tblastn hit ≥ min_aa) AND
     (any flankL hit exists)                                       AND
     (any flankR hit exists)
-— same definition as the path-level is_complete_path test in graph_path_search.
+— same definition the per-K caller uses for path completeness.
 
 Output: <outdir>/consensus_qc.tsv
     allele  len  vars_hit  vars_total  has_all_vars  aa_cov  has_flankL  has_flankR  complete

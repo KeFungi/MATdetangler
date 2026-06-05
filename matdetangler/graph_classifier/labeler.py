@@ -2,7 +2,7 @@
 
 This is the upstream piece that produces the classifier's preferred input.
 It does NOT run new BLAST — it consumes the cached `blast_*.tsv` files
-that `anchor_search.py` and `graph_path_search.py` already produce.
+that `anchor_search.py` and `run_per_k.py` already produce.
 
 Inputs
 ======

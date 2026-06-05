@@ -324,8 +324,8 @@ def write_queries(locus_fa: str, proteins_fa: str, outdir: str,
     `max_flank_len` (default 2000 bp per side) caps how much locus we keep flanking the HD
     envelope. It also drives:
         derived_max_locus_len = envelope_size + len(trimmed_flankL) + len(trimmed_flankR)
-    which downstream modules (graph_path_search) read off the manifest as their bp budget
-    when enumerating allele paths in the GFA. Smaller flank ⇒ tighter search.
+    which downstream modules (graph_classifier, run_per_k) read off the manifest as their bp
+    budget when enumerating allele paths in the GFA. Smaller flank ⇒ tighter search.
     """
     import json, shutil
     os.makedirs(outdir, exist_ok=True)

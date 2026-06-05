@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Production per-K driver — replaces graph_path_search + pick_alleles.
+"""Production per-K driver.
 
 For one (sample, k):
   1. Extract S-line segments from the k-GFA → temp fasta + BLAST DB

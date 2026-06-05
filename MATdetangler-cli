@@ -68,7 +68,7 @@ Optional inputs:
                                  (symmetric BFS — repeats expand normally). Turn
                                  on to dampen combinatorial blow-up at high-copy
                                  regions.
-  --skip-pick                    QC/dev mode: skip step 4 (pick_alleles) AND
+  --skip-pick                    QC/dev mode: skip step 4 (pick_k) AND
                                  step 8 (summary row); alias bubble_alleles.fasta
                                  as primary_alleles.fasta so steps 5, 6, 7 run
                                  on the full candidate pool from step 3 without
@@ -155,10 +155,10 @@ esac
 # ----- arg parsing (shared) -----
 SAMPLE=""; R1=""; R2=""; SPADES_DIR=""; LOCUS_REF=""; PROTEINS=""; OUTDIR=""
 REPEATS=""; GENOMECOV=""; KS="k45,k53"
-INIT_HOPS=""; MAX_HOPS=""    # blank = use graph_path_search defaults (5, 10)
+INIT_HOPS=""; MAX_HOPS=""    # blank = use run_per_k defaults (5, 8)
 # KNOWN_DEGHD removed 2026-05-30 — degHD detection is no longer plumbed by the wrapper.
 # Python modules still accept --known-degHD if invoked manually.
-# QC/dev mode: SKIP_PICK=1 (default) skips step 4 (pick_alleles)
+# QC/dev mode: SKIP_PICK=1 (default) skips step 4 (pick_k)
 # and 8 (summary), aliasing bubble_alleles.fasta as primary_alleles.fasta so steps 5-7
 # run on the full candidate pool. Pass --no-skip-pick for the full pipeline.
 SKIP_PICK=1

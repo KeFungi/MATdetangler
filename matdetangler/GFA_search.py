@@ -127,7 +127,7 @@ def label_segments(segs: dict[str, tuple[str, float]], queries_dir: str,
     # Default min_seg_len_for_label=0: label EVERY segment regardless of length
     # (2026-05-30 — user-requested). Previously short connector segs (50-300 bp)
     # were filtered out for perf, but that left them unlabeled in the per-seg
-    # labels file used by pick_alleles' pair-topology classifier. Keep the param
+    # labels file the per-K caller's pair-topology classifier reads. Keep the param
     # configurable so a caller can still raise the cut if blast wall-time becomes
     # an issue on huge GFAs.
     blast_segs = {sid: seq for sid, (seq, _) in segs.items()

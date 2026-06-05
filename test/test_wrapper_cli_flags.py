@@ -31,7 +31,7 @@ import argparse
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-WRAPPER = os.path.join(ROOT, "MATdetangler")
+WRAPPER = os.path.join(ROOT, "MATdetangler-cli")
 
 
 def _read_wrapper() -> str:

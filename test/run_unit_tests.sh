@@ -21,7 +21,7 @@ fi
 
 cd "$ROOT"
 fail=0
-for t in test/test_input_process.py test/test_GFA_search.py test/test_pick_alleles.py test/test_graph_paths.py test/test_paths.py test/test_graph_path_search.py test/test_consensus_qc.py test/test_anchor_search.py test/test_topology_clustering.py test/test_pairwise_identity.py test/test_bfs_asymmetric.py test/test_anchor_name_parsing.py test/test_blast_utils_out_tsv.py test/test_genome_cov_from_contigs.py test/test_wrapper_cli_flags.py; do
+for t in test/test_input_process.py test/test_GFA_search.py test/test_graph_paths.py test/test_paths.py test/test_consensus_qc.py test/test_anchor_search.py test/test_pairwise_identity.py test/test_blast_utils_out_tsv.py test/test_genome_cov_from_contigs.py test/test_wrapper_cli_flags.py; do
     echo ">>> $t"
     if ! python3 "$t" 2>&1 | grep -E "^(Ran |FAIL|ERROR|OK)" ; then
         fail=1

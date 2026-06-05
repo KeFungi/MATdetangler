@@ -162,6 +162,152 @@ def mafft_pair_core(s1: str, s2: str,
     denom = min(core_a_len, core_b_len) if core_a_len and core_b_len else 0
     return _score_columns(sa, sb, cols, denom_len=denom)
 
+
+# ---------------------------------------------------------------------------
+# HD-core MSA protocol — used by run() below to compute id_pct on the same
+# coordinate frame the picker used (matches step 3 / step 5 / step 5.5 metric).
+# Originally lived in the legacy graph_path_search; folded in here since
+# pairwise_identity is the only live consumer.
+# ---------------------------------------------------------------------------
+
+_REF_KEY = "__REF__"   # reserved name inside the MSA; must not collide with candidates
+
+
+def _read_first_fasta(fa: str) -> tuple[str, str]:
+    name = ""; buf: list[str] = []
+    for ln in open(fa):
+        if ln.startswith(">"):
+            if name: break
+            name = ln[1:].strip().split()[0]
+        else:
+            buf.append(ln.strip())
+    return name, "".join(buf).upper()
+
+
+def _hd_cols_from_aligned_ref(aligned_ref: str,
+                               ref_hd_lo: int, ref_hd_hi: int,
+                               flipped: bool) -> set[int]:
+    """Project an HD-core span (1-based inclusive, in ORIGINAL forward-ref
+    ungapped coords) onto column indices of a gapped, MAFFT-aligned reference.
+
+    When MAFFT --adjustdirection reverse-complements the reference (signalled by
+    a "_R_" prefix on its output record), position 1 of the aligned ref maps to
+    the LAST nucleotide of the original ungapped ref, so the span has to be
+    remapped to the RC frame before column-walking.
+    """
+    ref_ungap_len = sum(1 for c in aligned_ref if c != '-')
+    if flipped:
+        scan_lo = ref_ungap_len - ref_hd_hi + 1
+        scan_hi = ref_ungap_len - ref_hd_lo + 1
+    else:
+        scan_lo, scan_hi = ref_hd_lo, ref_hd_hi
+    hd_cols: set[int] = set()
+    ungap = 0
+    for ci, ch in enumerate(aligned_ref):
+        if ch != '-':
+            ungap += 1
+            if scan_lo <= ungap <= scan_hi:
+                hd_cols.add(ci)
+    return hd_cols
+
+
+def _trim_by_hd_core(seq: str, hd_proteins_fa: str, pad: int = 1000) -> tuple[str, int, int]:
+    """tblastn `hd_proteins_fa` → seq. Trim seq to [min(sstart) - pad,
+    max(send) + pad] (clamped to seq bounds). Returns (trimmed_seq, hd_lo, hd_hi)
+    where (hd_lo, hd_hi) are the HD-core span in the UN-GAPPED TRIMMED coords
+    (1-based inclusive). If no qualifying tblastn hits, returns (seq, 1, len(seq)).
+    """
+    if not seq or not (hd_proteins_fa and os.path.exists(hd_proteins_fa)):
+        return seq, 1, len(seq) if seq else 0
+    lo_orig, hi_orig = detect_core_span(seq, hd_proteins_fa)
+    if lo_orig == 1 and hi_orig == len(seq):
+        return seq, 1, len(seq)
+    L = len(seq)
+    cut_lo = max(0, lo_orig - 1 - pad)
+    cut_hi = min(L, hi_orig + pad)
+    trimmed = seq[cut_lo:cut_hi]
+    new_lo = lo_orig - cut_lo
+    new_hi = hi_orig - cut_lo
+    return trimmed, new_lo, new_hi
+
+
+def _align_cores(seqs: list[tuple[str, str]],
+                 locus_ref_fa: str | None,
+                 hd_proteins_fa: str | None,
+                 pad: int = 1000,
+                 fast: bool = False,
+                 ) -> tuple[dict[str, str], set[int]]:
+    """1. TRIM each candidate to HD-core span ± `pad` bp (tblastn HD proteins
+          on the candidate).
+       2. MSA — run ONE MAFFT with the REFERENCE LOCUS (similarly trimmed) in
+          the input alongside the trimmed candidates. The reference is the
+          coordinate ruler.
+       3. HD-CORE COLUMNS — walk the trimmed reference's aligned string; columns
+          whose ungapped position lies in the reference's HD-core span are the
+          shared HD-core columns.
+
+    Returns (aligned, hd_cols):
+      aligned[name] = MSA-aligned uppercase string per candidate (ref dropped)
+      hd_cols       = set of MSA column indices for HD-core (reference frame)
+
+    Identity is computed by the caller over hd_cols, counting only positions
+    where BOTH candidates are non-gap.
+
+    Tests mock this function to skip mafft+blast binary dependencies.
+    """
+    trimmed: list[tuple[str, str]] = []
+    for name, seq in seqs:
+        if hd_proteins_fa and os.path.exists(hd_proteins_fa):
+            t, _lo, _hi = _trim_by_hd_core(seq, hd_proteins_fa, pad=pad)
+            trimmed.append((name, t or seq))
+        else:
+            trimmed.append((name, seq))
+    ref_seq = ""
+    ref_hd_lo = ref_hd_hi = 0
+    if locus_ref_fa and os.path.exists(locus_ref_fa):
+        _ref_name, full_ref = _read_first_fasta(locus_ref_fa)
+        if full_ref and hd_proteins_fa and os.path.exists(hd_proteins_fa):
+            ref_seq, ref_hd_lo, ref_hd_hi = _trim_by_hd_core(full_ref, hd_proteins_fa, pad=pad)
+        else:
+            ref_seq, ref_hd_lo, ref_hd_hi = full_ref, 1, len(full_ref)
+    msa_input = ([(_REF_KEY, ref_seq)] if ref_seq else []) + trimmed
+    aligned: dict[str, str] = {}
+    with tempfile.TemporaryDirectory() as t:
+        in_fa  = os.path.join(t, "in.fa")
+        out_fa = os.path.join(t, "msa.fa")
+        with open(in_fa, "w") as o:
+            for n, s in msa_input: o.write(f">{n}\n{s}\n")
+        with open(out_fa, "w") as o:
+            mafft_args = ([MAFFT, "--adjustdirection", "--retree", "1",
+                           "--maxiterate", "0", in_fa]
+                           if fast else
+                           [MAFFT, "--adjustdirection", "--auto", in_fa])
+            subprocess.run(mafft_args, check=True, stdout=o, stderr=subprocess.DEVNULL)
+        cur_n = None; buf = []
+        flipped: set[str] = set()
+        for ln in open(out_fa):
+            if ln.startswith(">"):
+                if cur_n is not None: aligned[cur_n] = "".join(buf).upper()
+                nm = ln[1:].strip().split()[0]
+                if nm.startswith("_R_"):
+                    nm = nm[3:]; flipped.add(nm)
+                cur_n = nm; buf = []
+            else:
+                buf.append(ln.strip())
+        if cur_n is not None: aligned[cur_n] = "".join(buf).upper()
+    hd_cols: set[int] = set()
+    if _REF_KEY in aligned and ref_hd_lo > 0:
+        hd_cols = _hd_cols_from_aligned_ref(
+            aligned[_REF_KEY], ref_hd_lo, ref_hd_hi,
+            flipped=(_REF_KEY in flipped))
+        del aligned[_REF_KEY]
+    else:
+        for s in aligned.values():
+            for ci, ch in enumerate(s):
+                if ch != '-': hd_cols.add(ci)
+    return aligned, hd_cols
+
+
 def run(primary_alleles_fa: str, out_tsv: str | None = None,
         queries_dir: str | None = None,
         locus_ref_fa: str | None = None) -> dict:
@@ -191,7 +337,6 @@ def run(primary_alleles_fa: str, out_tsv: str | None = None,
         # value the picker used.
         if queries_dir and locus_ref_fa and os.path.exists(locus_ref_fa):
             try:
-                from .graph_path_search import _align_cores
                 proteins = os.path.join(queries_dir, "variable_proteins.fasta")
                 named = [(n, alleles[n]) for n in names[:2]]
                 aligned, hd_cols = _align_cores(named, locus_ref_fa, proteins)
